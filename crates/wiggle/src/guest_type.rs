@@ -74,22 +74,33 @@ macro_rules! integer_primitives {
                 // indicating that the memory is valid, and next safety checks
                 // are required to access it.
                 let offset = ptr.offset();
-                let host_ptr = mem.validate_size_align::<Self>(offset, 1)?;
+                match mem {
+                    GuestMemory::Dynamic(d) => {
+                        let mut bytes = (0 as Self).to_le_bytes();
+                        d.read(ptr.offset(), &mut bytes);
+                        Ok($ty::from_le_bytes(bytes))
+                    },
+                    _ => {
+                        let host_ptr = mem.validate_size_align::<Self>(offset, 1)?;
 
-                // If the accessed memory is shared, we need to load the bytes
-                // with the correct memory consistency. We could check if the
-                // memory is shared each time, but we expect little performance
-                // difference between an additional branch and a relaxed memory
-                // access and thus always do the relaxed access here.
-                let host_ptr: &$ty_atomic = unsafe {
-                    let host_ptr: &UnsafeCell<Self> = &host_ptr[0];
-                    &*((host_ptr as *const UnsafeCell<Self>).cast::<$ty_atomic>())
-                };
-                let val = host_ptr.load(Ordering::Relaxed);
+                        // If the accessed memory is shared, we need to load the bytes
+                        // with the correct memory consistency. We could check if the
+                        // memory is shared each time, but we expect little performance
+                        // difference between an additional branch and a relaxed memory
+                        // access and thus always do the relaxed access here.
+                        let host_ptr: &$ty_atomic = unsafe {
+                            let host_ptr: &UnsafeCell<Self> = &host_ptr[0];
+                            &*((host_ptr as *const UnsafeCell<Self>).cast::<$ty_atomic>())
+                        };
+                        let val = host_ptr.load(Ordering::Relaxed);
 
-                // And as a final operation convert from the little-endian wasm
-                // value to a native-endian value for the host.
-                Ok($ty::from_le(val))
+                        // And as a final operation convert from the little-endian wasm
+                        // value to a native-endian value for the host.
+                        Ok($ty::from_le(val))
+                    }
+                }
+
+
             }
 
             #[inline]
@@ -97,12 +108,23 @@ macro_rules! integer_primitives {
                 // See `read` above for various checks here.
                 let val = val.to_le();
                 let offset = ptr.offset();
-                let host_ptr = mem.validate_size_align::<Self>(offset, 1)?;
-                let host_ptr = &host_ptr[0];
-                let atomic_value_ref: &$ty_atomic =
-                    unsafe { &*(host_ptr.get().cast::<$ty_atomic>()) };
-                atomic_value_ref.store(val, Ordering::Relaxed);
-                Ok(())
+                match mem {
+                    GuestMemory::Dynamic(d) => {
+                        // let range = mem.validate_range::<Self>(offset, 1)?;
+                        let bytes = val.to_le_bytes() ;
+                        d.write(offset, &bytes);
+                        Ok(())
+                    },
+                    _ => {
+                        let host_ptr = mem.validate_size_align::<Self>(offset, 1)?;
+                        let host_ptr = &host_ptr[0];
+                        let atomic_value_ref: &$ty_atomic =
+                            unsafe { &*(host_ptr.get().cast::<$ty_atomic>()) };
+                        atomic_value_ref.store(val, Ordering::Relaxed);
+                        Ok(())
+                    }
+                }
+
             }
         }
 

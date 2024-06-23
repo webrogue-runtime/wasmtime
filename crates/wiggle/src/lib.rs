@@ -47,6 +47,13 @@ pub mod wasmtime_crate {
 pub enum GuestMemory<'a> {
     Unshared(&'a mut [u8]),
     Shared(&'a [UnsafeCell<u8>]),
+    Dynamic(Box<dyn DynamicGuestMemory>),
+}
+
+pub trait DynamicGuestMemory {
+    fn size(&self) -> usize;
+    fn write(&mut self, offset: u32, data: &[u8]);
+    fn read(&self, offset: u32, data: &mut [u8]);
 }
 
 // manual impls are needed because of the `UnsafeCell` in the `Shared` branch
@@ -104,6 +111,7 @@ impl<'a> GuestMemory<'a> {
                 None => unreachable!(),
             },
             GuestMemory::Shared(_) => Ok(Cow::Owned(self.to_vec(ptr)?)),
+            GuestMemory::Dynamic(_) => Ok(Cow::Owned(self.to_vec(ptr)?)),
         }
     }
 
@@ -137,6 +145,7 @@ impl<'a> GuestMemory<'a> {
         match self {
             GuestMemory::Unshared(slice) => Ok(Some(&slice[range])),
             GuestMemory::Shared(_) => Ok(None),
+            GuestMemory::Dynamic(_) => Ok(None),
         }
     }
 
@@ -158,6 +167,7 @@ impl<'a> GuestMemory<'a> {
         match self {
             GuestMemory::Unshared(slice) => Ok(Some(&mut slice[range])),
             GuestMemory::Shared(_) => Ok(None),
+            GuestMemory::Dynamic(_) => Ok(None),
         }
     }
 
@@ -255,6 +265,7 @@ impl<'a> GuestMemory<'a> {
                 unsafe { &*(s as *const [u8] as *const [UnsafeCell<u8>]) }
             }
             GuestMemory::Shared(s) => s,
+            GuestMemory::Dynamic(_) => todo!(),
         };
         let memory = &cells[range.clone()];
 
@@ -293,6 +304,7 @@ impl<'a> GuestMemory<'a> {
         let oob = match self {
             GuestMemory::Unshared(b) => b.get(range.clone()).is_none(),
             GuestMemory::Shared(b) => b.get(range.clone()).is_none(),
+            GuestMemory::Dynamic(d) => (offset + len as usize) < d.size(), // TODO check
         };
         if oob {
             Err(GuestError::PtrOutOfBounds(region))
@@ -306,6 +318,7 @@ impl<'a> GuestMemory<'a> {
         match self {
             GuestMemory::Shared(_) => true,
             GuestMemory::Unshared(_) => false,
+            GuestMemory::Dynamic(_) => true,
         }
     }
 }
