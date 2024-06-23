@@ -179,24 +179,37 @@ impl<'a> GuestMemory<'a> {
     where
         T: GuestTypeTransparent + Copy,
     {
-        let guest = self.validate_size_align::<T>(ptr.pointer.0, ptr.pointer.1)?;
-        let mut host = Vec::with_capacity(guest.len());
+        match self {
+            GuestMemory::Dynamic(d) => {
+                let mut host = Vec::<T>::with_capacity(ptr.pointer.1 as usize);
+                let byte_len = ptr.pointer.1 as usize * std::mem::size_of::<T>();
+                unsafe { host.set_len(ptr.pointer.1 as usize) };
+                d.read(ptr.pointer.0, unsafe {
+                    std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), byte_len)
+                });
+                Ok(host)
+            }
+            _ => {
+                let guest = self.validate_size_align::<T>(ptr.pointer.0, ptr.pointer.1)?;
+                let mut host = Vec::with_capacity(guest.len());
 
-        // SAFETY: The `guest_slice` variable is already a valid pointer into
-        // the guest's memory, and it may or may not be a pointer into shared
-        // memory. We can't naively use `.to_vec(..)` which could introduce data
-        // races but all that needs to happen is to copy data into our local
-        // `vec` as all the data is `Copy` and transparent anyway. For this
-        // purpose the `ptr::copy` function should be sufficient for copying
-        // over all the data.
-        //
-        // TODO: audit that this use of `std::ptr::copy` is safe with shared
-        // memory (https://github.com/bytecodealliance/wasmtime/issues/4203)
-        unsafe {
-            std::ptr::copy(guest.as_ptr().cast(), host.as_mut_ptr(), guest.len());
-            host.set_len(guest.len());
+                // SAFETY: The `guest_slice` variable is already a valid pointer into
+                // the guest's memory, and it may or may not be a pointer into shared
+                // memory. We can't naively use `.to_vec(..)` which could introduce data
+                // races but all that needs to happen is to copy data into our local
+                // `vec` as all the data is `Copy` and transparent anyway. For this
+                // purpose the `ptr::copy` function should be sufficient for copying
+                // over all the data.
+                //
+                // TODO: audit that this use of `std::ptr::copy` is safe with shared
+                // memory (https://github.com/bytecodealliance/wasmtime/issues/4203)
+                unsafe {
+                    std::ptr::copy(guest.as_ptr().cast(), host.as_mut_ptr(), guest.len());
+                    host.set_len(guest.len());
+                }
+                Ok(host)
+            }
         }
-        Ok(host)
     }
 
     /// Copies the data pointed to by `slice` into this guest region.
