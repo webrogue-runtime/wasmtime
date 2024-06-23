@@ -1,3 +1,10 @@
+# About this fork
+
+THis fork of Wasmtime has been modified for webrogue needs.
+
+Modificiations includes:
+- Support of dynamic memory for Wiggle. It means that a dyn struct implementing read/write functions can act as GuestMemory
+
 <div align="center">
   <h1><code>wasmtime</code></h1>
 
