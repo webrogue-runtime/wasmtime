@@ -76,7 +76,7 @@ macro_rules! integer_primitives {
                 let offset = ptr.offset();
                 match mem {
                     GuestMemory::Dynamic(d) => {
-                        let mut bytes = (0 as Self).to_le_bytes();
+                        let mut bytes = [0u8; std::mem::size_of::<$ty>()];
                         d.read(ptr.offset(), &mut bytes);
                         Ok($ty::from_le_bytes(bytes))
                     },
