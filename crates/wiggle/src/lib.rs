@@ -317,7 +317,7 @@ impl<'a> GuestMemory<'a> {
         let oob = match self {
             GuestMemory::Unshared(b) => b.get(range.clone()).is_none(),
             GuestMemory::Shared(b) => b.get(range.clone()).is_none(),
-            GuestMemory::Dynamic(d) => (offset + len as usize) < d.size(), // TODO check
+            GuestMemory::Dynamic(d) => (offset + len as usize) >= d.size(), // TODO check
         };
         if oob {
             Err(GuestError::PtrOutOfBounds(region))
