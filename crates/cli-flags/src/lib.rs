@@ -115,17 +115,6 @@ wasmtime_option_group! {
         /// The maximum runtime size of each linear memory in the pooling
         /// allocator, in bytes.
         pub pooling_max_memory_size: Option<usize>,
-
-        /// Whether to enable call-indirect caching.
-        pub cache_call_indirects: Option<bool>,
-
-        /// The maximum call-indirect cache slot count.
-        ///
-        /// One slot is allocated per indirect callsite; if the module
-        /// has more indirect callsites than this limit, then the
-        /// first callsites in linear order in the code section, up to
-        /// the limit, will receive a cache slot.
-        pub max_call_indirect_cache_slots: Option<usize>,
     }
 
     enum Optimize {
@@ -265,10 +254,16 @@ wasmtime_option_group! {
         pub memory64: Option<bool>,
         /// Configure support for the component-model proposal.
         pub component_model: Option<bool>,
+        /// Configure support for 33+ flags in the component model.
+        pub component_model_more_flags: Option<bool>,
+        /// Component model support for more than one return value.
+        pub component_model_multiple_returns: Option<bool>,
         /// Configure support for the function-references proposal.
         pub function_references: Option<bool>,
         /// Configure support for the GC proposal.
         pub gc: Option<bool>,
+        /// Configure support for the custom-page-sizes proposal.
+        pub custom_page_sizes: Option<bool>,
     }
 
     enum Wasm {
@@ -289,6 +284,10 @@ wasmtime_option_group! {
         pub threads: Option<bool>,
         /// Enable support for WASI HTTP API (experimental)
         pub http: Option<bool>,
+        /// Enable support for WASI runtime config API (experimental)
+        pub runtime_config: Option<bool>,
+        /// Enable support for WASI key-value API (experimental)
+        pub keyvalue: Option<bool>,
         /// Inherit environment variables and file descriptors following the
         /// systemd listen fd specification (UNIX only)
         pub listenfd: Option<bool>,
@@ -326,6 +325,19 @@ wasmtime_option_group! {
         ///
         /// This option can be further overwritten with `--env` flags.
         pub inherit_env: Option<bool>,
+        /// Pass a wasi runtime config variable to the program.
+        pub runtime_config_var: Vec<KeyValuePair>,
+        /// Preset data for the In-Memory provider of WASI key-value API.
+        pub keyvalue_in_memory_data: Vec<KeyValuePair>,
+        /// Grant access to the given Redis host for the Redis provider of WASI
+        /// key-value API.
+        pub keyvalue_redis_host: Vec<String>,
+        /// Sets the connection timeout parameter for the Redis provider of WASI
+        /// key-value API.
+        pub keyvalue_redis_connection_timeout: Option<Duration>,
+        /// Sets the response timeout parameter for the Redis provider of WASI
+        /// key-value API.
+        pub keyvalue_redis_response_timeout: Option<Duration>,
     }
 
     enum Wasi {
@@ -337,6 +349,12 @@ wasmtime_option_group! {
 pub struct WasiNnGraph {
     pub format: String,
     pub dir: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyValuePair {
+    pub key: String,
+    pub value: String,
 }
 
 /// Common options for commands that translate WebAssembly modules
@@ -576,12 +594,6 @@ impl CommonOptions {
         if let Some(enable) = self.opts.memory_init_cow {
             config.memory_init_cow(enable);
         }
-        if let Some(enable) = self.opts.cache_call_indirects {
-            config.cache_call_indirects(enable);
-        }
-        if let Some(max) = self.opts.max_call_indirect_cache_slots {
-            config.max_call_indirect_cache_slots(max);
-        }
 
         match_feature! {
             ["pooling-allocator" : self.opts.pooling_allocator.or(pooling_allocator_default)]
@@ -606,8 +618,10 @@ impl CommonOptions {
                     if let Some(limit) = self.opts.pooling_total_tables {
                         cfg.total_tables(limit);
                     }
-                    if let Some(limit) = self.opts.pooling_total_stacks {
-                        cfg.total_stacks(limit);
+                    match_feature! {
+                        ["async" : self.opts.pooling_total_stacks]
+                        limit => cfg.total_stacks(limit),
+                        _ => err,
                     }
                     if let Some(limit) = self.opts.pooling_max_memory_size {
                         cfg.max_memory_size(limit);
@@ -673,6 +687,9 @@ impl CommonOptions {
         if let Some(enable) = self.wasm.memory64.or(all) {
             config.wasm_memory64(enable);
         }
+        if let Some(enable) = self.wasm.custom_page_sizes.or(all) {
+            config.wasm_custom_page_sizes(enable);
+        }
 
         macro_rules! handle_conditionally_compiled {
             ($(($feature:tt, $field:tt, $method:tt))*) => ($(
@@ -689,6 +706,8 @@ impl CommonOptions {
 
         handle_conditionally_compiled! {
             ("component-model", component_model, wasm_component_model)
+            ("component-model", component_model_more_flags, wasm_component_model_more_flags)
+            ("component-model", component_model_multiple_returns, wasm_component_model_multiple_returns)
             ("threads", threads, wasm_threads)
             ("gc", gc, wasm_gc)
             ("gc", reference_types, wasm_reference_types)

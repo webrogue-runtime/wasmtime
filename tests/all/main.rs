@@ -16,6 +16,7 @@ mod funcref;
 mod gc;
 mod globals;
 mod host_funcs;
+mod i31ref;
 mod iloop;
 mod import_calling_export;
 mod import_indexes;
@@ -35,15 +36,13 @@ mod relocs;
 mod stack_creator;
 mod stack_overflow;
 mod store;
+mod structs;
 mod table;
 mod threads;
 mod traps;
 mod types;
 mod wait_notify;
 mod wasi_testsuite;
-// Currently Winch is only supported in x86_64.
-#[cfg(all(target_arch = "x86_64"))]
-mod winch;
 
 /// A helper to compile a module in a new store with reference types enabled.
 pub(crate) fn ref_types_module(
@@ -57,10 +56,7 @@ pub(crate) fn ref_types_module(
     let mut config = Config::new();
     config.wasm_reference_types(true);
 
-    if !cfg!(target_arch = "s390x") {
-        // TODO(6530): s390x doesn't support tail calls yet.
-        config.wasm_tail_call(true);
-    }
+    config.wasm_tail_call(true);
 
     if use_epochs {
         config.epoch_interruption(true);

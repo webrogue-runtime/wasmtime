@@ -4,8 +4,9 @@
 #![allow(trivial_numeric_casts)]
 
 use core::fmt::{self, Display, Formatter};
+use core::ops::Neg;
 use cranelift_codegen::data_value::{DataValue, DataValueCastFailure};
-use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
+use cranelift_codegen::ir::immediates::{Ieee128, Ieee16, Ieee32, Ieee64};
 use cranelift_codegen::ir::{types, Type};
 use thiserror::Error;
 
@@ -318,7 +319,7 @@ impl DataValueExt for DataValue {
 
     fn is_float(&self) -> bool {
         match self {
-            DataValue::F32(_) | DataValue::F64(_) => true,
+            DataValue::F16(_) | DataValue::F32(_) | DataValue::F64(_) | DataValue::F128(_) => true,
             _ => false,
         }
     }
@@ -399,10 +400,14 @@ impl DataValueExt for DataValue {
                 (val, ty) if val.ty().is_int() && ty.is_int() => {
                     DataValue::from_integer(val.into_int_signed()?, ty)?
                 }
+                (DataValue::I16(n), types::F16) => DataValue::F16(Ieee16::with_bits(n as u16)),
                 (DataValue::I32(n), types::F32) => DataValue::F32(f32::from_bits(n as u32).into()),
                 (DataValue::I64(n), types::F64) => DataValue::F64(f64::from_bits(n as u64).into()),
+                (DataValue::I128(n), types::F128) => DataValue::F128(Ieee128::with_bits(n as u128)),
+                (DataValue::F16(n), types::I16) => DataValue::I16(n.bits() as i16),
                 (DataValue::F32(n), types::I32) => DataValue::I32(n.bits() as i32),
                 (DataValue::F64(n), types::I64) => DataValue::I64(n.bits() as i64),
+                (DataValue::F128(n), types::I128) => DataValue::I128(n.bits() as i128),
                 (DataValue::F32(n), types::F64) => DataValue::F64((n.as_f32() as f64).into()),
                 (dv, t) if (t.is_int() || t.is_float()) && dv.ty() == t => dv,
                 (dv, _) => unimplemented!("conversion: {} -> {:?}", dv.ty(), kind),
@@ -502,8 +507,10 @@ impl DataValueExt for DataValue {
             DataValue::I32(f) => Ok(*f == 0),
             DataValue::I64(f) => Ok(*f == 0),
             DataValue::I128(f) => Ok(*f == 0),
+            DataValue::F16(f) => Ok(f.is_zero()),
             DataValue::F32(f) => Ok(f.is_zero()),
             DataValue::F64(f) => Ok(f.is_zero()),
+            DataValue::F128(f) => Ok(f.is_zero()),
             DataValue::V64(_) | DataValue::V128(_) => {
                 Err(ValueError::InvalidType(ValueTypeClass::Float, self.ty()))
             }
@@ -794,12 +801,11 @@ impl DataValueExt for DataValue {
             DataValue::I128(a) => DataValue::I128(!a),
             DataValue::F32(a) => DataValue::F32(!a),
             DataValue::F64(a) => DataValue::F64(!a),
-            DataValue::V128(a) => {
-                let mut a2 = a.clone();
-                for a in a2.iter_mut() {
-                    *a = !*a;
+            DataValue::V128(mut a) => {
+                for byte in a.iter_mut() {
+                    *byte = !*byte;
                 }
-                DataValue::V128(a2)
+                DataValue::V128(a)
             }
             _ => unimplemented!(),
         })

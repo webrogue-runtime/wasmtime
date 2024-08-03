@@ -20,7 +20,7 @@ fn run(path: &str, inherit_stdio: bool) -> Result<()> {
             }
             builder.allow_blocking_current_thread(blocking);
         })?;
-        let (command, _instance) = Command::instantiate(&mut store, &component, &linker)?;
+        let command = Command::instantiate(&mut store, &component, &linker)?;
         command
             .wasi_cli_run()
             .call_run(&mut store)?
@@ -268,6 +268,10 @@ fn preview2_tcp_sample_application() {
 #[test_log::test]
 fn preview2_tcp_states() {
     run(PREVIEW2_TCP_STATES_COMPONENT, false).unwrap()
+}
+#[test_log::test]
+fn preview2_tcp_streams() {
+    run(PREVIEW2_TCP_STREAMS_COMPONENT, false).unwrap()
 }
 #[test_log::test]
 fn preview2_tcp_bind() {

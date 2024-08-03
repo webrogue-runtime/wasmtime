@@ -46,20 +46,28 @@ pub enum EmitVState {
 /// State carried between emissions of a sequence of instructions.
 #[derive(Default, Clone, Debug)]
 pub struct EmitState {
-    /// Safepoint stack map for upcoming instruction, as provided to `pre_safepoint()`.
+    /// Safepoint stack map for upcoming instruction, as provided to
+    /// `pre_safepoint()`.
     stack_map: Option<StackMap>,
+
+    /// The user stack map for the upcoming instruction, as provided to
+    /// `pre_safepoint()`.
+    user_stack_map: Option<ir::UserStackMap>,
+
     /// Only used during fuzz-testing. Otherwise, it is a zero-sized struct and
     /// optimized away at compiletime. See [cranelift_control].
     ctrl_plane: ControlPlane,
+
     /// Vector State
     /// Controls the current state of the vector unit at the emission point.
     vstate: EmitVState,
+
     frame_layout: FrameLayout,
 }
 
 impl EmitState {
-    fn take_stack_map(&mut self) -> Option<StackMap> {
-        self.stack_map.take()
+    fn take_stack_map(&mut self) -> (Option<StackMap>, Option<ir::UserStackMap>) {
+        (self.stack_map.take(), self.user_stack_map.take())
     }
 }
 
@@ -70,14 +78,20 @@ impl MachInstEmitState<Inst> for EmitState {
     ) -> Self {
         EmitState {
             stack_map: None,
+            user_stack_map: None,
             ctrl_plane,
             vstate: EmitVState::Unknown,
             frame_layout: abi.frame_layout().clone(),
         }
     }
 
-    fn pre_safepoint(&mut self, stack_map: StackMap) {
-        self.stack_map = Some(stack_map);
+    fn pre_safepoint(
+        &mut self,
+        stack_map: Option<StackMap>,
+        user_stack_map: Option<ir::UserStackMap>,
+    ) {
+        self.stack_map = stack_map;
+        self.user_stack_map = user_stack_map;
     }
 
     fn ctrl_plane_mut(&mut self) -> &mut ControlPlane {
@@ -218,11 +232,11 @@ impl MachInstEmit for Inst {
     fn emit(&self, sink: &mut MachBuffer<Inst>, emit_info: &Self::Info, state: &mut EmitState) {
         // Check if we need to update the vector state before emitting this instruction
         if let Some(expected) = self.expected_vstate() {
-            if state.vstate != EmitVState::Known(expected.clone()) {
+            if state.vstate != EmitVState::Known(*expected) {
                 // Update the vector state.
                 Inst::VecSetState {
                     rd: writable_zero_reg(),
-                    vstate: expected.clone(),
+                    vstate: *expected,
                 }
                 .emit(sink, emit_info, state);
             }
@@ -242,14 +256,21 @@ impl MachInstEmit for Inst {
             self.emit_uncompressed(sink, emit_info, state, &mut start_off);
         }
 
-        let end_off = sink.cur_offset();
-        assert!(
-            (end_off - start_off) <= Inst::worst_case_size(),
-            "Inst:{:?} length:{} worst_case_size:{}",
+        // We exclude br_table and return call from these checks since they emit
+        // their own islands, and thus are allowed to exceed the worst case size.
+        if !matches!(
             self,
-            end_off - start_off,
-            Inst::worst_case_size()
-        );
+            Inst::BrTable { .. } | Inst::ReturnCall { .. } | Inst::ReturnCallInd { .. }
+        ) {
+            let end_off = sink.cur_offset();
+            assert!(
+                (end_off - start_off) <= Inst::worst_case_size(),
+                "Inst:{:?} length:{} worst_case_size:{}",
+                self,
+                end_off - start_off,
+                Inst::worst_case_size()
+            );
+        }
     }
 
     fn pretty_print_inst(&self, state: &mut Self::State) -> String {
@@ -1123,16 +1144,22 @@ impl Inst {
             }
 
             &Inst::Call { ref info } => {
-                if info.opcode.is_call() {
-                    sink.add_call_site(info.opcode);
-                }
+                sink.add_call_site();
                 sink.add_reloc(Reloc::RiscvCallPlt, &info.dest, 0);
-                if let Some(s) = state.take_stack_map() {
+
+                let (stack_map, user_stack_map) = state.take_stack_map();
+                if let Some(s) = stack_map {
                     sink.add_stack_map(StackMapExtent::UpcomingBytes(8), s);
                 }
+
                 Inst::construct_auipc_and_jalr(Some(writable_link_reg()), writable_link_reg(), 0)
                     .into_iter()
                     .for_each(|i| i.emit_uncompressed(sink, emit_info, state, start_off));
+
+                if let Some(s) = user_stack_map {
+                    let offset = sink.cur_offset();
+                    sink.push_user_stack_map(state, offset, s);
+                }
 
                 let callee_pop_size = i32::try_from(info.callee_pop_size).unwrap();
                 if callee_pop_size > 0 {
@@ -1151,13 +1178,16 @@ impl Inst {
                 }
                 .emit(sink, emit_info, state);
 
-                if let Some(s) = state.take_stack_map() {
+                let (stack_map, user_stack_map) = state.take_stack_map();
+                if let Some(s) = stack_map {
                     sink.add_stack_map(StackMapExtent::StartedAtOffset(start_offset), s);
                 }
-
-                if info.opcode.is_call() {
-                    sink.add_call_site(info.opcode);
+                if let Some(s) = user_stack_map {
+                    let offset = sink.cur_offset();
+                    sink.push_user_stack_map(state, offset, s);
                 }
+
+                sink.add_call_site();
 
                 let callee_pop_size = i32::try_from(info.callee_pop_size).unwrap();
                 if callee_pop_size > 0 {
@@ -1173,7 +1203,7 @@ impl Inst {
             } => {
                 emit_return_call_common_sequence(sink, emit_info, state, info);
 
-                sink.add_call_site(ir::Opcode::ReturnCall);
+                sink.add_call_site();
                 sink.add_reloc(Reloc::RiscvCallPlt, &**callee, 0);
                 Inst::construct_auipc_and_jalr(None, writable_spilltmp_reg(), 0)
                     .into_iter()
@@ -2003,7 +2033,6 @@ impl Inst {
                         dest: ExternalName::LibCall(LibCall::ElfTlsGetAddr),
                         uses: smallvec![],
                         defs: smallvec![],
-                        opcode: crate::ir::Opcode::TlsValue,
                         caller_callconv: CallConv::SystemV,
                         callee_callconv: CallConv::SystemV,
                         callee_pop_size: 0,
@@ -2503,7 +2532,7 @@ impl Inst {
                 ));
 
                 // Update the current vector emit state.
-                state.vstate = EmitVState::Known(vstate.clone());
+                state.vstate = EmitVState::Known(*vstate);
             }
 
             &Inst::VecLoad {
@@ -2528,7 +2557,7 @@ impl Inst {
                             let tmp = writable_spilltmp_reg();
                             Inst::LoadAddr {
                                 rd: tmp,
-                                mem: base.clone(),
+                                mem: *base,
                             }
                             .emit(sink, emit_info, state);
                             tmp.to_reg()
@@ -2575,7 +2604,7 @@ impl Inst {
                             let tmp = writable_spilltmp_reg();
                             Inst::LoadAddr {
                                 rd: tmp,
-                                mem: base.clone(),
+                                mem: *base,
                             }
                             .emit(sink, emit_info, state);
                             tmp.to_reg()
@@ -2604,6 +2633,40 @@ impl Inst {
 }
 
 fn emit_return_call_common_sequence(
+    sink: &mut MachBuffer<Inst>,
+    emit_info: &EmitInfo,
+    state: &mut EmitState,
+    info: &ReturnCallInfo,
+) {
+    // The return call sequence can potentially emit a lot of instructions (up to 634 bytes!)
+    // So lets emit an island here if we need it.
+    //
+    // It is difficult to calculate exactly how many instructions are going to be emitted, so
+    // we calculate it by emitting it into a disposable buffer, and then checking how many instructions
+    // were actually emitted.
+    let mut buffer = MachBuffer::new();
+    let mut fake_emit_state = state.clone();
+
+    return_call_emit_impl(&mut buffer, emit_info, &mut fake_emit_state, info);
+
+    // Finalize the buffer and get the number of bytes emitted.
+    let buffer = buffer.finish(&Default::default(), &mut Default::default());
+    let length = buffer.data().len() as u32;
+
+    // And now emit the island inline with this instruction.
+    if sink.island_needed(length) {
+        let jump_around_label = sink.get_label();
+        Inst::gen_jump(jump_around_label).emit(sink, emit_info, state);
+        sink.emit_island(length + 4, &mut state.ctrl_plane);
+        sink.bind_label(jump_around_label, &mut state.ctrl_plane);
+    }
+
+    // Now that we're done, emit the *actual* return sequence.
+    return_call_emit_impl(sink, emit_info, state, info);
+}
+
+/// This should not be called directly, Instead prefer to call [emit_return_call_common_sequence].
+fn return_call_emit_impl(
     sink: &mut MachBuffer<Inst>,
     emit_info: &EmitInfo,
     state: &mut EmitState,

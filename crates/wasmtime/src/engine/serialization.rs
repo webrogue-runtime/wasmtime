@@ -202,6 +202,8 @@ struct WasmFeatures {
     function_references: bool,
     gc: bool,
     custom_page_sizes: bool,
+    component_model_more_flags: bool,
+    component_model_multiple_returns: bool,
 }
 
 impl Metadata<'_> {
@@ -227,6 +229,9 @@ impl Metadata<'_> {
             shared_everything_threads,
             component_model_values,
             component_model_nested_names,
+            component_model_more_flags,
+            component_model_multiple_returns,
+            legacy_exceptions,
 
             // Always on; we don't currently have knobs for these.
             mutable_global: _,
@@ -242,6 +247,7 @@ impl Metadata<'_> {
         assert!(!component_model_values);
         assert!(!component_model_nested_names);
         assert!(!shared_everything_threads);
+        assert!(!legacy_exceptions);
 
         Metadata {
             target: engine.compiler().triple().to_string(),
@@ -264,6 +270,8 @@ impl Metadata<'_> {
                 function_references,
                 gc,
                 custom_page_sizes,
+                component_model_more_flags,
+                component_model_multiple_returns,
             },
         }
     }
@@ -358,10 +366,7 @@ impl Metadata<'_> {
             guard_before_linear_memory,
             table_lazy_init,
             relaxed_simd_deterministic,
-            tail_callable,
             winch_callable,
-            cache_call_indirects,
-            max_call_indirect_cache_slots,
 
             // This doesn't affect compilation, it's just a runtime setting.
             dynamic_memory_growth_reserve: _,
@@ -423,21 +428,10 @@ impl Metadata<'_> {
             other.relaxed_simd_deterministic,
             "relaxed simd deterministic semantics",
         )?;
-        Self::check_bool(tail_callable, other.tail_callable, "WebAssembly tail calls")?;
         Self::check_bool(
             winch_callable,
             other.winch_callable,
             "Winch calling convention",
-        )?;
-        Self::check_bool(
-            cache_call_indirects,
-            other.cache_call_indirects,
-            "caching of call-indirect targets",
-        )?;
-        Self::check_int(
-            max_call_indirect_cache_slots,
-            other.max_call_indirect_cache_slots,
-            "maximum slot count for caching of call-indirect targets",
         )?;
 
         Ok(())
@@ -481,6 +475,8 @@ impl Metadata<'_> {
             function_references,
             gc,
             custom_page_sizes,
+            component_model_more_flags,
+            component_model_multiple_returns,
         } = self.features;
 
         use wasmparser::WasmFeatures as F;
@@ -561,6 +557,16 @@ impl Metadata<'_> {
             custom_page_sizes,
             other.contains(F::CUSTOM_PAGE_SIZES),
             "WebAssembly custom-page-sizes support",
+        )?;
+        Self::check_bool(
+            component_model_more_flags,
+            other.contains(F::COMPONENT_MODEL_MORE_FLAGS),
+            "WebAssembly component model support for more than 32 flags",
+        )?;
+        Self::check_bool(
+            component_model_multiple_returns,
+            other.contains(F::COMPONENT_MODEL_MULTIPLE_RETURNS),
+            "WebAssembly component model support for multiple returns",
         )?;
 
         Ok(())

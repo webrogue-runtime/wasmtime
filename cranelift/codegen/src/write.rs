@@ -5,8 +5,9 @@
 
 use crate::entity::SecondaryMap;
 use crate::ir::entities::AnyEntity;
+use crate::ir::immediates::Ieee128;
 use crate::ir::pcc::Fact;
-use crate::ir::{Block, DataFlowGraph, Function, Inst, SigRef, Type, Value, ValueDef};
+use crate::ir::{Block, DataFlowGraph, Function, Inst, Opcode, SigRef, Type, Value, ValueDef};
 use crate::packed_option::ReservedValue;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -389,13 +390,21 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
     let pool = &dfg.value_lists;
     let jump_tables = &dfg.jump_tables;
     use crate::ir::instructions::InstructionData::*;
+    let ctrl_ty = dfg.ctrl_typevar(inst);
     match dfg.insts[inst] {
         AtomicRmw { op, args, .. } => write!(w, " {} {}, {}", op, args[0], args[1]),
         AtomicCas { args, .. } => write!(w, " {}, {}, {}", args[0], args[1], args[2]),
         LoadNoOffset { flags, arg, .. } => write!(w, "{} {}", flags, arg),
         StoreNoOffset { flags, args, .. } => write!(w, "{} {}, {}", flags, args[0], args[1]),
         Unary { arg, .. } => write!(w, " {}", arg),
-        UnaryImm { imm, .. } => write!(w, " {}", imm),
+        UnaryImm { imm, .. } => write!(w, " {}", {
+            let mut imm = imm;
+            if ctrl_ty.bits() != 0 {
+                imm = imm.sign_extend_from_width(ctrl_ty.bits());
+            }
+            imm
+        }),
+        UnaryIeee16 { imm, .. } => write!(w, " {}", imm),
         UnaryIeee32 { imm, .. } => write!(w, " {}", imm),
         UnaryIeee64 { imm, .. } => write!(w, " {}", imm),
         UnaryGlobalValue { global_value, .. } => write!(w, " {}", global_value),
@@ -404,7 +413,13 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
         } => write!(w, " {}", constant_handle),
         Binary { args, .. } => write!(w, " {}, {}", args[0], args[1]),
         BinaryImm8 { arg, imm, .. } => write!(w, " {}, {}", arg, imm),
-        BinaryImm64 { arg, imm, .. } => write!(w, " {}, {}", arg, imm),
+        BinaryImm64 { arg, imm, .. } => write!(w, " {}, {}", arg, {
+            let mut imm = imm;
+            if ctrl_ty.bits() != 0 {
+                imm = imm.sign_extend_from_width(ctrl_ty.bits());
+            }
+            imm
+        }),
         Ternary { args, .. } => write!(w, " {}, {}, {}", args[0], args[1], args[2]),
         MultiAry { ref args, .. } => {
             if args.is_empty() {
@@ -422,7 +437,13 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
             write!(w, " {}, {}, {}", args[0], args[1], data)
         }
         IntCompare { cond, args, .. } => write!(w, " {} {}, {}", cond, args[0], args[1]),
-        IntCompareImm { cond, arg, imm, .. } => write!(w, " {} {}, {}", cond, arg, imm),
+        IntCompareImm { cond, arg, imm, .. } => write!(w, " {} {}, {}", cond, arg, {
+            let mut imm = imm;
+            if ctrl_ty.bits() != 0 {
+                imm = imm.sign_extend_from_width(ctrl_ty.bits());
+            }
+            imm
+        }),
         IntAddTrap { args, code, .. } => write!(w, " {}, {}, {}", args[0], args[1], code),
         FloatCompare { cond, args, .. } => write!(w, " {} {}, {}", cond, args[0], args[1]),
         Jump { destination, .. } => {
@@ -493,9 +514,22 @@ pub fn write_operands(w: &mut dyn Write, dfg: &DataFlowGraph, inst: Inst) -> fmt
     for arg in dfg.inst_values(inst) {
         if let ValueDef::Result(src, _) = dfg.value_def(arg) {
             let imm = match dfg.insts[src] {
-                UnaryImm { imm, .. } => imm.to_string(),
+                UnaryImm { imm, .. } => {
+                    let mut imm = imm;
+                    if dfg.ctrl_typevar(src).bits() != 0 {
+                        imm = imm.sign_extend_from_width(dfg.ctrl_typevar(src).bits());
+                    }
+                    imm.to_string()
+                }
+                UnaryIeee16 { imm, .. } => imm.to_string(),
                 UnaryIeee32 { imm, .. } => imm.to_string(),
                 UnaryIeee64 { imm, .. } => imm.to_string(),
+                UnaryConst {
+                    constant_handle,
+                    opcode: Opcode::F128const,
+                } => Ieee128::try_from(dfg.constants.get(constant_handle))
+                    .expect("16-byte f128 constant")
+                    .to_string(),
                 UnaryConst {
                     constant_handle, ..
                 } => constant_handle.to_string(),

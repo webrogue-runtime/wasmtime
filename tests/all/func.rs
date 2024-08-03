@@ -690,6 +690,7 @@ fn import_works() -> Result<()> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn trap_smoke() -> Result<()> {
     let mut store = Store::<()>::default();
     let f = Func::wrap(&mut store, || -> Result<()> { bail!("test") });
@@ -1434,14 +1435,14 @@ fn typed_funcs_count_params_correctly_in_error_messages(config: &mut Config) -> 
     match instance.get_typed_func::<(), ()>(&mut store, "f") {
         Ok(_) => panic!("should be wrong signature"),
         Err(e) => {
-            let msg = format!("{:?}", e);
+            let msg = format!("{e:?}");
             assert!(dbg!(msg).contains("expected 0 types, found 2"))
         }
     }
     match instance.get_typed_func::<(i32,), ()>(&mut store, "f") {
         Ok(_) => panic!("should be wrong signature"),
         Err(e) => {
-            let msg = format!("{:?}", e);
+            let msg = format!("{e:?}");
             assert!(dbg!(msg).contains("expected 1 types, found 2"))
         }
     }
@@ -1450,7 +1451,7 @@ fn typed_funcs_count_params_correctly_in_error_messages(config: &mut Config) -> 
     match instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "f") {
         Ok(_) => panic!("should be wrong signature"),
         Err(e) => {
-            let msg = format!("{:?}", e);
+            let msg = format!("{e:?}");
             assert!(dbg!(msg).contains("expected 3 types, found 2"))
         }
     }
@@ -1966,7 +1967,7 @@ fn typed_v128(config: &mut Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[wasmtime_test(wasm_features(simd))]
+#[wasmtime_test]
 #[cfg_attr(miri, ignore)]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn typed_v128_imports(config: &mut Config) -> anyhow::Result<()> {

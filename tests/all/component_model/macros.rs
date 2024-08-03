@@ -4,7 +4,7 @@ use super::{make_echo_component, TypedFuncExt};
 use anyhow::Result;
 use component_macro_test::{add_variants, flags_test};
 use wasmtime::component::{Component, ComponentType, Lift, Linker, Lower};
-use wasmtime::Store;
+use wasmtime::{Engine, Store};
 
 #[test]
 fn record_derive() -> Result<()> {
@@ -307,7 +307,7 @@ fn enum_derive() -> Result<()> {
             &format!(
                 "(enum {})",
                 (0..257)
-                    .map(|index| format!(r#""V{}""#, index))
+                    .map(|index| format!(r#""V{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -337,7 +337,9 @@ fn enum_derive() -> Result<()> {
 
 #[test]
 fn flags() -> Result<()> {
-    let engine = super::engine();
+    let mut config = component_test_util::config();
+    config.wasm_component_model_more_flags(true);
+    let engine = Engine::new(&config)?;
     let mut store = Store::new(&engine, ());
 
     // Simple 8-bit flags
@@ -451,7 +453,7 @@ fn flags() -> Result<()> {
             &format!(
                 r#"(flags {})"#,
                 (0..8)
-                    .map(|index| format!(r#""F{}""#, index))
+                    .map(|index| format!(r#""F{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -500,7 +502,7 @@ fn flags() -> Result<()> {
             &format!(
                 "(flags {})",
                 (0..9)
-                    .map(|index| format!(r#""F{}""#, index))
+                    .map(|index| format!(r#""F{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -548,7 +550,7 @@ fn flags() -> Result<()> {
             &format!(
                 r#"(flags {})"#,
                 (0..16)
-                    .map(|index| format!(r#""F{}""#, index))
+                    .map(|index| format!(r#""F{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -587,7 +589,7 @@ fn flags() -> Result<()> {
             &format!(
                 "(flags {})",
                 (0..17)
-                    .map(|index| format!(r#""F{}""#, index))
+                    .map(|index| format!(r#""F{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -635,7 +637,7 @@ fn flags() -> Result<()> {
             &format!(
                 r#"(flags {})"#,
                 (0..32)
-                    .map(|index| format!(r#""F{}""#, index))
+                    .map(|index| format!(r#""F{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -674,7 +676,7 @@ fn flags() -> Result<()> {
             &format!(
                 "(flags {})",
                 (0..33)
-                    .map(|index| format!(r#""F{}""#, index))
+                    .map(|index| format!(r#""F{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),
@@ -707,7 +709,7 @@ fn flags() -> Result<()> {
             &format!(
                 "(flags {})",
                 (0..65)
-                    .map(|index| format!(r#""F{}""#, index))
+                    .map(|index| format!(r#""F{index}""#))
                     .collect::<Vec<_>>()
                     .join(" ")
             ),

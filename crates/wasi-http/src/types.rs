@@ -8,7 +8,10 @@ use crate::{
     error::dns_error,
     hyper_request_error,
 };
+use anyhow::bail;
+use bytes::Bytes;
 use http_body_util::BodyExt;
+use hyper::body::Body;
 use hyper::header::HeaderName;
 use std::any::Any;
 use std::time::Duration;
@@ -18,6 +21,7 @@ use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::{runtime::AbortOnDropJoinHandle, Subscribe};
 
 /// Capture the state necessary for use in the wasi-http API implementation.
+#[derive(Debug)]
 pub struct WasiHttpCtx {
     _priv: (),
 }
@@ -30,6 +34,45 @@ impl WasiHttpCtx {
 }
 
 /// A trait which provides internal WASI HTTP state.
+///
+/// # Example
+///
+/// ```
+/// use wasmtime::component::ResourceTable;
+/// use wasmtime_wasi::{WasiCtx, WasiView, WasiCtxBuilder};
+/// use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+///
+/// struct MyState {
+///     ctx: WasiCtx,
+///     http_ctx: WasiHttpCtx,
+///     table: ResourceTable,
+/// }
+///
+/// impl WasiHttpView for MyState {
+///     fn ctx(&mut self) -> &mut WasiHttpCtx { &mut self.http_ctx }
+///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+/// }
+///
+/// impl WasiView for MyState {
+///     fn ctx(&mut self) -> &mut WasiCtx { &mut self.ctx }
+///     fn table(&mut self) -> &mut ResourceTable { &mut self.table }
+/// }
+///
+/// impl MyState {
+///     fn new() -> MyState {
+///         let mut wasi = WasiCtxBuilder::new();
+///         wasi.arg("./foo.wasm");
+///         wasi.arg("--help");
+///         wasi.env("FOO", "bar");
+///
+///         MyState {
+///             ctx: wasi.build(),
+///             table: ResourceTable::new(),
+///             http_ctx: WasiHttpCtx::new(),
+///         }
+///     }
+/// }
+/// ```
 pub trait WasiHttpView: Send {
     /// Returns a mutable reference to the WASI HTTP context.
     fn ctx(&mut self) -> &mut WasiHttpCtx;
@@ -38,20 +81,23 @@ pub trait WasiHttpView: Send {
     fn table(&mut self) -> &mut ResourceTable;
 
     /// Create a new incoming request resource.
-    fn new_incoming_request(
+    fn new_incoming_request<B>(
         &mut self,
-        req: hyper::Request<HyperIncomingBody>,
+        scheme: Scheme,
+        req: hyper::Request<B>,
     ) -> wasmtime::Result<Resource<HostIncomingRequest>>
     where
+        B: Body<Data = Bytes, Error = hyper::Error> + Send + Sync + 'static,
         Self: Sized,
     {
         let (parts, body) = req.into_parts();
+        let body = body.map_err(crate::hyper_response_error).boxed();
         let body = HostIncomingBody::new(
             body,
             // TODO: this needs to be plumbed through
             std::time::Duration::from_millis(600 * 1000),
         );
-        let incoming_req = HostIncomingRequest::new(self, parts, Some(body));
+        let incoming_req = HostIncomingRequest::new(self, parts, scheme, Some(body))?;
         Ok(self.table().push(incoming_req)?)
     }
 
@@ -151,9 +197,9 @@ impl<T: ?Sized + WasiHttpView> WasiHttpView for Box<T> {
 /// themselves (or `add_to_linker_get_host`).
 ///
 /// This type is automatically used when using
-/// [`wasmtime_wasi_http::proxy::add_to_linker`](crate::proxy::add_to_linker)
+/// [`add_to_linker_async`](crate::add_to_linker_async)
 /// or
-/// [`wasmtime_wasi_http::proxy::sync::add_to_linker`](crate::proxy::sync::add_to_linker)
+/// [`add_to_linker_sync`](crate::add_to_linker_sync)
 /// and doesn't need to be manually configured.
 #[repr(transparent)]
 pub struct WasiHttpImpl<T>(pub T);
@@ -441,8 +487,11 @@ impl TryInto<http::Method> for types::Method {
 }
 
 /// The concrete type behind a `wasi:http/types/incoming-request` resource.
+#[derive(Debug)]
 pub struct HostIncomingRequest {
     pub(crate) parts: http::request::Parts,
+    pub(crate) scheme: Scheme,
+    pub(crate) authority: String,
     /// The body of the incoming request.
     pub body: Option<HostIncomingBody>,
 }
@@ -452,10 +501,24 @@ impl HostIncomingRequest {
     pub fn new(
         view: &mut dyn WasiHttpView,
         mut parts: http::request::Parts,
+        scheme: Scheme,
         body: Option<HostIncomingBody>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let authority = match parts.uri.authority() {
+            Some(authority) => authority.to_string(),
+            None => match parts.headers.get(http::header::HOST) {
+                Some(host) => host.to_str()?.to_string(),
+                None => bail!("invalid HTTP request missing authority in URI and host header"),
+            },
+        };
+
         remove_forbidden_headers(view, &mut parts.headers);
-        Self { parts, body }
+        Ok(Self {
+            parts,
+            authority,
+            scheme,
+            body,
+        })
     }
 }
 
@@ -500,6 +563,7 @@ impl TryFrom<HostOutgoingResponse> for hyper::Response<HyperOutgoingBody> {
 }
 
 /// The concrete type behind a `wasi:http/types/outgoing-request` resource.
+#[derive(Debug)]
 pub struct HostOutgoingRequest {
     /// The method of the request.
     pub method: Method,
@@ -516,7 +580,7 @@ pub struct HostOutgoingRequest {
 }
 
 /// The concrete type behind a `wasi:http/types/request-options` resource.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct HostRequestOptions {
     /// How long to wait for a connection to be established.
     pub connect_timeout: Option<std::time::Duration>,
@@ -527,6 +591,7 @@ pub struct HostRequestOptions {
 }
 
 /// The concrete type behind a `wasi:http/types/incoming-response` resource.
+#[derive(Debug)]
 pub struct HostIncomingResponse {
     /// The response status
     pub status: u16,
@@ -537,6 +602,7 @@ pub struct HostIncomingResponse {
 }
 
 /// The concrete type behind a `wasi:http/types/fields` resource.
+#[derive(Debug)]
 pub enum HostFields {
     /// A reference to the fields of a parent entry.
     Ref {
@@ -565,6 +631,7 @@ pub type FutureIncomingResponseHandle =
     AbortOnDropJoinHandle<anyhow::Result<Result<IncomingResponse, types::ErrorCode>>>;
 
 /// A response that is in the process of being received.
+#[derive(Debug)]
 pub struct IncomingResponse {
     /// The response itself.
     pub resp: hyper::Response<HyperIncomingBody>,
@@ -575,6 +642,7 @@ pub struct IncomingResponse {
 }
 
 /// The concrete type behind a `wasi:http/types/future-incoming-response` resource.
+#[derive(Debug)]
 pub enum HostFutureIncomingResponse {
     /// A pending response
     Pending(FutureIncomingResponseHandle),

@@ -59,8 +59,10 @@
 //!
 //! ```plain
 //!   (high address)
-//!
-//!                              +---------------------------+
+//!                              |          ...              |
+//!                              | caller frames             |
+//!                              |          ...              |
+//!                              +===========================+
 //!                              |          ...              |
 //!                              | stack args                |
 //! Canonical Frame Address -->  | (accessed via FP)         |
@@ -68,24 +70,24 @@
 //! SP at function entry ----->  | return address            |
 //!                              +---------------------------+
 //! FP after prologue -------->  | FP (pushed by prologue)   |
-//!                              +---------------------------+
-//!                              |          ...              |
-//!                              | clobbered callee-saves    |
-//! unwind-frame base -------->  | (pushed by prologue)      |
-//!                              +---------------------------+
-//!                              |          ...              |
-//!                              | spill slots               |
-//!                              | (accessed via SP)         |
-//!                              |          ...              |
-//!                              | stack slots               |
-//!                              | (accessed via SP)         |
-//!                              | (alloc'd by prologue)     |
-//!                              +---------------------------+
-//!                              | [alignment as needed]     |
-//!                              |          ...              |
-//!                              | args for largest call     |
-//! SP ----------------------->  | (alloc'd by prologue)     |
-//!                              +---------------------------+
+//!                              +---------------------------+   -----
+//!                              |          ...              |     |
+//!                              | clobbered callee-saves    |     |
+//! unwind-frame base -------->  | (pushed by prologue)      |     |
+//!                              +---------------------------+     |
+//!                              |          ...              |     |
+//!                              | spill slots               |     |
+//!                              | (accessed via SP)         |   active
+//!                              |          ...              |    size
+//!                              | stack slots               |     |
+//!                              | (accessed via SP)         |     |
+//!                              | (alloc'd by prologue)     |     |
+//!                              +---------------------------+     |
+//!                              | [alignment as needed]     |     |
+//!                              |          ...              |     |
+//!                              | args for largest call     |     |
+//! SP ----------------------->  | (alloc'd by prologue)     |     |
+//!                              +===========================+   -----
 //!
 //!   (low address)
 //! ```
@@ -544,7 +546,6 @@ pub trait ABIMachineSpec {
         uses: CallArgList,
         defs: CallRetList,
         clobbers: PRegSet,
-        opcode: ir::Opcode,
         tmp: Writable<Reg>,
         callee_conv: isa::CallConv,
         caller_conv: isa::CallConv,
@@ -888,39 +889,6 @@ impl SigSet {
         self.rets(sig)[idx].clone()
     }
 
-    /// Return all clobbers for the callsite.
-    pub fn call_clobbers<M: ABIMachineSpec>(&self, sig: Sig) -> PRegSet {
-        let sig_data = &self.sigs[sig];
-        // Get clobbers: all caller-saves. These may include return value
-        // regs, which we will remove from the clobber set below.
-        let mut clobbers = M::get_regs_clobbered_by_call(sig_data.call_conv);
-
-        // Remove retval regs from clobbers. Skip StructRets: these
-        // are not, semantically, returns at the CLIF level, so we
-        // treat such a value as a clobber instead.
-        for ret in self.rets(sig) {
-            if let &ABIArg::Slots {
-                ref slots, purpose, ..
-            } = ret
-            {
-                if purpose == ir::ArgumentPurpose::StructReturn {
-                    continue;
-                }
-                for slot in slots {
-                    match slot {
-                        &ABIArgSlot::Reg { reg, .. } => {
-                            crate::trace!("call_clobbers: retval reg {:?}", reg);
-                            clobbers.remove(PReg::from(reg));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        clobbers
-    }
-
     /// Get the number of arguments expected.
     pub fn num_args(&self, sig: Sig) -> usize {
         let len = self.args(sig).len();
@@ -1011,6 +979,12 @@ impl FrameLayout {
         );
         debug_assert!(floats.iter().all(|r| r.to_reg().class() == RegClass::Float));
         (ints, floats)
+    }
+
+    /// The size of FP to SP while the frame is active (not during prologue
+    /// setup or epilogue tear down).
+    pub fn active_size(&self) -> u32 {
+        self.outgoing_args_size + self.fixed_frame_storage_size + self.clobber_size
     }
 }
 
@@ -1359,6 +1333,11 @@ impl<M: ABIMachineSpec> Callee<M> {
             self.ret_area_ptr = Some(ret_area_ptr.only_reg().unwrap());
         }
         Ok(())
+    }
+
+    /// Get the return area pointer register, if any.
+    pub fn ret_area_ptr(&self) -> Option<Reg> {
+        self.ret_area_ptr
     }
 
     /// Accumulate outgoing arguments.
@@ -1948,6 +1927,11 @@ pub struct CallRetPair {
 pub type CallArgList = SmallVec<[CallArgPair; 8]>;
 pub type CallRetList = SmallVec<[CallRetPair; 8]>;
 
+pub enum IsTailCall {
+    Yes,
+    No,
+}
+
 /// ABI object for a callsite.
 pub struct CallSite<M: ABIMachineSpec> {
     /// The called function's signature.
@@ -1957,12 +1941,9 @@ pub struct CallSite<M: ABIMachineSpec> {
     uses: CallArgList,
     /// All defs for the callsite, i.e., return values.
     defs: CallRetList,
-    /// Caller-save clobbers.
-    clobbers: PRegSet,
     /// Call destination.
     dest: CallDest,
-    /// Actual call opcode; used to distinguish various types of calls.
-    opcode: ir::Opcode,
+    is_tail_call: IsTailCall,
     /// Caller's calling convention.
     caller_conv: isa::CallConv,
     /// The settings controlling this compilation.
@@ -1986,20 +1967,18 @@ impl<M: ABIMachineSpec> CallSite<M> {
         sigs: &SigSet,
         sig_ref: ir::SigRef,
         extname: &ir::ExternalName,
-        opcode: ir::Opcode,
+        is_tail_call: IsTailCall,
         dist: RelocDistance,
         caller_conv: isa::CallConv,
         flags: settings::Flags,
     ) -> CallSite<M> {
         let sig = sigs.abi_sig_for_sig_ref(sig_ref);
-        let clobbers = sigs.call_clobbers::<M>(sig);
         CallSite {
             sig,
             uses: smallvec![],
             defs: smallvec![],
-            clobbers,
             dest: CallDest::ExtName(extname.clone(), dist),
-            opcode,
+            is_tail_call,
             caller_conv,
             flags,
             _mach: PhantomData,
@@ -2017,14 +1996,12 @@ impl<M: ABIMachineSpec> CallSite<M> {
         flags: settings::Flags,
     ) -> CallSite<M> {
         let sig = sigs.abi_sig_for_signature(sig);
-        let clobbers = sigs.call_clobbers::<M>(sig);
         CallSite {
             sig,
             uses: smallvec![],
             defs: smallvec![],
-            clobbers,
             dest: CallDest::ExtName(extname.clone(), dist),
-            opcode: ir::Opcode::Call,
+            is_tail_call: IsTailCall::No,
             caller_conv,
             flags,
             _mach: PhantomData,
@@ -2037,19 +2014,17 @@ impl<M: ABIMachineSpec> CallSite<M> {
         sigs: &SigSet,
         sig_ref: ir::SigRef,
         ptr: Reg,
-        opcode: ir::Opcode,
+        is_tail_call: IsTailCall,
         caller_conv: isa::CallConv,
         flags: settings::Flags,
     ) -> CallSite<M> {
         let sig = sigs.abi_sig_for_sig_ref(sig_ref);
-        let clobbers = sigs.call_clobbers::<M>(sig);
         CallSite {
             sig,
             uses: smallvec![],
             defs: smallvec![],
-            clobbers,
             dest: CallDest::Reg(ptr),
-            opcode,
+            is_tail_call,
             caller_conv,
             flags,
             _mach: PhantomData,
@@ -2058,10 +2033,6 @@ impl<M: ABIMachineSpec> CallSite<M> {
 
     pub(crate) fn dest(&self) -> &CallDest {
         &self.dest
-    }
-
-    pub(crate) fn opcode(&self) -> ir::Opcode {
-        self.opcode
     }
 
     pub(crate) fn take_uses(self) -> CallArgList {
@@ -2073,10 +2044,7 @@ impl<M: ABIMachineSpec> CallSite<M> {
     }
 
     pub(crate) fn is_tail_call(&self) -> bool {
-        matches!(
-            self.opcode,
-            ir::Opcode::ReturnCall | ir::Opcode::ReturnCallIndirect
-        )
+        matches!(self.is_tail_call, IsTailCall::Yes)
     }
 }
 
@@ -2084,6 +2052,11 @@ impl<M: ABIMachineSpec> CallSite<M> {
     /// Get the number of arguments expected.
     pub fn num_args(&self, sigs: &SigSet) -> usize {
         sigs.num_args(self.sig)
+    }
+
+    /// Get the number of return values expected.
+    pub fn num_rets(&self, sigs: &SigSet) -> usize {
+        sigs.num_rets(self.sig)
     }
 
     /// Emit a copy of a large argument into its associated stack buffer, if
@@ -2289,25 +2262,28 @@ impl<M: ABIMachineSpec> CallSite<M> {
     /// Define a return value after the call returns.
     pub fn gen_retval(
         &mut self,
-        ctx: &Lower<M::I>,
+        ctx: &mut Lower<M::I>,
         idx: usize,
-        into_regs: ValueRegs<Writable<Reg>>,
-    ) -> SmallInstVec<M::I> {
+    ) -> (SmallInstVec<M::I>, ValueRegs<Reg>) {
         let mut insts = smallvec![];
-        match &ctx.sigs().rets(self.sig)[idx] {
-            &ABIArg::Slots { ref slots, .. } => {
-                assert_eq!(into_regs.len(), slots.len());
-                for (slot, into_reg) in slots.iter().zip(into_regs.regs().iter()) {
+        let mut into_regs: SmallVec<[Reg; 2]> = smallvec![];
+        let ret = ctx.sigs().rets(self.sig)[idx].clone();
+        match ret {
+            ABIArg::Slots { ref slots, .. } => {
+                for slot in slots {
                     match slot {
                         // Extension mode doesn't matter because we're copying out, not in,
                         // and we ignore high bits in our own registers by convention.
-                        &ABIArgSlot::Reg { reg, .. } => {
+                        &ABIArgSlot::Reg { reg, ty, .. } => {
+                            let into_reg = ctx.alloc_tmp(ty).only_reg().unwrap();
                             self.defs.push(CallRetPair {
-                                vreg: *into_reg,
+                                vreg: into_reg,
                                 preg: reg.into(),
                             });
+                            into_regs.push(into_reg.to_reg());
                         }
                         &ABIArgSlot::Stack { offset, ty, .. } => {
+                            let into_reg = ctx.alloc_tmp(ty).only_reg().unwrap();
                             let sig_data = &ctx.sigs()[self.sig];
                             // The outgoing argument area must always be restored after a call,
                             // ensuring that the return values will be in a consistent place after
@@ -2315,21 +2291,28 @@ impl<M: ABIMachineSpec> CallSite<M> {
                             let ret_area_base = sig_data.sized_stack_arg_space();
                             insts.push(M::gen_load_stack(
                                 StackAMode::OutgoingArg(offset + ret_area_base),
-                                *into_reg,
+                                into_reg,
                                 ty,
                             ));
+                            into_regs.push(into_reg.to_reg());
                         }
                     }
                 }
             }
-            &ABIArg::StructArg { .. } => {
+            ABIArg::StructArg { .. } => {
                 panic!("StructArg not supported in return position");
             }
-            &ABIArg::ImplicitPtrArg { .. } => {
+            ABIArg::ImplicitPtrArg { .. } => {
                 panic!("ImplicitPtrArg not supported in return position");
             }
         }
-        insts
+
+        let value_regs = match *into_regs {
+            [a] => ValueRegs::one(a),
+            [a, b] => ValueRegs::two(a, b),
+            _ => panic!("Expected to see one or two slots only from {:?}", ret),
+        };
+        (insts, value_regs)
     }
 
     /// Emit the call itself.
@@ -2357,10 +2340,20 @@ impl<M: ABIMachineSpec> CallSite<M> {
             self.gen_arg(ctx, i.into(), ValueRegs::one(rd.to_reg()));
         }
 
-        let (uses, defs) = (
-            mem::replace(&mut self.uses, Default::default()),
-            mem::replace(&mut self.defs, Default::default()),
-        );
+        let uses = mem::take(&mut self.uses);
+        let defs = mem::take(&mut self.defs);
+        let clobbers = {
+            // Get clobbers: all caller-saves. These may include return value
+            // regs, which we will remove from the clobber set below.
+            let mut clobbers = <M>::get_regs_clobbered_by_call(ctx.sigs()[self.sig].call_conv);
+
+            // Remove retval regs from clobbers.
+            for def in &defs {
+                clobbers.remove(PReg::from(def.preg.to_real_reg().unwrap()));
+            }
+
+            clobbers
+        };
 
         let sig = &ctx.sigs()[self.sig];
         let callee_pop_size = if sig.call_conv() == isa::CallConv::Tail {
@@ -2392,8 +2385,7 @@ impl<M: ABIMachineSpec> CallSite<M> {
             &self.dest,
             uses,
             defs,
-            self.clobbers,
-            self.opcode,
+            clobbers,
             tmp,
             call_conv,
             self.caller_conv,

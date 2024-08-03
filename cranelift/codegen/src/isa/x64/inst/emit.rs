@@ -1,4 +1,3 @@
-use crate::ir;
 use crate::ir::immediates::{Ieee32, Ieee64};
 use crate::ir::KnownSymbol;
 use crate::isa::x64::encoding::evex::{EvexInstruction, EvexVectorLength, RegisterOrAmode};
@@ -33,7 +32,7 @@ fn emit_signed_cvt(
         op,
         dst,
         src1: dst.to_reg(),
-        src2: GprMem::new(RegMem::reg(src)).unwrap(),
+        src2: GprMem::unwrap_new(RegMem::reg(src)),
         src2_size: OperandSize::Size64,
     }
     .emit(sink, info, state);
@@ -166,9 +165,9 @@ pub(crate) fn emit(
             let mut rex = RexFlags::from(*size);
             let (opcode_r, opcode_m, subopcode_i) = match op {
                 AluRmiROpcode::Add => (0x01, 0x03, 0),
-                AluRmiROpcode::Adc => (0x11, 0x03, 0),
+                AluRmiROpcode::Adc => (0x11, 0x03, 2),
                 AluRmiROpcode::Sub => (0x29, 0x2B, 5),
-                AluRmiROpcode::Sbb => (0x19, 0x2B, 5),
+                AluRmiROpcode::Sbb => (0x19, 0x2B, 3),
                 AluRmiROpcode::And => (0x21, 0x23, 4),
                 AluRmiROpcode::Or => (0x09, 0x0B, 1),
                 AluRmiROpcode::Xor => (0x31, 0x33, 6),
@@ -789,18 +788,18 @@ pub(crate) fn emit(
                     DivSignedness::Signed,
                     TrapCode::IntegerDivisionByZero,
                     RegMem::reg(divisor),
-                    Gpr::new(regs::rax()).unwrap(),
-                    Writable::from_reg(Gpr::new(regs::rax()).unwrap()),
+                    Gpr::unwrap_new(regs::rax()),
+                    Writable::from_reg(Gpr::unwrap_new(regs::rax())),
                 ),
                 _ => Inst::div(
                     size,
                     DivSignedness::Signed,
                     TrapCode::IntegerDivisionByZero,
                     RegMem::reg(divisor),
-                    Gpr::new(regs::rax()).unwrap(),
-                    Gpr::new(regs::rdx()).unwrap(),
-                    Writable::from_reg(Gpr::new(regs::rax()).unwrap()),
-                    Writable::from_reg(Gpr::new(regs::rdx()).unwrap()),
+                    Gpr::unwrap_new(regs::rax()),
+                    Gpr::unwrap_new(regs::rdx()),
+                    Writable::from_reg(Gpr::unwrap_new(regs::rax())),
+                    Writable::from_reg(Gpr::unwrap_new(regs::rdx())),
                 ),
             };
             inst.emit(sink, info, state);
@@ -885,7 +884,7 @@ pub(crate) fn emit(
         Inst::MovFromPReg { src, dst } => {
             let src: Reg = (*src).into();
             debug_assert!([regs::rsp(), regs::rbp(), regs::pinned_reg()].contains(&src));
-            let src = Gpr::new(src).unwrap();
+            let src = Gpr::unwrap_new(src);
             let size = OperandSize::Size64;
             let dst = WritableGpr::from_writable_reg(dst.to_writable_reg()).unwrap();
             Inst::MovRR { size, src, dst }.emit(sink, info, state);
@@ -893,7 +892,7 @@ pub(crate) fn emit(
 
         Inst::MovToPReg { src, dst } => {
             let src = src.to_reg();
-            let src = Gpr::new(src).unwrap();
+            let src = Gpr::unwrap_new(src);
             let dst: Reg = (*dst).into();
             debug_assert!([regs::rsp(), regs::rbp(), regs::pinned_reg()].contains(&dst));
             let dst = WritableGpr::from_writable_reg(Writable::from_reg(dst)).unwrap();
@@ -1417,7 +1416,7 @@ pub(crate) fn emit(
             let alternative = alternative.to_reg();
             let dst = dst.to_writable_reg();
             debug_assert_eq!(alternative, dst.to_reg());
-            let consequent = consequent.clone().to_reg();
+            let consequent = consequent.to_reg();
 
             // Lowering of the Select IR opcode when the input is an fcmp relies on the fact that
             // this doesn't clobber flags. Make sure to not do so here.
@@ -1429,10 +1428,11 @@ pub(crate) fn emit(
             let op = match *ty {
                 types::F64 => SseOpcode::Movsd,
                 types::F32 => SseOpcode::Movsd,
+                types::F16 => SseOpcode::Movsd,
                 types::F32X4 => SseOpcode::Movaps,
                 types::F64X2 => SseOpcode::Movapd,
                 ty => {
-                    debug_assert!(ty.is_vector() && ty.bytes() == 16);
+                    debug_assert!((ty.is_float() || ty.is_vector()) && ty.bytes() == 16);
                     SseOpcode::Movdqa
                 }
             };
@@ -1596,20 +1596,24 @@ pub(crate) fn emit(
 
         Inst::CallKnown {
             dest,
-            opcode,
             info: call_info,
+            ..
         } => {
-            if let Some(s) = state.take_stack_map() {
+            let (stack_map, user_stack_map) = state.take_stack_map();
+            if let Some(s) = stack_map {
                 sink.add_stack_map(StackMapExtent::UpcomingBytes(5), s);
             }
+            if let Some(s) = user_stack_map {
+                let offset = sink.cur_offset() + 5;
+                sink.push_user_stack_map(state, offset, s);
+            }
+
             sink.put1(0xE8);
             // The addend adjusts for the difference between the end of the instruction and the
             // beginning of the immediate field.
             emit_reloc(sink, Reloc::X86CallPCRel4, &dest, -4);
             sink.put4(0);
-            if opcode.is_call() {
-                sink.add_call_site(*opcode);
-            }
+            sink.add_call_site();
 
             // Reclaim the outgoing argument area that was released by the callee, to ensure that
             // StackAMode values are always computed from a consistent SP.
@@ -1642,7 +1646,7 @@ pub(crate) fn emit(
             // beginning of the immediate field.
             emit_reloc(sink, Reloc::X86CallPCRel4, &callee, -4);
             sink.put4(0);
-            sink.add_call_site(ir::Opcode::ReturnCall);
+            sink.add_call_site();
         }
 
         Inst::ReturnCallUnknown {
@@ -1657,13 +1661,13 @@ pub(crate) fn emit(
                 target: RegMem::reg(callee),
             }
             .emit(sink, info, state);
-            sink.add_call_site(ir::Opcode::ReturnCallIndirect);
+            sink.add_call_site();
         }
 
         Inst::CallUnknown {
             dest,
-            opcode,
             info: call_info,
+            ..
         } => {
             let dest = dest.clone();
 
@@ -1696,12 +1700,17 @@ pub(crate) fn emit(
                     );
                 }
             }
-            if let Some(s) = state.take_stack_map() {
+
+            let (stack_map, user_stack_map) = state.take_stack_map();
+            if let Some(s) = stack_map {
                 sink.add_stack_map(StackMapExtent::StartedAtOffset(start_offset), s);
             }
-            if opcode.is_call() {
-                sink.add_call_site(*opcode);
+            if let Some(s) = user_stack_map {
+                let offset = sink.cur_offset();
+                sink.push_user_stack_map(state, offset, s);
             }
+
+            sink.add_call_site();
 
             // Reclaim the outgoing argument area that was released by the callee, to ensure that
             // StackAMode values are always computed from a consistent SP.
@@ -1858,8 +1867,8 @@ pub(crate) fn emit(
                 ExtMode::LQ,
                 RegMem::mem(Amode::imm_reg_reg_shift(
                     0,
-                    Gpr::new(tmp1.to_reg()).unwrap(),
-                    Gpr::new(idx).unwrap(),
+                    Gpr::unwrap_new(tmp1.to_reg()),
+                    Gpr::unwrap_new(idx),
                     2,
                 )),
                 tmp2,
@@ -1931,7 +1940,7 @@ pub(crate) fn emit(
             emit(
                 &Inst::XmmUnaryRmRUnaligned {
                     op: *op,
-                    src: XmmMem::new(src.clone().into()).unwrap(),
+                    src: XmmMem::unwrap_new(src.clone().into()),
                     dst: *dst,
                 },
                 sink,
@@ -2089,7 +2098,7 @@ pub(crate) fn emit(
                 op: *op,
                 dst: *dst,
                 src1: *src1,
-                src2: XmmMem::new(src2.clone().to_reg_mem()).unwrap(),
+                src2: XmmMem::unwrap_new(src2.clone().to_reg_mem()),
             },
             sink,
             info,
@@ -2567,6 +2576,22 @@ pub(crate) fn emit(
                 AvxOpcode::Vfmadd213pd => (true, OpcodeMap::_0F38, 0xA8),
                 AvxOpcode::Vfnmadd132pd => (true, OpcodeMap::_0F38, 0x9C),
                 AvxOpcode::Vfnmadd213pd => (true, OpcodeMap::_0F38, 0xAC),
+                AvxOpcode::Vfmsub132ss => (false, OpcodeMap::_0F38, 0x9B),
+                AvxOpcode::Vfmsub213ss => (false, OpcodeMap::_0F38, 0xAB),
+                AvxOpcode::Vfnmsub132ss => (false, OpcodeMap::_0F38, 0x9F),
+                AvxOpcode::Vfnmsub213ss => (false, OpcodeMap::_0F38, 0xAF),
+                AvxOpcode::Vfmsub132sd => (true, OpcodeMap::_0F38, 0x9B),
+                AvxOpcode::Vfmsub213sd => (true, OpcodeMap::_0F38, 0xAB),
+                AvxOpcode::Vfnmsub132sd => (true, OpcodeMap::_0F38, 0x9F),
+                AvxOpcode::Vfnmsub213sd => (true, OpcodeMap::_0F38, 0xAF),
+                AvxOpcode::Vfmsub132ps => (false, OpcodeMap::_0F38, 0x9A),
+                AvxOpcode::Vfmsub213ps => (false, OpcodeMap::_0F38, 0xAA),
+                AvxOpcode::Vfnmsub132ps => (false, OpcodeMap::_0F38, 0x9E),
+                AvxOpcode::Vfnmsub213ps => (false, OpcodeMap::_0F38, 0xAE),
+                AvxOpcode::Vfmsub132pd => (true, OpcodeMap::_0F38, 0x9A),
+                AvxOpcode::Vfmsub213pd => (true, OpcodeMap::_0F38, 0xAA),
+                AvxOpcode::Vfnmsub132pd => (true, OpcodeMap::_0F38, 0x9E),
+                AvxOpcode::Vfnmsub213pd => (true, OpcodeMap::_0F38, 0xAE),
                 AvxOpcode::Vblendvps => (false, OpcodeMap::_0F3A, 0x4A),
                 AvxOpcode::Vblendvpd => (false, OpcodeMap::_0F3A, 0x4B),
                 AvxOpcode::Vpblendvb => (false, OpcodeMap::_0F3A, 0x4C),
@@ -3373,7 +3398,7 @@ pub(crate) fn emit(
             let inst = Inst::shift_r(
                 OperandSize::Size64,
                 ShiftKind::ShiftRightLogical,
-                Imm8Gpr::new(Imm8Reg::Imm8 { imm: 1 }).unwrap(),
+                Imm8Gpr::unwrap_new(Imm8Reg::Imm8 { imm: 1 }),
                 tmp_gpr1.to_reg(),
                 tmp_gpr1,
             );
@@ -3553,7 +3578,7 @@ pub(crate) fn emit(
                 let output_bits = dst_size.to_bits();
                 match *src_size {
                     OperandSize::Size32 => {
-                        let cst = Ieee32::pow2(output_bits - 1).neg().bits();
+                        let cst = (-Ieee32::pow2(output_bits - 1)).bits();
                         let inst = Inst::imm(OperandSize::Size32, cst as u64, tmp_gpr);
                         inst.emit(sink, info, state);
                     }
@@ -3564,7 +3589,7 @@ pub(crate) fn emit(
                             no_overflow_cc = CC::NBE; // >
                             Ieee64::fcvt_to_sint_negative_overflow(output_bits)
                         } else {
-                            Ieee64::pow2(output_bits - 1).neg()
+                            -Ieee64::pow2(output_bits - 1)
                         };
                         let inst = Inst::imm(OperandSize::Size64, cst.bits(), tmp_gpr);
                         inst.emit(sink, info, state);

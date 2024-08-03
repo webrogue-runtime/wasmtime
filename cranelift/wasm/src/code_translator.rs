@@ -639,7 +639,6 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         Operator::CallIndirect {
             type_index,
             table_index,
-            table_byte: _,
         } => {
             // `type_index` is the index of the function's signature and
             // `table_index` is the index of the table to search the function
@@ -750,7 +749,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
          * Memory management is handled by environment. It is usually translated into calls to
          * special functions.
          ************************************************************************************/
-        Operator::MemoryGrow { mem, mem_byte: _ } => {
+        Operator::MemoryGrow { mem } => {
             // The WebAssembly MVP only supports one linear memory, but we expect the reserved
             // argument to be a memory index.
             let heap_index = MemoryIndex::from_u32(*mem);
@@ -759,7 +758,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
             environ.before_memory_grow(builder, val, heap_index);
             state.push1(environ.translate_memory_grow(builder.cursor(), heap_index, heap, val)?)
         }
-        Operator::MemorySize { mem, mem_byte: _ } => {
+        Operator::MemorySize { mem } => {
             let heap_index = MemoryIndex::from_u32(*mem);
             let heap = state.get_heap(builder.func, *mem, environ)?;
             state.push1(environ.translate_memory_size(builder.cursor(), heap_index, heap)?);
@@ -1690,17 +1689,17 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         | Operator::V128Store32Lane { memarg, lane }
         | Operator::V128Store64Lane { memarg, lane } => {
             let vector = pop1_with_bitcast(state, type_of(op), builder);
-            state.push1(builder.ins().extractlane(vector, lane.clone()));
+            state.push1(builder.ins().extractlane(vector, *lane));
             translate_store(memarg, ir::Opcode::Store, builder, state, environ)?;
         }
         Operator::I8x16ExtractLaneS { lane } | Operator::I16x8ExtractLaneS { lane } => {
             let vector = pop1_with_bitcast(state, type_of(op), builder);
-            let extracted = builder.ins().extractlane(vector, lane.clone());
+            let extracted = builder.ins().extractlane(vector, *lane);
             state.push1(builder.ins().sextend(I32, extracted))
         }
         Operator::I8x16ExtractLaneU { lane } | Operator::I16x8ExtractLaneU { lane } => {
             let vector = pop1_with_bitcast(state, type_of(op), builder);
-            let extracted = builder.ins().extractlane(vector, lane.clone());
+            let extracted = builder.ins().extractlane(vector, *lane);
             state.push1(builder.ins().uextend(I32, extracted));
             // On x86, PEXTRB zeroes the upper bits of the destination register of extractlane so
             // uextend could be elided; for now, uextend is needed for Cranelift's type checks to
@@ -1711,7 +1710,7 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         | Operator::F32x4ExtractLane { lane }
         | Operator::F64x2ExtractLane { lane } => {
             let vector = pop1_with_bitcast(state, type_of(op), builder);
-            state.push1(builder.ins().extractlane(vector, lane.clone()))
+            state.push1(builder.ins().extractlane(vector, *lane))
         }
         Operator::I8x16ReplaceLane { lane } | Operator::I16x8ReplaceLane { lane } => {
             let (vector, replacement) = state.pop2();
@@ -2552,7 +2551,34 @@ pub fn translate_operator<FE: FuncEnvironment + ?Sized>(
         | Operator::GlobalAtomicRmwXor { .. }
         | Operator::GlobalAtomicRmwAnd { .. }
         | Operator::GlobalAtomicRmwXchg { .. }
-        | Operator::GlobalAtomicRmwCmpxchg { .. } => {
+        | Operator::GlobalAtomicRmwCmpxchg { .. }
+        | Operator::TableAtomicGet { .. }
+        | Operator::TableAtomicSet { .. }
+        | Operator::TableAtomicRmwXchg { .. }
+        | Operator::TableAtomicRmwCmpxchg { .. }
+        | Operator::StructAtomicGet { .. }
+        | Operator::StructAtomicGetS { .. }
+        | Operator::StructAtomicGetU { .. }
+        | Operator::StructAtomicSet { .. }
+        | Operator::StructAtomicRmwAdd { .. }
+        | Operator::StructAtomicRmwSub { .. }
+        | Operator::StructAtomicRmwOr { .. }
+        | Operator::StructAtomicRmwXor { .. }
+        | Operator::StructAtomicRmwAnd { .. }
+        | Operator::StructAtomicRmwXchg { .. }
+        | Operator::StructAtomicRmwCmpxchg { .. }
+        | Operator::ArrayAtomicGet { .. }
+        | Operator::ArrayAtomicGetS { .. }
+        | Operator::ArrayAtomicGetU { .. }
+        | Operator::ArrayAtomicSet { .. }
+        | Operator::ArrayAtomicRmwAdd { .. }
+        | Operator::ArrayAtomicRmwSub { .. }
+        | Operator::ArrayAtomicRmwOr { .. }
+        | Operator::ArrayAtomicRmwXor { .. }
+        | Operator::ArrayAtomicRmwAnd { .. }
+        | Operator::ArrayAtomicRmwXchg { .. }
+        | Operator::ArrayAtomicRmwCmpxchg { .. }
+        | Operator::RefI31Shared { .. } => {
             unimplemented!("shared-everything-threads not yet implemented")
         }
     };

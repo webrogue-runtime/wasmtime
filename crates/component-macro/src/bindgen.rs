@@ -9,7 +9,7 @@ use syn::parse::{Error, Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::{braced, token, Token};
 use wasmtime_wit_bindgen::{AsyncConfig, Opts, Ownership, TrappableError, TrappableImports};
-use wit_parser::{PackageId, Resolve, UnresolvedPackage, WorldId};
+use wit_parser::{PackageId, Resolve, UnresolvedPackageGroup, WorldId};
 
 pub struct Config {
     opts: Opts,
@@ -197,7 +197,14 @@ fn parse_source(
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
 
     let mut parse = |resolve: &mut Resolve, path: &Path| -> anyhow::Result<_> {
-        let (pkg, sources) = resolve.push_path(path)?;
+        // Try to normalize the path to make the error message more understandable when
+        // the path is not correct. Fallback to the original path if normalization fails
+        // (probably return an error somewhere else).
+        let normalized_path = match std::fs::canonicalize(path) {
+            Ok(p) => p,
+            Err(_) => path.to_path_buf(),
+        };
+        let (pkg, sources) = resolve.push_path(normalized_path)?;
         files.extend(sources);
         Ok(pkg)
     };
@@ -208,17 +215,17 @@ fn parse_source(
         None
     };
 
-    let inline_pkg = if let Some(inline) = inline {
-        Some(resolve.push(UnresolvedPackage::parse("macro-input".as_ref(), inline)?)?)
+    let inline_pkgs = if let Some(inline) = inline {
+        Some(resolve.push_group(UnresolvedPackageGroup::parse("macro-input", inline)?)?)
     } else {
         None
     };
 
-    let pkg = inline_pkg
+    let pkgs = inline_pkgs
         .or(path_pkg)
         .map_or_else(|| parse(&mut resolve, &root.join("wit")), Ok)?;
 
-    Ok((resolve, pkg, files))
+    Ok((resolve, pkgs, files))
 }
 
 mod kw {

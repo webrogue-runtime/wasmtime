@@ -172,12 +172,13 @@
 
 use crate::binemit::{Addend, CodeOffset, Reloc, StackMap};
 use crate::ir::function::FunctionParameters;
-use crate::ir::{ExternalName, Opcode, RelSourceLoc, SourceLoc, TrapCode};
+use crate::ir::{ExternalName, RelSourceLoc, SourceLoc, TrapCode};
 use crate::isa::unwind::UnwindInst;
 use crate::machinst::{
     BlockIndex, MachInstLabelUse, TextSectionBuilder, VCodeConstant, VCodeConstants, VCodeInst,
 };
 use crate::trace;
+use crate::{ir, MachInstEmitState};
 use crate::{timing, VCodeConstantData};
 use cranelift_control::ControlPlane;
 use cranelift_entity::{entity_impl, PrimaryMap};
@@ -250,6 +251,11 @@ pub struct MachBuffer<I: VCodeInst> {
     srclocs: SmallVec<[MachSrcLoc<Stencil>; 64]>,
     /// Any stack maps referring to this code.
     stack_maps: SmallVec<[MachStackMap; 8]>,
+    /// Any user stack maps for this code.
+    ///
+    /// Each entry is an `(offset, span, stack_map)` triple. Entries are sorted
+    /// by code offset, and each stack map covers `span` bytes on the stack.
+    user_stack_maps: SmallVec<[(CodeOffset, u32, ir::UserStackMap); 8]>,
     /// Any unwind info at a given location.
     unwind_info: SmallVec<[(CodeOffset, UnwindInst); 8]>,
     /// The current source location in progress (after `start_srcloc()` and
@@ -329,6 +335,7 @@ impl MachBufferFinalized<Stencil> {
                 .map(|srcloc| srcloc.apply_base_srcloc(base_srcloc))
                 .collect(),
             stack_maps: self.stack_maps,
+            user_stack_maps: self.user_stack_maps,
             unwind_info: self.unwind_info,
             alignment: self.alignment,
         }
@@ -357,9 +364,14 @@ pub struct MachBufferFinalized<T: CompilePhase> {
     pub(crate) srclocs: SmallVec<[T::MachSrcLocType; 64]>,
     /// Any stack maps referring to this code.
     pub(crate) stack_maps: SmallVec<[MachStackMap; 8]>,
+    /// Any user stack maps for this code.
+    ///
+    /// Each entry is an `(offset, span, stack_map)` triple. Entries are sorted
+    /// by code offset, and each stack map covers `span` bytes on the stack.
+    pub(crate) user_stack_maps: SmallVec<[(CodeOffset, u32, ir::UserStackMap); 8]>,
     /// Any unwind info at a given location.
     pub unwind_info: SmallVec<[(CodeOffset, UnwindInst); 8]>,
-    /// The requireed alignment of this buffer
+    /// The required alignment of this buffer.
     pub alignment: u32,
 }
 
@@ -447,6 +459,7 @@ impl<I: VCodeInst> MachBuffer<I> {
             call_sites: SmallVec::new(),
             srclocs: SmallVec::new(),
             stack_maps: SmallVec::new(),
+            user_stack_maps: SmallVec::new(),
             unwind_info: SmallVec::new(),
             cur_srcloc: None,
             label_offsets: SmallVec::new(),
@@ -1532,6 +1545,7 @@ impl<I: VCodeInst> MachBuffer<I> {
             call_sites: self.call_sites,
             srclocs,
             stack_maps: self.stack_maps,
+            user_stack_maps: self.user_stack_maps,
             unwind_info: self.unwind_info,
             alignment,
         }
@@ -1606,14 +1620,9 @@ impl<I: VCodeInst> MachBuffer<I> {
     }
 
     /// Add a call-site record at the current offset.
-    pub fn add_call_site(&mut self, opcode: Opcode) {
-        debug_assert!(
-            opcode.is_call(),
-            "adding call site info for a non-call instruction."
-        );
+    pub fn add_call_site(&mut self) {
         self.call_sites.push(MachCallSite {
             ret_addr: self.data.len() as CodeOffset,
-            opcode,
         });
     }
 
@@ -1666,6 +1675,36 @@ impl<I: VCodeInst> MachBuffer<I> {
             offset_end: end,
             stack_map,
         });
+    }
+
+    /// Push a user stack map onto this buffer.
+    ///
+    /// The stack map is associated with the given `return_addr` code
+    /// offset. This must be the PC for the instruction just *after* this stack
+    /// map's associated instruction. For example in the sequence `call $foo;
+    /// add r8, rax`, the `return_addr` must be the offset of the start of the
+    /// `add` instruction.
+    ///
+    /// Stack maps must be pushed in sorted `return_addr` order.
+    pub fn push_user_stack_map(
+        &mut self,
+        emit_state: &I::State,
+        return_addr: CodeOffset,
+        stack_map: ir::UserStackMap,
+    ) {
+        let span = emit_state.frame_layout().active_size();
+        trace!("Adding user stack map @ {return_addr:#x} spanning {span} bytes: {stack_map:?}");
+
+        debug_assert!(
+            self.user_stack_maps
+                .last()
+                .map_or(true, |(prev_addr, _, _)| *prev_addr < return_addr),
+            "pushed stack maps out of order: {} is not less than {}",
+            self.user_stack_maps.last().unwrap().0,
+            return_addr,
+        );
+
+        self.user_stack_maps.push((return_addr, span, stack_map));
     }
 }
 
@@ -1720,6 +1759,11 @@ impl<T: CompilePhase> MachBufferFinalized<T> {
     /// Get the stack map metadata for this code.
     pub fn stack_maps(&self) -> &[MachStackMap] {
         &self.stack_maps[..]
+    }
+
+    /// Take this buffer's stack map metadata.
+    pub fn take_stack_maps(&mut self) -> SmallVec<[MachStackMap; 8]> {
+        mem::take(&mut self.stack_maps)
     }
 
     /// Get the list of call sites for this code.
@@ -1890,8 +1934,6 @@ pub struct MachTrap {
 pub struct MachCallSite {
     /// The offset of the call's return address, *relative to the containing section*.
     pub ret_addr: CodeOffset,
-    /// The call's opcode.
-    pub opcode: Opcode,
 }
 
 /// A source-location mapping resulting from a compilation.
@@ -2449,7 +2491,7 @@ mod test {
         buf.put1(2);
         buf.add_trap(TrapCode::IntegerOverflow);
         buf.add_trap(TrapCode::IntegerDivisionByZero);
-        buf.add_call_site(Opcode::Call);
+        buf.add_call_site();
         buf.add_reloc(
             Reloc::Abs4,
             &ExternalName::User(UserExternalNameRef::new(0)),
@@ -2480,9 +2522,9 @@ mod test {
         assert_eq!(
             buf.call_sites()
                 .iter()
-                .map(|call_site| (call_site.ret_addr, call_site.opcode))
+                .map(|call_site| call_site.ret_addr)
                 .collect::<Vec<_>>(),
-            vec![(2, Opcode::Call)]
+            vec![2]
         );
         assert_eq!(
             buf.relocs()

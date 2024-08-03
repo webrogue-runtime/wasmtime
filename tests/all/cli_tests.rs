@@ -221,8 +221,7 @@ fn timeout_in_start() -> Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("wasm trap: interrupt"),
-        "bad stderr: {}",
-        stderr
+        "bad stderr: {stderr}"
     );
     Ok(())
 }
@@ -244,8 +243,7 @@ fn timeout_in_invoke() -> Result<()> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("wasm trap: interrupt"),
-        "bad stderr: {}",
-        stderr
+        "bad stderr: {stderr}"
     );
     Ok(())
 }
@@ -1347,7 +1345,7 @@ mod test_programs {
         )?;
         println!("{}", String::from_utf8_lossy(&output.stderr));
         let stdout = String::from_utf8_lossy(&output.stdout);
-        println!("{}", stdout);
+        println!("{stdout}");
         assert!(stdout.starts_with("Called _start\n"));
         assert!(stdout.ends_with("Done\n"));
         assert!(output.status.success());
@@ -1507,7 +1505,7 @@ mod test_programs {
         }
 
         /// Completes this server gracefully by printing the output on failure.
-        fn finish(mut self) -> Result<String> {
+        fn finish(mut self) -> Result<(String, String)> {
             let mut child = self.child.take().unwrap();
 
             // If the child process has already exited then collect the output
@@ -1525,7 +1523,10 @@ mod test_programs {
                 bail!("child failed {output:?}");
             }
 
-            Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+            Ok((
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ))
         }
 
         /// Send a request to this server and wait for the response.
@@ -1660,7 +1661,7 @@ mod test_programs {
             )
             .await;
         assert!(result.is_err());
-        let stderr = server.finish()?;
+        let (_, stderr) = server.finish()?;
         assert!(
             stderr.contains("maximum concurrent memory limit of 0 reached"),
             "bad stderr: {stderr}",
@@ -1764,6 +1765,156 @@ mod test_programs {
                 .arg(wasm),
         )?;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_serve_with_print() -> Result<()> {
+        let server = WasmtimeServe::new(CLI_SERVE_WITH_PRINT_COMPONENT, |cmd| {
+            cmd.arg("-Scli");
+        })?;
+
+        for _ in 0..2 {
+            let resp = server
+                .send_request(
+                    hyper::Request::builder()
+                        .uri("http://localhost/")
+                        .body(String::new())
+                        .context("failed to make request")?,
+                )
+                .await?;
+            assert!(resp.status().is_success());
+        }
+
+        let (out, err) = server.finish()?;
+        assert_eq!(
+            out,
+            "\
+stdout [0] :: this is half a print to stdout
+stdout [0] :: \n\
+stdout [0] :: after empty
+stdout [1] :: this is half a print to stdout
+stdout [1] :: \n\
+stdout [1] :: after empty
+"
+        );
+        assert_eq!(
+            err,
+            "\
+stderr [0] :: this is half a print to stderr
+stderr [0] :: \n\
+stderr [0] :: after empty
+stderr [1] :: this is half a print to stderr
+stderr [1] :: \n\
+stderr [1] :: after empty
+"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_serve_authority_and_scheme() -> Result<()> {
+        let server = WasmtimeServe::new(CLI_SERVE_AUTHORITY_AND_SCHEME_COMPONENT, |cmd| {
+            cmd.arg("-Scli");
+        })?;
+
+        let resp = server
+            .send_request(
+                hyper::Request::builder()
+                    .uri("/")
+                    .header("Host", "localhost")
+                    .body(String::new())
+                    .context("failed to make request")?,
+            )
+            .await?;
+        assert!(resp.status().is_success());
+
+        let resp = server
+            .send_request(
+                hyper::Request::builder()
+                    .method("CONNECT")
+                    .uri("http://localhost/")
+                    .body(String::new())
+                    .context("failed to make request")?,
+            )
+            .await?;
+        assert!(resp.status().is_success());
+
+        Ok(())
+    }
+
+    #[test]
+    fn cli_argv0() -> Result<()> {
+        run_wasmtime(&["run", "--argv0=a", CLI_ARGV0, "a"])?;
+        run_wasmtime(&["run", "--argv0=b", CLI_ARGV0_COMPONENT, "b"])?;
+        run_wasmtime(&["run", "--argv0=foo.wasm", CLI_ARGV0, "foo.wasm"])?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_serve_runtime_config() -> Result<()> {
+        let server = WasmtimeServe::new(CLI_SERVE_RUNTIME_CONFIG_COMPONENT, |cmd| {
+            cmd.arg("-Scli");
+            cmd.arg("-Sruntime-config");
+            cmd.arg("-Sruntime-config-var=hello=world");
+        })?;
+
+        let resp = server
+            .send_request(
+                hyper::Request::builder()
+                    .uri("http://localhost/")
+                    .body(String::new())
+                    .context("failed to make request")?,
+            )
+            .await?;
+
+        assert!(resp.status().is_success());
+        assert_eq!(resp.body(), "world");
+        Ok(())
+    }
+
+    #[test]
+    fn cli_runtime_config() -> Result<()> {
+        run_wasmtime(&[
+            "run",
+            "-Sruntime-config",
+            "-Sruntime-config-var=hello=world",
+            RUNTIME_CONFIG_GET_COMPONENT,
+        ])?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_serve_keyvalue() -> Result<()> {
+        let server = WasmtimeServe::new(CLI_SERVE_KEYVALUE_COMPONENT, |cmd| {
+            cmd.arg("-Scli");
+            cmd.arg("-Skeyvalue");
+            cmd.arg("-Skeyvalue-in-memory-data=hello=world");
+        })?;
+
+        let resp = server
+            .send_request(
+                hyper::Request::builder()
+                    .uri("http://localhost/")
+                    .body(String::new())
+                    .context("failed to make request")?,
+            )
+            .await?;
+
+        assert!(resp.status().is_success());
+        assert_eq!(resp.body(), "world");
+        Ok(())
+    }
+
+    #[test]
+    fn cli_keyvalue() -> Result<()> {
+        run_wasmtime(&[
+            "run",
+            "-Skeyvalue",
+            "-Skeyvalue-in-memory-data=atomics_key=5",
+            KEYVALUE_MAIN_COMPONENT,
+        ])?;
         Ok(())
     }
 }

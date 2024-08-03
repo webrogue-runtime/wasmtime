@@ -10,9 +10,8 @@ fn checks_incompatible_target() -> Result<()> {
     ) {
         Ok(_) => unreachable!(),
         Err(e) => assert!(
-            format!("{:?}", e).contains("configuration does not match the host"),
-            "bad error: {:?}",
-            e
+            format!("{e:?}").contains("configuration does not match the host"),
+            "bad error: {e:?}"
         ),
     }
 
@@ -77,28 +76,28 @@ fn serialize_deterministic() {
         let p1 = engine.precompile_module(wasm.as_bytes()).unwrap();
         let p2 = engine.precompile_module(wasm.as_bytes()).unwrap();
         if p1 != p2 {
-            panic!("precompile_module not deterministic for:\n{}", wasm);
+            panic!("precompile_module not deterministic for:\n{wasm}");
         }
 
         let module1 = Module::new(&engine, wasm).unwrap();
         let a1 = module1.serialize().unwrap();
         let a2 = module1.serialize().unwrap();
         if a1 != a2 {
-            panic!("Module::serialize not deterministic for:\n{}", wasm);
+            panic!("Module::serialize not deterministic for:\n{wasm}");
         }
 
         let module2 = Module::new(&engine, wasm).unwrap();
         let b1 = module2.serialize().unwrap();
         let b2 = module2.serialize().unwrap();
         if b1 != b2 {
-            panic!("Module::serialize not deterministic for:\n{}", wasm);
+            panic!("Module::serialize not deterministic for:\n{wasm}");
         }
 
         if a1 != b2 {
-            panic!("not matching across modules:\n{}", wasm);
+            panic!("not matching across modules:\n{wasm}");
         }
         if b1 != p2 {
-            panic!("not matching across engine/module:\n{}", wasm);
+            panic!("not matching across engine/module:\n{wasm}");
         }
     };
 
@@ -122,7 +121,7 @@ fn serialize_not_overly_massive() -> Result<()> {
     let engine = Engine::new(&config)?;
 
     let assert_smaller_than_1mb = |module: &str| -> Result<()> {
-        println!("{}", module);
+        println!("{module}");
         let bytes = Module::new(&engine, module)?.serialize()?;
         assert!(bytes.len() < (1 << 20));
         Ok(())
@@ -252,69 +251,17 @@ fn compile_a_component() -> Result<()> {
 }
 
 #[test]
-fn call_indirect_caching_and_memory64() -> Result<()> {
-    let mut config = Config::new();
-    config.wasm_memory64(true);
-    config.cache_call_indirects(true);
-    let engine = Engine::new(&config)?;
-    Module::new(
-        &engine,
-        "(module
-            (memory i64 1)
-            (func (param i64) (result i32)
-                local.get 0
-                i32.load offset=0x100000000
-            )
-        )",
-    )?;
-    Ok(())
-}
-
-#[test]
-fn call_indirect_caching_out_of_bounds_table_index() -> Result<()> {
-    let mut config = Config::new();
-    config.cache_call_indirects(true);
-    let engine = Engine::new(&config)?;
-    // Test an out-of-bounds table index: this is exposed to the prescan
-    // that call-indirect caching must perform during compilation, so we
-    // need to make sure the error is properly handled by the validation
-    // that comes later.
-    let err = Module::new(
-        &engine,
-        "(module
-            (func (param i32)
-                ref.null func
-                local.get 0
-                table.set 32  ;; out-of-bounds table index
-            )
-        )",
-    )
-    .unwrap_err();
-    let err = format!("{err:?}");
-    assert!(
-        err.contains("table index out of bounds"),
-        "bad error: {err}"
-    );
-    Ok(())
-}
-
-#[test]
 fn tail_call_defaults() -> Result<()> {
     let wasm_with_tail_calls = "(module (func $a return_call $a))";
-    if cfg!(target_arch = "s390x") {
-        // off by default on s390x
-        let res = Module::new(&Engine::default(), wasm_with_tail_calls);
-        assert!(res.is_err());
-    } else {
-        // on by default
-        Module::new(&Engine::default(), wasm_with_tail_calls)?;
 
-        // on by default for cranelift
-        Module::new(
-            &Engine::new(Config::new().strategy(Strategy::Cranelift))?,
-            wasm_with_tail_calls,
-        )?;
-    }
+    // on by default
+    Module::new(&Engine::default(), wasm_with_tail_calls)?;
+
+    // on by default for cranelift
+    Module::new(
+        &Engine::new(Config::new().strategy(Strategy::Cranelift))?,
+        wasm_with_tail_calls,
+    )?;
 
     if cfg!(target_arch = "x86_64") {
         // off by default for winch
@@ -322,10 +269,6 @@ fn tail_call_defaults() -> Result<()> {
             &Engine::new(Config::new().strategy(Strategy::Winch))?,
             wasm_with_tail_calls,
         );
-        assert!(err.is_err());
-
-        // can't enable with winch
-        let err = Engine::new(Config::new().strategy(Strategy::Winch).wasm_tail_call(true));
         assert!(err.is_err());
     }
     Ok(())

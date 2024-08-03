@@ -5,7 +5,7 @@ use crate::binemit::{Addend, CodeOffset, Reloc};
 pub use crate::ir::condcodes::IntCC;
 use crate::ir::types::{self, F32, F64, I128, I16, I32, I64, I8, I8X16, R32, R64};
 
-pub use crate::ir::{ExternalName, MemFlags, Opcode, Type};
+pub use crate::ir::{ExternalName, MemFlags, Type};
 use crate::isa::{CallConv, FunctionAlignment};
 use crate::machinst::*;
 use crate::{settings, CodegenError, CodegenResult};
@@ -58,7 +58,6 @@ pub struct CallInfo {
     pub dest: ExternalName,
     pub uses: CallArgList,
     pub defs: CallRetList,
-    pub opcode: Opcode,
     pub caller_callconv: CallConv,
     pub callee_callconv: CallConv,
     pub clobbers: PRegSet,
@@ -72,7 +71,6 @@ pub struct CallIndInfo {
     pub rn: Reg,
     pub uses: CallArgList,
     pub defs: CallRetList,
-    pub opcode: Opcode,
     pub caller_callconv: CallConv,
     pub callee_callconv: CallConv,
     pub clobbers: PRegSet,
@@ -84,7 +82,6 @@ pub struct CallIndInfo {
 #[derive(Clone, Debug)]
 pub struct ReturnCallInfo {
     pub uses: CallArgList,
-    pub opcode: Opcode,
     pub new_stack_arg_size: u32,
 }
 
@@ -742,7 +739,7 @@ impl MachInst for Inst {
 
     fn is_move(&self) -> Option<(Writable<Reg>, Reg)> {
         match self {
-            Inst::Mov { rd, rm, .. } => Some((rd.clone(), rm.clone())),
+            Inst::Mov { rd, rm, .. } => Some((*rd, *rm)),
             _ => None,
         }
     }
@@ -844,8 +841,8 @@ impl MachInst for Inst {
     }
 
     fn worst_case_size() -> CodeOffset {
-        // calculate by test function riscv64_worst_case_instruction_size()
-        124
+        // Our worst case size is determined by the riscv64_worst_case_instruction_size test
+        84
     }
 
     fn ref_type_regclass(_settings: &settings::Flags) -> RegClass {
@@ -919,7 +916,7 @@ impl Inst {
                 String::default()
             };
             regs.iter().for_each(|i| {
-                x.push_str(format_reg(i.clone()).as_str());
+                x.push_str(format_reg(*i).as_str());
                 if *i != *regs.last().unwrap() {
                     x.push_str(",");
                 }

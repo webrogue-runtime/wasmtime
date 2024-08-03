@@ -60,19 +60,8 @@ pub struct Tunables {
     /// be deterministic.
     pub relaxed_simd_deterministic: bool,
 
-    /// Whether or not Wasm functions can be tail-called or not.
-    pub tail_callable: bool,
-
     /// Whether or not Wasm functions target the winch abi.
     pub winch_callable: bool,
-
-    /// Whether we implement a one-entry cache at each call_indirect
-    /// site.
-    pub cache_call_indirects: bool,
-
-    /// The maximum number of call-indirect cache slots that we will
-    /// allocate for one instance.
-    pub max_call_indirect_cache_slots: usize,
 }
 
 impl Tunables {
@@ -123,10 +112,7 @@ impl Tunables {
             generate_address_map: true,
             debug_adapter_modules: false,
             relaxed_simd_deterministic: false,
-            tail_callable: false,
             winch_callable: false,
-            cache_call_indirects: false,
-            max_call_indirect_cache_slots: 50_000,
         }
     }
 
