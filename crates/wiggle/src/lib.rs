@@ -228,6 +228,19 @@ impl<'a> GuestMemory<'a> {
     where
         T: GuestTypeTransparent + Copy,
     {
+        match self {
+            GuestMemory::Dynamic(d) => {
+                let byte_slice = unsafe {
+                    std::slice::from_raw_parts(
+                        slice.as_ptr() as *const u8,
+                        slice.len() * std::mem::size_of::<T>(),
+                    )
+                };
+                d.write(ptr.offset().0, byte_slice);
+                return Ok(());
+            }
+            _ => {}
+        }
         if usize::try_from(ptr.len())? != slice.len() {
             return Err(GuestError::SliceLengthsDiffer);
         }
