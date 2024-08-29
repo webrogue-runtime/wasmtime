@@ -171,6 +171,35 @@ pub(crate) enum ExtendKind {
     I64Extend32S,
 }
 
+impl ExtendKind {
+    pub fn signed(&self) -> bool {
+        if let Self::I64ExtendI32U = self {
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn from_bits(&self) -> u8 {
+        match self {
+            Self::I64ExtendI32S | Self::I64ExtendI32U | Self::I64Extend32S => 32,
+            Self::I32Extend8S | Self::I64Extend8S => 8,
+            Self::I32Extend16S | Self::I64Extend16S => 16,
+        }
+    }
+
+    pub fn to_bits(&self) -> u8 {
+        match self {
+            Self::I64ExtendI32S
+            | Self::I64ExtendI32U
+            | Self::I64Extend8S
+            | Self::I64Extend16S
+            | Self::I64Extend32S => 64,
+            Self::I32Extend8S | Self::I32Extend16S => 32,
+        }
+    }
+}
+
 /// Operand size, in bits.
 #[derive(Copy, Debug, Clone, Eq, PartialEq)]
 pub(crate) enum OperandSize {
@@ -227,7 +256,7 @@ impl OperandSize {
             4 => S32,
             8 => S64,
             16 => S128,
-            _ => panic!("Invalid bytes {} for OperandSize", bytes),
+            _ => panic!("Invalid bytes {bytes} for OperandSize"),
         }
     }
 }

@@ -1484,6 +1484,12 @@ pub enum ConstOp {
     RefI31,
     RefNull,
     RefFunc(FuncIndex),
+    I32Add,
+    I32Sub,
+    I32Mul,
+    I64Add,
+    I64Sub,
+    I64Mul,
 }
 
 impl ConstOp {
@@ -1500,6 +1506,12 @@ impl ConstOp {
             O::RefFunc { function_index } => Self::RefFunc(FuncIndex::from_u32(function_index)),
             O::GlobalGet { global_index } => Self::GlobalGet(GlobalIndex::from_u32(global_index)),
             O::RefI31 => Self::RefI31,
+            O::I32Add => Self::I32Add,
+            O::I32Sub => Self::I32Sub,
+            O::I32Mul => Self::I32Mul,
+            O::I64Add => Self::I64Add,
+            O::I64Sub => Self::I64Sub,
+            O::I64Mul => Self::I64Mul,
             op => {
                 return Err(wasm_unsupported!(
                     "unsupported opcode in const expression at offset {offset:#x}: {op:?}",
@@ -1662,8 +1674,7 @@ impl From<wasmparser::MemoryType> for Memory {
         let page_size_log2 = u8::try_from(ty.page_size_log2.unwrap_or(16)).unwrap();
         debug_assert!(
             page_size_log2 == 16 || page_size_log2 == 0,
-            "invalid page_size_log2: {}; must be 16 or 0",
-            page_size_log2
+            "invalid page_size_log2: {page_size_log2}; must be 16 or 0"
         );
         Memory {
             minimum: ty.initial,

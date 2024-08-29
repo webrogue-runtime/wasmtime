@@ -94,7 +94,7 @@ impl From<OperandSize> for args::OperandSize {
             OperandSize::S16 => Self::Size16,
             OperandSize::S32 => Self::Size32,
             OperandSize::S64 => Self::Size64,
-            s => panic!("Invalid operand size {:?}", s),
+            s => panic!("Invalid operand size {s:?}"),
         }
     }
 }
@@ -490,7 +490,7 @@ impl Assembler {
             OperandSize::S32 => types::F32,
             OperandSize::S64 => types::F64,
             // Move the entire 128 bits via movdqa.
-            OperandSize::S128 => types::I128,
+            OperandSize::S128 => types::I32X4,
             OperandSize::S8 | OperandSize::S16 => unreachable!(),
         };
 

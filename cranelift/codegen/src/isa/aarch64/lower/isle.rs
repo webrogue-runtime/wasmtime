@@ -16,7 +16,6 @@ use crate::ir::{condcodes, ArgumentExtension};
 use crate::isa;
 use crate::isa::aarch64::inst::{FPULeftShiftImm, FPURightShiftImm, ReturnCallInfo};
 use crate::isa::aarch64::AArch64Backend;
-use crate::isle_common_prelude_methods;
 use crate::machinst::isle::*;
 use crate::{
     binemit::CodeOffset,
@@ -150,6 +149,10 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
         }
     }
 
+    fn use_fp16(&mut self) -> bool {
+        self.backend.isa_flags.has_fp16()
+    }
+
     fn move_wide_const_from_u64(&mut self, ty: Type, n: u64) -> Option<MoveWideConst> {
         let bits = ty.bits();
         let n = if bits < 64 {
@@ -227,7 +230,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     fn integral_ty(&mut self, ty: Type) -> Option<Type> {
         match ty {
-            I8 | I16 | I32 | I64 | R64 => Some(ty),
+            I8 | I16 | I32 | I64 => Some(ty),
             _ => None,
         }
     }

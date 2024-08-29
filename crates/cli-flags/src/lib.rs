@@ -115,6 +115,14 @@ wasmtime_option_group! {
         /// The maximum runtime size of each linear memory in the pooling
         /// allocator, in bytes.
         pub pooling_max_memory_size: Option<usize>,
+
+        /// The maximum table elements for any table defined in a module when
+        /// using the pooling allocator.
+        pub pooling_table_elements: Option<u32>,
+
+        /// The maximum size, in bytes, allocated for a core instance's metadata
+        /// when using the pooling allocator.
+        pub pooling_max_core_instance_size: Option<usize>,
     }
 
     enum Optimize {
@@ -329,15 +337,6 @@ wasmtime_option_group! {
         pub runtime_config_var: Vec<KeyValuePair>,
         /// Preset data for the In-Memory provider of WASI key-value API.
         pub keyvalue_in_memory_data: Vec<KeyValuePair>,
-        /// Grant access to the given Redis host for the Redis provider of WASI
-        /// key-value API.
-        pub keyvalue_redis_host: Vec<String>,
-        /// Sets the connection timeout parameter for the Redis provider of WASI
-        /// key-value API.
-        pub keyvalue_redis_connection_timeout: Option<Duration>,
-        /// Sets the response timeout parameter for the Redis provider of WASI
-        /// key-value API.
-        pub keyvalue_redis_response_timeout: Option<Duration>,
     }
 
     enum Wasi {
@@ -617,6 +616,12 @@ impl CommonOptions {
                     }
                     if let Some(limit) = self.opts.pooling_total_tables {
                         cfg.total_tables(limit);
+                    }
+                    if let Some(limit) = self.opts.pooling_table_elements {
+                        cfg.table_elements(limit);
+                    }
+                    if let Some(limit) = self.opts.pooling_max_core_instance_size {
+                        cfg.max_core_instance_size(limit);
                     }
                     match_feature! {
                         ["async" : self.opts.pooling_total_stacks]

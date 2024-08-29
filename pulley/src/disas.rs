@@ -127,6 +127,29 @@ impl Disas for PcRelOffset {
     }
 }
 
+fn disas_list<T: Disas>(position: usize, disas: &mut String, iter: impl IntoIterator<Item = T>) {
+    let mut iter = iter.into_iter();
+    let Some(first) = iter.next() else { return };
+    first.disas(position, disas);
+
+    for item in iter {
+        write!(disas, ", ").unwrap();
+        item.disas(position, disas);
+    }
+}
+
+impl<R: Reg + Disas> Disas for BinaryOperands<R> {
+    fn disas(&self, position: usize, disas: &mut String) {
+        disas_list(position, disas, [self.dst, self.src1, self.src2])
+    }
+}
+
+impl<R: Reg + Disas> Disas for RegSet<R> {
+    fn disas(&self, position: usize, disas: &mut String) {
+        disas_list(position, disas, *self)
+    }
+}
+
 macro_rules! impl_disas {
     (
         $(

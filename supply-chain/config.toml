@@ -160,7 +160,13 @@ audit-as-crates-io = true
 [policy.wasmtime-wasi-http]
 audit-as-crates-io = true
 
+[policy.wasmtime-wasi-keyvalue]
+audit-as-crates-io = true
+
 [policy.wasmtime-wasi-nn]
+audit-as-crates-io = true
+
+[policy.wasmtime-wasi-runtime-config]
 audit-as-crates-io = true
 
 [policy.wasmtime-wasi-threads]
@@ -211,10 +217,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.capstone-sys]]
 version = "0.16.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.combine]]
-version = "4.6.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.console]]
@@ -429,10 +431,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.rand_xorshift]]
 version = "0.3.0"
-criteria = "safe-to-deploy"
-
-[[exemptions.redis]]
-version = "0.25.4"
 criteria = "safe-to-deploy"
 
 [[exemptions.redox_syscall]]

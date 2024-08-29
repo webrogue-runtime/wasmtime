@@ -2,7 +2,7 @@
 
 // Pull in the ISLE generated code.
 pub(crate) mod generated_code;
-use crate::{ir::types, ir::AtomicRmwOp, isa, isle_common_prelude_methods};
+use crate::{ir::types, ir::AtomicRmwOp, isa};
 use generated_code::{Context, MInst, RegisterClass};
 
 // Types that the generated ISLE code uses via `use super::*`.
@@ -331,8 +331,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     fn sinkable_load(&mut self, val: Value) -> Option<SinkableLoad> {
-        let input = self.lower_ctx.get_value_as_source_or_const(val);
-        if let InputSourceInst::UniqueUse(inst, 0) = input.inst {
+        if let Some(inst) = self.is_sinkable_inst(val) {
             if let Some((addr_input, offset)) =
                 is_mergeable_load(self.lower_ctx, inst, MergeableLoadSize::Min32)
             {
@@ -347,8 +346,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     fn sinkable_load_exact(&mut self, val: Value) -> Option<SinkableLoad> {
-        let input = self.lower_ctx.get_value_as_source_or_const(val);
-        if let InputSourceInst::UniqueUse(inst, 0) = input.inst {
+        if let Some(inst) = self.is_sinkable_inst(val) {
             if let Some((addr_input, offset)) =
                 is_mergeable_load(self.lower_ctx, inst, MergeableLoadSize::Exact)
             {
@@ -609,8 +607,7 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn ty_int_bool_or_ref(&mut self, ty: Type) -> Option<()> {
         match ty {
-            types::I8 | types::I16 | types::I32 | types::I64 | types::R64 => Some(()),
-            types::R32 => panic!("shouldn't have 32-bits refs on x64"),
+            types::I8 | types::I16 | types::I32 | types::I64 => Some(()),
             _ => None,
         }
     }

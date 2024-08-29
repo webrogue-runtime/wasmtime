@@ -6,16 +6,13 @@ use std::cell::Cell;
 
 pub use super::MachLabel;
 use super::RetPair;
-pub use crate::ir::{
-    condcodes::CondCode, dynamic_to_fixed, Constant, DynamicStackSlot, ExternalName, FuncRef,
-    GlobalValue, Immediate, SigRef, StackSlot,
-};
+pub use crate::ir::{condcodes::CondCode, *};
 pub use crate::isa::{unwind::UnwindInst, TargetIsa};
 pub use crate::machinst::{
     ABIArg, ABIArgSlot, ABIMachineSpec, CallSite, InputSourceInst, Lower, LowerBackend, RealReg,
     Reg, RelocDistance, Sig, VCodeInst, Writable,
 };
-pub use crate::settings::TlsModel;
+pub use crate::settings::{StackSwitchModel, TlsModel};
 
 pub type Unit = ();
 pub type ValueSlice = (ValueList, usize);
@@ -45,7 +42,10 @@ pub enum RangeView {
 #[doc(hidden)]
 macro_rules! isle_lower_prelude_methods {
     () => {
-        isle_common_prelude_methods!();
+        crate::isle_lower_prelude_methods!(MInst);
+    };
+    ($inst:ty) => {
+        crate::isle_common_prelude_methods!();
 
         #[inline]
         fn value_type(&mut self, val: Value) -> Type {
@@ -341,6 +341,11 @@ macro_rules! isle_lower_prelude_methods {
         }
 
         #[inline]
+        fn stack_switch_model(&mut self) -> Option<StackSwitchModel> {
+            Some(self.backend.flags().stack_switch_model())
+        }
+
+        #[inline]
         fn func_ref_data(&mut self, func_ref: FuncRef) -> (SigRef, ExternalName, RelocDistance) {
             let funcdata = &self.lower_ctx.dfg().ext_funcs[func_ref];
             let reloc_distance = if funcdata.colocated {
@@ -530,6 +535,7 @@ macro_rules! isle_lower_prelude_methods {
             self.lower_ctx
                 .abi()
                 .sized_stackslot_addr(stack_slot, offset, dst)
+                .into()
         }
 
         fn abi_dynamic_stackslot_addr(
@@ -542,7 +548,10 @@ macro_rules! isle_lower_prelude_methods {
                 .abi()
                 .dynamic_stackslot_offsets()
                 .is_valid(stack_slot));
-            self.lower_ctx.abi().dynamic_stackslot_addr(stack_slot, dst)
+            self.lower_ctx
+                .abi()
+                .dynamic_stackslot_addr(stack_slot, dst)
+                .into()
         }
 
         fn real_reg_to_reg(&mut self, reg: RealReg) -> Reg {
@@ -597,7 +606,7 @@ macro_rules! isle_lower_prelude_methods {
 
         #[inline]
         fn gen_move(&mut self, ty: Type, dst: WritableReg, src: Reg) -> MInst {
-            MInst::gen_move(dst, src, ty)
+            <$inst>::gen_move(dst, src, ty).into()
         }
 
         /// Generate the return instruction.

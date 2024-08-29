@@ -419,7 +419,9 @@ where
                 match &ty {
                     I32 | I64 | F32 | F64 | V128 => self.masm.store(src.into(), addr, ty.into()),
                     Ref(rt) => match rt.heap_type {
-                        WasmHeapType::Func => self.masm.store_ptr(src.into(), addr),
+                        WasmHeapType::Func | WasmHeapType::Extern => {
+                            self.masm.store_ptr(src.into(), addr)
+                        }
                         ht => unimplemented!("Support for WasmHeapType: {ht}"),
                     },
                 }
@@ -593,6 +595,14 @@ where
                 // Move the value of the index to the
                 // index_offset_and_access_size register to perform the overflow
                 // check to avoid clobbering the initial index value.
+                //
+                // We derive size of the operation from the heap type since:
+                //
+                // * This is the first assignment to the
+                // `index_offset_and_access_size` register
+                //
+                // * The memory64 proposal specifies that the index is bound to
+                // the heap type instead of hardcoding it to 32-bits (i32).
                 self.masm.mov(
                     index_reg.into(),
                     index_offset_and_access_size,
@@ -601,11 +611,18 @@ where
                 // Perform
                 // index = index + offset + access_size, trapping if the
                 // addition overflows.
+                //
+                // We use the target's pointer size rather than depending on the heap
+                // type since we want to check for overflow; even though the
+                // offset and access size are guaranteed to be bounded by the heap
+                // type, when added, if used with the wrong operand size, their
+                // result could be clamped, resulting in an erroneus overflow
+                // check.
                 self.masm.checked_uadd(
                     index_offset_and_access_size,
                     index_offset_and_access_size,
                     RegImm::i64(offset_with_access_size as i64),
-                    heap.ty.into(),
+                    ptr_size,
                     TrapCode::HeapOutOfBounds,
                 );
 
@@ -623,7 +640,10 @@ where
                         masm.cmp(
                             index_offset_and_access_size.into(),
                             bounds_reg.into(),
-                            heap.ty.into(),
+                            // We use the pointer size to keep the bounds
+                            // comparison consistent with the result of the
+                            // overflow check above.
+                            ptr_size,
                         );
                         IntCmpKind::GtU
                     },
@@ -707,7 +727,12 @@ where
                         masm.cmp(
                             index_reg,
                             RegImm::i64(adjusted_bounds as i64),
-                            heap.ty.into(),
+                            // Similar to the dynamic heap case, even though the
+                            // offset and access size are bound through the heap
+                            // type, when added they can overflow, resulting in
+                            // an erroneus comparison, therfore we rely on the
+                            // target pointer size.
+                            ptr_size,
                         );
                         IntCmpKind::GtU
                     },
@@ -876,5 +901,5 @@ where
 pub fn control_index(depth: u32, control_length: usize) -> usize {
     (control_length - 1)
         .checked_sub(depth as usize)
-        .unwrap_or_else(|| panic!("expected valid control stack frame at index: {}", depth))
+        .unwrap_or_else(|| panic!("expected valid control stack frame at index: {depth}"))
 }

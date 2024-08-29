@@ -49,10 +49,10 @@ pub fn log_wasm(wasm: &[u8]) {
     }
 
     let i = CNT.fetch_add(1, SeqCst);
-    let name = format!("testcase{}.wasm", i);
+    let name = format!("testcase{i}.wasm");
     std::fs::write(&name, wasm).expect("failed to write wasm file");
     log::debug!("wrote wasm file to `{}`", name);
-    let wat = format!("testcase{}.wat", i);
+    let wat = format!("testcase{i}.wat");
     match wasmprinter::print_bytes(wasm) {
         Ok(s) => std::fs::write(&wat, s).expect("failed to write wat file"),
         // If wasmprinter failed remove a `*.wat` file, if any, to avoid
@@ -311,7 +311,7 @@ fn compile_module(
                 }
             }
 
-            panic!("failed to compile module: {:?}", e);
+            panic!("failed to compile module: {e:?}");
         }
     }
 }
@@ -375,7 +375,7 @@ fn unwrap_instance(
     }
 
     // Everything else should be a bug in the fuzzer or a bug in wasmtime
-    panic!("failed to instantiate: {:?}", e);
+    panic!("failed to instantiate: {e:?}");
 }
 
 /// Evaluate the function identified by `name` in two different engine
@@ -744,6 +744,11 @@ pub fn table_ops(
 
         {
             let mut scope = RootScope::new(&mut store);
+
+            log::info!(
+                "table_ops: begin allocating {} externref arguments",
+                ops.num_globals
+            );
             let args: Vec<_> = (0..ops.num_params)
                 .map(|_| {
                     Ok(Val::ExternRef(Some(ExternRef::new(
@@ -752,11 +757,16 @@ pub fn table_ops(
                     )?)))
                 })
                 .collect::<Result<_>>()?;
+            log::info!(
+                "table_ops: end allocating {} externref arguments",
+                ops.num_globals
+            );
 
             // The generated function should always return a trap. The only two
             // valid traps are table-out-of-bounds which happens through `table.get`
             // and `table.set` generated or an out-of-fuel trap. Otherwise any other
             // error is unexpected and should fail fuzzing.
+            log::info!("table_ops: calling into Wasm `run` function");
             let trap = run
                 .call(&mut scope, &args, &mut [])
                 .unwrap_err()

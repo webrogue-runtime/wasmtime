@@ -1607,6 +1607,26 @@ fn test_x64_emit() {
         "4983D700",
         "adcq    %r15, $0, %r15",
     ));
+    insns.push((
+        Inst::alu_rmi_r(
+            OperandSize::Size64,
+            AluRmiROpcode::Adc,
+            RegMemImm::mem(Amode::imm_reg(99, rdi)),
+            w_r15,
+        ),
+        "4C137F63",
+        "adcq    %r15, 99(%rdi), %r15",
+    ));
+    insns.push((
+        Inst::alu_rmi_r(
+            OperandSize::Size64,
+            AluRmiROpcode::Sbb,
+            RegMemImm::mem(Amode::imm_reg(99, rdi)),
+            w_r15,
+        ),
+        "4C1B7F63",
+        "sbbq    %r15, 99(%rdi), %r15",
+    ));
 
     // ========================================================
     // AluRM
@@ -5132,6 +5152,6 @@ fn test_x64_emit() {
 
         let buffer = buffer.finish(&constants, ctrl_plane);
         let actual_encoding = &buffer.stringify_code_bytes();
-        assert_eq!(expected_encoding, actual_encoding, "{}", expected_printing);
+        assert_eq!(expected_encoding, actual_encoding, "{expected_printing}");
     }
 }
