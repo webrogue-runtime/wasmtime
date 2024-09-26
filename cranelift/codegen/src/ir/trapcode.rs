@@ -27,6 +27,9 @@ pub enum TrapCode {
     /// A `table_addr` instruction detected an out-of-bounds error.
     TableOutOfBounds,
 
+    /// An array access attempted to index beyond its array's bounds.
+    ArrayOutOfBounds,
+
     /// Indirect call to a null table entry.
     IndirectCallToNull,
 
@@ -53,9 +56,6 @@ pub enum TrapCode {
 
     /// A null reference was encountered which was required to be non-null.
     NullReference,
-
-    /// A null `i31ref` was encountered which was required to be non-null.
-    NullI31Ref,
 }
 
 impl TrapCode {
@@ -95,7 +95,7 @@ impl Display for TrapCode {
             Interrupt => "interrupt",
             User(x) => return write!(f, "user{x}"),
             NullReference => "null_reference",
-            NullI31Ref => "null_i31ref",
+            ArrayOutOfBounds => "array_oob",
         };
         f.write_str(identifier)
     }
@@ -119,7 +119,7 @@ impl FromStr for TrapCode {
             "unreachable" => Ok(UnreachableCodeReached),
             "interrupt" => Ok(Interrupt),
             "null_reference" => Ok(NullReference),
-            "null_i31ref" => Ok(NullI31Ref),
+            "array_oob" => Ok(ArrayOutOfBounds),
             _ if s.starts_with("user") => s[4..].parse().map(User).map_err(|_| ()),
             _ => Err(()),
         }
