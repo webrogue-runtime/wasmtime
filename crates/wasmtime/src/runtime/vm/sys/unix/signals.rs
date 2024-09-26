@@ -282,7 +282,8 @@ unsafe fn get_trap_registers(cx: *mut libc::c_void, _signum: libc::c_int) -> Tra
                 pc: (cx.uc_mcontext.psw.addr - trap_offset) as usize,
                 fp: *(cx.uc_mcontext.gregs[15] as *const usize),
             }
-        } else if #[cfg(all(target_os = "macos", target_arch = "x86_64"))] {
+            /* TODO verify ios */
+        } else if #[cfg(all(any(target_os = "macos", target_os = "ios"), target_arch = "x86_64"))] {
             let cx = &*(cx as *const libc::ucontext_t);
             TrapRegisters {
                 pc: (*cx.uc_mcontext).__ss.__rip as usize,
