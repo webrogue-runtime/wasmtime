@@ -3,6 +3,7 @@
 //! Helps implement fast indirect call signature checking, reference type
 //! downcasting, and etc...
 
+use crate::hash_set::HashSet;
 use crate::prelude::*;
 use crate::sync::RwLock;
 use crate::vm::GcRuntime;
@@ -16,15 +17,15 @@ use core::{
     hash::{Hash, Hasher},
     ops::Range,
     sync::atomic::{
-        AtomicUsize,
-        Ordering::{AcqRel, Acquire},
+        AtomicBool, AtomicUsize,
+        Ordering::{AcqRel, Acquire, Release},
     },
 };
-use hashbrown::HashSet;
 use wasmtime_environ::{
-    iter_entity_range, packed_option::PackedOption, EngineOrModuleTypeIndex, GcLayout,
-    ModuleInternedTypeIndex, ModuleTypes, PrimaryMap, SecondaryMap, TypeTrace, VMSharedTypeIndex,
-    WasmRecGroup, WasmSubType,
+    iter_entity_range,
+    packed_option::{PackedOption, ReservedValue},
+    EngineOrModuleTypeIndex, GcLayout, ModuleInternedTypeIndex, ModuleTypes, PrimaryMap,
+    SecondaryMap, TypeTrace, VMSharedTypeIndex, WasmRecGroup, WasmSubType,
 };
 use wasmtime_slab::{Id as SlabId, Slab};
 
@@ -112,18 +113,21 @@ impl TypeCollection {
     pub fn new_for_module(engine: &Engine, module_types: &ModuleTypes) -> Self {
         let engine = engine.clone();
         let registry = engine.signatures();
-        let gc_runtime = engine.gc_runtime();
+        let gc_runtime = engine.gc_runtime().ok().map(|rt| &**rt);
         let (rec_groups, types) = registry
             .0
             .write()
-            .register_module_types(&**gc_runtime, module_types);
+            .register_module_types(gc_runtime, module_types);
 
+        log::trace!("Begin building module's shared-to-module-trampoline-types map");
         let mut trampolines = SecondaryMap::with_capacity(types.len());
-        for (module_ty, trampoline) in module_types.trampoline_types() {
+        for (module_ty, module_trampoline_ty) in module_types.trampoline_types() {
             let shared_ty = types[module_ty];
-            let trampoline_ty = registry.trampoline_type(shared_ty);
-            trampolines[trampoline_ty] = Some(trampoline).into();
+            let trampoline_shared_ty = registry.trampoline_type(shared_ty);
+            trampolines[trampoline_shared_ty] = Some(module_trampoline_ty).into();
+            log::trace!("--> shared_to_module_trampolines[{trampoline_shared_ty:?}] = {module_trampoline_ty:?}");
         }
+        log::trace!("Done building module's shared-to-module-trampoline-types map");
 
         Self {
             engine,
@@ -145,7 +149,9 @@ impl TypeCollection {
     /// Gets the shared type index given a module type index.
     #[inline]
     pub fn shared_type(&self, index: ModuleInternedTypeIndex) -> Option<VMSharedTypeIndex> {
-        self.types.get(index).copied()
+        let shared_ty = self.types.get(index).copied();
+        log::trace!("TypeCollection::shared_type({index:?}) -> {shared_ty:?}");
+        shared_ty
     }
 
     /// Get the module-level type index of the trampoline type for the given
@@ -178,12 +184,15 @@ impl Drop for TypeCollection {
 
 #[inline]
 fn shared_type_index_to_slab_id(index: VMSharedTypeIndex) -> SlabId {
+    assert!(!index.is_reserved_value());
     SlabId::from_raw(index.bits())
 }
 
 #[inline]
 fn slab_id_to_shared_type_index(id: SlabId) -> VMSharedTypeIndex {
-    VMSharedTypeIndex::new(id.into_raw())
+    let index = VMSharedTypeIndex::new(id.into_raw());
+    assert!(!index.is_reserved_value());
+    index
 }
 
 /// A Wasm type that has been registered in the engine's `TypeRegistry`.
@@ -285,7 +294,7 @@ impl RegisteredType {
         let (entry, index, ty, layout) = {
             log::trace!("RegisteredType::new({ty:?})");
 
-            let gc_runtime = engine.gc_runtime();
+            let gc_runtime = engine.gc_runtime().ok().map(|rt| &**rt);
             let mut inner = engine.signatures().0.write();
 
             // It shouldn't be possible for users to construct non-canonical
@@ -296,7 +305,7 @@ impl RegisteredType {
             // engine mismatch; those should be caught earlier.
             inner.assert_canonicalized_for_runtime_usage_in_this_registry(&ty);
 
-            let entry = inner.register_singleton_rec_group(&**gc_runtime, ty);
+            let entry = inner.register_singleton_rec_group(gc_runtime, ty);
 
             let index = entry.0.shared_type_indices[0];
             let id = shared_type_index_to_slab_id(index);
@@ -415,8 +424,25 @@ impl Debug for RecGroupEntry {
 struct RecGroupEntryInner {
     /// The Wasm rec group, canonicalized for hash consing.
     hash_consing_key: WasmRecGroup,
+
+    /// The shared type indices for each type in this rec group.
     shared_type_indices: Box<[VMSharedTypeIndex]>,
+
+    /// The number of times that this entry has been registered in the
+    /// `TypeRegistryInner`.
+    ///
+    /// This is an atomic counter so that cloning a `RegisteredType`, and
+    /// temporarily keeping a type registered, doesn't require locking the full
+    /// registry.
     registrations: AtomicUsize,
+
+    /// Whether this entry has already been unregistered from the
+    /// `TypeRegistryInner`.
+    ///
+    /// This flag exists to detect and avoid double-unregistration bugs that
+    /// could otherwise occur in rare cases. See the comments in
+    /// `TypeRegistryInner::unregister_type` for details.
+    unregistered: AtomicBool,
 }
 
 impl PartialEq for RecGroupEntry {
@@ -521,7 +547,7 @@ struct TypeRegistryInner {
 impl TypeRegistryInner {
     fn register_module_types(
         &mut self,
-        gc_runtime: &dyn GcRuntime,
+        gc_runtime: Option<&dyn GcRuntime>,
         types: &ModuleTypes,
     ) -> (
         Vec<RecGroupEntry>,
@@ -585,7 +611,7 @@ impl TypeRegistryInner {
     /// on behalf of callers.
     fn register_rec_group(
         &mut self,
-        gc_runtime: &dyn GcRuntime,
+        gc_runtime: Option<&dyn GcRuntime>,
         map: &PrimaryMap<ModuleInternedTypeIndex, VMSharedTypeIndex>,
         range: Range<ModuleInternedTypeIndex>,
         types: impl ExactSizeIterator<Item = WasmSubType>,
@@ -609,6 +635,7 @@ impl TypeRegistryInner {
 
         // If we've already registered this rec group before, reuse it.
         if let Some(entry) = self.hash_consing_map.get(&hash_consing_key) {
+            assert_eq!(entry.0.unregistered.load(Acquire), false);
             entry.incref(
                 "hash consed to already-registered type in `TypeRegistryInner::register_rec_group`",
             );
@@ -620,8 +647,9 @@ impl TypeRegistryInner {
         // while this rec group is still alive.
         hash_consing_key
             .trace_engine_indices::<_, ()>(&mut |index| {
-                let entry = &self.type_to_rec_group[index].as_ref().unwrap();
-                entry.incref(
+                let other_entry = &self.type_to_rec_group[index].as_ref().unwrap();
+                assert_eq!(other_entry.0.unregistered.load(Acquire), false);
+                other_entry.incref(
                     "new cross-group type reference to existing type in `register_rec_group`",
                 );
                 Ok(())
@@ -643,17 +671,32 @@ impl TypeRegistryInner {
                         map[idx]
                     } else {
                         let rec_group_offset = idx.as_u32() - module_rec_group_start.as_u32();
-                        VMSharedTypeIndex::from_u32(engine_rec_group_start + rec_group_offset)
+                        let index =
+                            VMSharedTypeIndex::from_u32(engine_rec_group_start + rec_group_offset);
+                        assert!(!index.is_reserved_value());
+                        index
                     }
                 });
                 self.insert_one_type_from_rec_group(gc_runtime, module_index, ty)
             })
             .collect();
 
+        debug_assert_eq!(
+            shared_type_indices.len(),
+            shared_type_indices
+                .iter()
+                .copied()
+                .inspect(|ty| assert!(!ty.is_reserved_value()))
+                .collect::<crate::hash_set::HashSet<_>>()
+                .len(),
+            "should not have any duplicate type indices",
+        );
+
         let entry = RecGroupEntry(Arc::new(RecGroupEntryInner {
             hash_consing_key,
             shared_type_indices,
             registrations: AtomicUsize::new(1),
+            unregistered: AtomicBool::new(false),
         }));
         log::trace!("create new entry {entry:?} (registrations -> 1)");
 
@@ -671,14 +714,21 @@ impl TypeRegistryInner {
         // type in the rec group.
         for shared_type_index in entry.0.shared_type_indices.iter().copied() {
             let slab_id = shared_type_index_to_slab_id(shared_type_index);
-            if let Some(f) = self.types[slab_id].as_func() {
-                match f.trampoline_type() {
-                    Cow::Borrowed(_) => {
+            let sub_ty = &self.types[slab_id];
+            if let Some(f) = sub_ty.as_func() {
+                let trampoline = f.trampoline_type();
+                match &trampoline {
+                    Cow::Borrowed(_) if sub_ty.is_final && sub_ty.supertype.is_none() => {
                         // The function type is its own trampoline type. Leave
                         // its entry in `type_to_trampoline` empty to signal
                         // this.
+                        log::trace!(
+                            "function type is its own trampoline type: \n\
+                             --> trampoline_type[{shared_type_index:?}] = {shared_type_index:?}\n\
+                             --> trampoline_type[{f}] = {f}"
+                        );
                     }
-                    Cow::Owned(trampoline) => {
+                    Cow::Borrowed(_) | Cow::Owned(_) => {
                         // This will recursively call into rec group
                         // registration, but at most once since trampoline
                         // function types are their own trampoline type.
@@ -687,14 +737,27 @@ impl TypeRegistryInner {
                             WasmSubType {
                                 is_final: true,
                                 supertype: None,
-                                composite_type: wasmtime_environ::WasmCompositeType::Func(
-                                    trampoline,
-                                ),
+                                composite_type: wasmtime_environ::WasmCompositeType {
+                                    shared: sub_ty.composite_type.shared,
+                                    inner: wasmtime_environ::WasmCompositeInnerType::Func(
+                                        trampoline.into_owned(),
+                                    ),
+                                },
                             },
                         );
                         let trampoline_index = trampoline_entry.0.shared_type_indices[0];
                         log::trace!(
-                            "Registering trampoline {trampoline_index:?} for function type {shared_type_index:?}"
+                            "Registering trampoline type:\n\
+                             --> trampoline_type[{shared_type_index:?}] = {trampoline_index:?}\n\
+                             --> trampoline_type[{f}] = {g}",
+                            f = {
+                                let slab_id = shared_type_index_to_slab_id(shared_type_index);
+                                self.types[slab_id].unwrap_func()
+                            },
+                            g = {
+                                let slab_id = shared_type_index_to_slab_id(trampoline_index);
+                                self.types[slab_id].unwrap_func()
+                            }
                         );
                         debug_assert_ne!(shared_type_index, trampoline_index);
                         self.type_to_trampoline[shared_type_index] = Some(trampoline_index).into();
@@ -731,7 +794,7 @@ impl TypeRegistryInner {
     /// an already-registered rec group.
     fn insert_one_type_from_rec_group(
         &mut self,
-        gc_runtime: &dyn GcRuntime,
+        gc_runtime: Option<&dyn GcRuntime>,
         module_index: ModuleInternedTypeIndex,
         ty: WasmSubType,
     ) -> VMSharedTypeIndex {
@@ -746,14 +809,23 @@ impl TypeRegistryInner {
             "type is not canonicalized for runtime usage: {ty:?}"
         );
 
-        let gc_layout = match &ty.composite_type {
-            wasmtime_environ::WasmCompositeType::Func(_) => None,
-            wasmtime_environ::WasmCompositeType::Array(a) => {
-                Some(gc_runtime.layouts().array_layout(a).into())
-            }
-            wasmtime_environ::WasmCompositeType::Struct(s) => {
-                Some(gc_runtime.layouts().struct_layout(s).into())
-            }
+        assert!(!ty.composite_type.shared);
+        let gc_layout = match &ty.composite_type.inner {
+            wasmtime_environ::WasmCompositeInnerType::Func(_) => None,
+            wasmtime_environ::WasmCompositeInnerType::Array(a) => Some(
+                gc_runtime
+                    .expect("must have a GC runtime to register array types")
+                    .layouts()
+                    .array_layout(a)
+                    .into(),
+            ),
+            wasmtime_environ::WasmCompositeInnerType::Struct(s) => Some(
+                gc_runtime
+                    .expect("must have a GC runtime to register array types")
+                    .layouts()
+                    .struct_layout(s)
+                    .into(),
+            ),
         };
 
         // Add the type to our slab.
@@ -808,7 +880,7 @@ impl TypeRegistryInner {
     /// on behalf of callers.
     fn register_singleton_rec_group(
         &mut self,
-        gc_runtime: &dyn GcRuntime,
+        gc_runtime: Option<&dyn GcRuntime>,
         ty: WasmSubType,
     ) -> RecGroupEntry {
         self.assert_canonicalized_for_runtime_usage_in_this_registry(&ty);
@@ -843,29 +915,133 @@ impl TypeRegistryInner {
     /// zero remaining registrations.
     fn unregister_entry(&mut self, entry: RecGroupEntry) {
         debug_assert!(self.drop_stack.is_empty());
+
+        // There are two races to guard against before we can unregister the
+        // entry, even though it was on the drop stack:
+        //
+        // 1. Although an entry has to reach zero registrations before it is
+        //    enqueued in the drop stack, we need to double check whether the
+        //    entry is *still* at zero registrations. This is because someone
+        //    else can resurrect the entry in between when the
+        //    zero-registrations count was first observed and when we actually
+        //    acquire the lock to unregister it. In this example, we have
+        //    threads A and B, an existing rec group entry E, and a rec group
+        //    entry E' that is a duplicate of E:
+        //
+        //    Thread A                        | Thread B
+        //    --------------------------------+-----------------------------
+        //    acquire(type registry lock)     |
+        //                                    |
+        //                                    | decref(E) --> 0
+        //                                    |
+        //                                    | block_on(type registry lock)
+        //                                    |
+        //    register(E') == incref(E) --> 1 |
+        //                                    |
+        //    release(type registry lock)     |
+        //                                    |
+        //                                    | acquire(type registry lock)
+        //                                    |
+        //                                    | unregister(E)         !!!!!!
+        //
+        //    If we aren't careful, we can unregister a type while it is still
+        //    in use!
+        //
+        //    The fix in this case is that we skip unregistering the entry if
+        //    its reference count is non-zero, since that means it was
+        //    concurrently resurrected and is now in use again.
+        //
+        // 2. In a slightly more convoluted version of (1), where an entry is
+        //    resurrected but then dropped *again*, someone might attempt to
+        //    unregister an entry a second time:
+        //
+        //    Thread A                        | Thread B
+        //    --------------------------------|-----------------------------
+        //    acquire(type registry lock)     |
+        //                                    |
+        //                                    | decref(E) --> 0
+        //                                    |
+        //                                    | block_on(type registry lock)
+        //                                    |
+        //    register(E') == incref(E) --> 1 |
+        //                                    |
+        //    release(type registry lock)     |
+        //                                    |
+        //    decref(E) --> 0                 |
+        //                                    |
+        //    acquire(type registry lock)     |
+        //                                    |
+        //    unregister(E)                   |
+        //                                    |
+        //    release(type registry lock)     |
+        //                                    |
+        //                                    | acquire(type registry lock)
+        //                                    |
+        //                                    | unregister(E)         !!!!!!
+        //
+        //    If we aren't careful, we can unregister a type twice, which leads
+        //    to panics and registry corruption!
+        //
+        //    To detect this scenario and avoid the double-unregistration bug,
+        //    we maintain an `unregistered` flag on entries. We set this flag
+        //    once an entry is unregistered and therefore, even if it is
+        //    enqueued in the drop stack multiple times, we only actually
+        //    unregister the entry the first time.
+        //
+        // A final note: we don't need to worry about any concurrent
+        // modifications during the middle of this function's execution, only
+        // between (a) when we first observed a zero-registrations count and
+        // decided to unregister the type, and (b) when we acquired the type
+        // registry's lock so that we could perform that unregistration. This is
+        // because this method has exclusive access to `&mut self` -- that is,
+        // we have a write lock on the whole type registry -- and therefore no
+        // one else can create new references to this zero-registration entry
+        // and bring it back to life (which would require finding it in
+        // `self.hash_consing_map`, which no one else has access to, because we
+        // now have an exclusive lock on `self`).
+
+        // Handle scenario (1) from above.
+        let registrations = entry.0.registrations.load(Acquire);
+        if registrations != 0 {
+            log::trace!(
+                "{entry:?} was concurrently resurrected and no longer has \
+                 zero registrations (registrations -> {registrations})",
+            );
+            assert_eq!(entry.0.unregistered.load(Acquire), false);
+            return;
+        }
+
+        // Handle scenario (2) from above.
+        if entry.0.unregistered.load(Acquire) {
+            log::trace!(
+                "{entry:?} was concurrently resurrected, dropped again, \
+                 and already unregistered"
+            );
+            return;
+        }
+
+        // Okay, we are really going to unregister this entry. Enqueue it on the
+        // drop stack.
         self.drop_stack.push(entry);
 
+        // Keep unregistering entries until the drop stack is empty. This is
+        // logically a recursive process where if we unregister a type that was
+        // the only thing keeping another type alive, we then recursively
+        // unregister that other type as well. However, we use this explicit
+        // drop stack to avoid recursion and the potential stack overflows that
+        // recursion implies.
         while let Some(entry) = self.drop_stack.pop() {
             log::trace!("Start unregistering {entry:?}");
 
-            // We need to double check whether the entry is still at zero
-            // registrations: Between the time that we observed a zero and
-            // acquired the lock to call this function, another thread could
-            // have registered the type and found the 0-registrations entry in
-            // `self.map` and incremented its count.
-            //
-            // We don't need to worry about any concurrent increments during
-            // this function's invocation after we check for zero because we
-            // have exclusive access to `&mut self` and therefore no one can
-            // create a new reference to this entry and bring it back to life.
-            let registrations = entry.0.registrations.load(Acquire);
-            if registrations != 0 {
-                log::trace!(
-                    "{entry:?} was concurrently resurrected and no longer has \
-                     zero registrations (registrations -> {registrations})",
-                );
-                continue;
-            }
+            // All entries on the drop stack should *really* be ready for
+            // unregistration, since no one can resurrect entries once we've
+            // locked the registry.
+            assert_eq!(entry.0.registrations.load(Acquire), 0);
+            assert_eq!(entry.0.unregistered.load(Acquire), false);
+
+            // We are taking responsibility for unregistering this entry, so
+            // prevent anyone else from attempting to do it again.
+            entry.0.unregistered.store(true, Release);
 
             // Decrement any other types that this type was shallowly
             // (i.e. non-transitively) referencing and keeping alive. If this
@@ -899,6 +1075,18 @@ impl TypeRegistryInner {
             // map. Additionally, stop holding a strong reference from each
             // function type in the rec group to that function type's trampoline
             // type.
+            debug_assert_eq!(
+                entry.0.shared_type_indices.len(),
+                entry
+                    .0
+                    .shared_type_indices
+                    .iter()
+                    .copied()
+                    .inspect(|ty| assert!(!ty.is_reserved_value()))
+                    .collect::<crate::hash_set::HashSet<_>>()
+                    .len(),
+                "should not have any duplicate type indices",
+            );
             for ty in entry.0.shared_type_indices.iter().copied() {
                 log::trace!("removing {ty:?} from registry");
 

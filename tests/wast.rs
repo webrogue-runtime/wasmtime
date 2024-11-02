@@ -1,12 +1,11 @@
 use anyhow::{bail, Context};
 use bstr::ByteSlice;
 use libtest_mimic::{Arguments, FormatSetting, Trial};
-use once_cell::sync::Lazy;
 use std::path::Path;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, LazyLock, Mutex};
 use wasmtime::{
-    Config, Engine, InstanceAllocationStrategy, MpkEnabled, PoolingAllocationConfig, Store,
-    Strategy,
+    Collector, Config, Engine, InstanceAllocationStrategy, MpkEnabled, PoolingAllocationConfig,
+    Store, Strategy,
 };
 use wasmtime_environ::Memory;
 use wasmtime_wast::{SpectestConfig, WastContext};
@@ -42,22 +41,52 @@ fn add_tests(trials: &mut Vec<Trial>, path: &Path) {
             continue;
         }
 
+        let test_uses_gc_types = path.iter().any(|part| {
+            part.to_str().map_or(false, |s| {
+                s.contains("gc")
+                    || s.contains("function-references")
+                    || s.contains("reference-types")
+                    || s.contains("exception-handling")
+            })
+        });
+
         for strategy in [Strategy::Cranelift, Strategy::Winch] {
             for pooling in [true, false] {
-                let trial = Trial::test(
-                    format!(
-                        "{strategy:?}/{}{}",
-                        if pooling { "pooling/" } else { "" },
-                        path.to_str().unwrap()
-                    ),
-                    {
-                        let path = path.clone();
-                        move || {
-                            run_wast(&path, strategy, pooling).map_err(|e| format!("{e:?}").into())
-                        }
-                    },
-                );
-                trials.push(trial);
+                let collectors: &[_] = if !pooling && test_uses_gc_types {
+                    &[Collector::DeferredReferenceCounting, Collector::Null]
+                } else {
+                    &[Collector::Auto]
+                };
+
+                for collector in collectors.iter().copied() {
+                    let trial = Trial::test(
+                        format!(
+                            "{strategy:?}/{}{}{}",
+                            if pooling { "pooling/" } else { "" },
+                            if collector != Collector::Auto {
+                                format!("{collector:?}/")
+                            } else {
+                                String::new()
+                            },
+                            path.to_str().unwrap()
+                        ),
+                        {
+                            let path = path.clone();
+                            move || {
+                                run_wast(
+                                    &path,
+                                    WastConfig {
+                                        strategy,
+                                        pooling,
+                                        collector,
+                                    },
+                                )
+                                .map_err(|e| format!("{e:?}").into())
+                            }
+                        },
+                    );
+                    trials.push(trial);
+                }
             }
         }
     }
@@ -104,6 +133,7 @@ fn should_fail(test: &Path, strategy: Strategy) -> bool {
             "spec_testsuite/table_set.wast",
             "spec_testsuite/table_size.wast",
             "spec_testsuite/unreached-invalid.wast",
+            "spec_testsuite/call_indirect.wast",
             // simd-related failures
             "annotations/simd_lane.wast",
             "memory64/simd.wast",
@@ -201,29 +231,6 @@ fn should_fail(test: &Path, strategy: Strategy) -> bool {
             }
         }
     }
-    let unsupported_gc_tests = [
-        "array_copy.wast",
-        "array_fill.wast",
-        "array_init_data.wast",
-        "array_init_elem.wast",
-        "array.wast",
-        "binary_gc.wast",
-        "br_on_cast_fail.wast",
-        "br_on_cast.wast",
-        "extern.wast",
-        "ref_cast.wast",
-        "ref_eq.wast",
-        "ref_test.wast",
-        "return_call_indirect.wast",
-        "return_call.wast",
-        "table_sub.wast",
-        "type_canon.wast",
-        "type_equivalence.wast",
-        "type-rec.wast",
-        "type-subtyping.wast",
-        "unreached_valid.wast",
-        "i31.wast",
-    ];
 
     for part in test.iter() {
         // Not implemented in Wasmtime yet
@@ -241,32 +248,30 @@ fn should_fail(test: &Path, strategy: Strategy) -> bool {
                 "throw_ref.wast",
                 "try_table.wast",
                 "tag.wast",
+                "instance.wast",
             ]
             .iter()
             .any(|i| test.ends_with(i))
             {
                 return true;
             }
-            if unsupported_gc_tests.iter().any(|i| test.ends_with(i)) {
-                return true;
-            }
-        }
-
-        // Implementation of the GC proposal is a work-in-progress, this is
-        // a list of all currently known-to-fail tests.
-        if part == "gc" {
-            return unsupported_gc_tests.iter().any(|i| test.ends_with(i));
         }
     }
 
     false
 }
 
+struct WastConfig {
+    strategy: Strategy,
+    pooling: bool,
+    collector: Collector,
+}
+
 // Each of the tests included from `wast_testsuite_tests` will call this
 // function which actually executes the `wast` test suite given the `strategy`
 // to compile it.
-fn run_wast(wast: &Path, strategy: Strategy, pooling: bool) -> anyhow::Result<()> {
-    let should_fail = should_fail(wast, strategy);
+fn run_wast(wast: &Path, config: WastConfig) -> anyhow::Result<()> {
+    let should_fail = should_fail(wast, config.strategy);
     let wast_bytes =
         std::fs::read(wast).with_context(|| format!("failed to read `{}`", wast.display()))?;
 
@@ -284,18 +289,19 @@ fn run_wast(wast: &Path, strategy: Strategy, pooling: bool) -> anyhow::Result<()
     let gc = feature_found(wast, "gc") || memory64;
     let function_references = gc || memory64 || feature_found(wast, "function-references");
     let reference_types = !(threads && feature_found(wast, "proposals"));
-    let relaxed_simd = feature_found(wast, "relaxed-simd");
-    let tail_call = feature_found(wast, "tail-call") || feature_found(wast, "function-references");
+    let relaxed_simd = feature_found(wast, "relaxed-simd") || memory64;
+    let tail_call = function_references || feature_found(wast, "tail-call");
     let use_shared_memory = feature_found_src(&wast_bytes, "shared_memory")
         || feature_found_src(&wast_bytes, "shared)");
     let extended_const = feature_found(wast, "extended-const") || memory64;
+    let wide_arithmetic = feature_found(wast, "wide-arithmetic");
 
-    if pooling && use_shared_memory {
+    if config.pooling && use_shared_memory {
         log::warn!("skipping pooling test with shared memory");
         return Ok(());
     }
 
-    let is_cranelift = match strategy {
+    let is_cranelift = match config.strategy {
         Strategy::Cranelift => true,
         _ => false,
     };
@@ -311,7 +317,9 @@ fn run_wast(wast: &Path, strategy: Strategy, pooling: bool) -> anyhow::Result<()
         .wasm_tail_call(tail_call)
         .wasm_custom_page_sizes(custom_page_sizes)
         .wasm_extended_const(extended_const)
-        .strategy(strategy);
+        .wasm_wide_arithmetic(wide_arithmetic)
+        .strategy(config.strategy)
+        .collector(config.collector);
 
     if is_cranelift {
         cfg.cranelift_debug_verifier(true);
@@ -338,7 +346,7 @@ fn run_wast(wast: &Path, strategy: Strategy, pooling: bool) -> anyhow::Result<()
     if std::env::var("WASMTIME_TEST_NO_HOG_MEMORY").is_ok() {
         // The pooling allocator hogs ~6TB of virtual address space for each
         // store, so if we don't to hog memory then ignore pooling tests.
-        if pooling {
+        if config.pooling {
             return Ok(());
         }
 
@@ -359,11 +367,10 @@ fn run_wast(wast: &Path, strategy: Strategy, pooling: bool) -> anyhow::Result<()
         cfg.dynamic_memory_reserved_for_growth(0);
 
         let small_guard = 64 * 1024;
-        cfg.static_memory_guard_size(small_guard);
-        cfg.dynamic_memory_guard_size(small_guard);
+        cfg.memory_guard_size(small_guard);
     }
 
-    let _pooling_lock = if pooling {
+    let _pooling_lock = if config.pooling {
         // Some memory64 tests take more than 4gb of resident memory to test,
         // but we don't want to configure the pooling allocator to allow that
         // (that's a ton of memory to reserve), so we skip those tests.
@@ -385,8 +392,7 @@ fn run_wast(wast: &Path, strategy: Strategy, pooling: bool) -> anyhow::Result<()
         if multi_memory {
             cfg.static_memory_maximum_size(max_memory_size as u64);
             cfg.dynamic_memory_reserved_for_growth(0);
-            cfg.static_memory_guard_size(0);
-            cfg.dynamic_memory_guard_size(0);
+            cfg.memory_guard_size(0);
         }
 
         // The limits here are crafted such that the wast tests should pass.
@@ -471,7 +477,7 @@ fn feature_found_src(bytes: &[u8], name: &str) -> bool {
 fn lock_pooling() -> impl Drop {
     const MAX_CONCURRENT_POOLING: u32 = 4;
 
-    static ACTIVE: Lazy<MyState> = Lazy::new(MyState::default);
+    static ACTIVE: LazyLock<MyState> = LazyLock::new(MyState::default);
 
     #[derive(Default)]
     struct MyState {

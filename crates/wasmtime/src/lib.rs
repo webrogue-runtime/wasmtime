@@ -294,6 +294,8 @@ pub(crate) mod prelude {
     pub use wasmtime_environ::prelude::*;
 }
 
+pub(crate) use hashbrown::{hash_map, hash_set};
+
 /// A helper macro to safely map `MaybeUninit<T>` to `MaybeUninit<U>` where `U`
 /// is a field projection within `T`.
 ///
@@ -390,6 +392,24 @@ use sync_nostd as sync;
 /// This type alias is identical to `anyhow::Result`.
 #[doc(no_inline)]
 pub use anyhow::{Error, Result};
+
+/// A re-exported instance of Wasmtime's `wasmparser` dependency.
+///
+/// This may be useful for embedders that also use `wasmparser`
+/// directly: it allows embedders to ensure that they are using the same
+/// version as Wasmtime, both to eliminate redundant dependencies on
+/// multiple versions of the library, and to ensure compatibility in
+/// validation and feature support.
+///
+/// Note that this re-export is *not subject to semver*: we reserve the
+/// right to make patch releases of Wasmtime that bump the version of
+/// wasmparser used, and hence the version re-exported, in
+/// semver-incompatible ways. This is the tradeoff that the embedder
+/// needs to opt into: in order to stay exactly in sync with an internal
+/// detail of Wasmtime, the cost is visibility into potential internal
+/// version changes.
+#[cfg(feature = "reexport-wasmparser")]
+pub use wasmparser;
 
 fn _assert_send_and_sync<T: Send + Sync>() {}
 

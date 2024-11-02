@@ -1,14 +1,16 @@
 //! Compiler for the deferred reference-counting (DRC) collector and its
 //! barriers.
 
-use super::{unbarriered_load_gc_ref, unbarriered_store_gc_ref};
-use crate::{func_environ::FuncEnvironment, gc::GcCompiler};
+use super::*;
+use crate::gc::gc_compiler;
+use crate::translate::TargetEnvironment;
+use crate::{func_environ::FuncEnvironment, gc::GcCompiler, TRAP_INTERNAL_ASSERT};
+use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, InstBuilder};
 use cranelift_frontend::FunctionBuilder;
-use cranelift_wasm::TargetEnvironment;
 use smallvec::SmallVec;
 use wasmtime_environ::{
-    drc::DrcTypeLayouts, GcTypeLayouts, PtrSize, TypeIndex, VMGcKind, WasmCompositeType,
+    drc::DrcTypeLayouts, GcTypeLayouts, ModuleInternedTypeIndex, PtrSize, TypeIndex, VMGcKind,
     WasmHeapTopType, WasmHeapType, WasmRefType, WasmResult, WasmStorageType, WasmValType,
 };
 
@@ -28,8 +30,12 @@ impl DrcCompiler {
         gc_ref: ir::Value,
     ) -> ir::Value {
         let offset = func_env.offsets.vm_drc_header_ref_count();
-        let size = ir::types::I64.bytes();
-        let pointer = func_env.prepare_gc_ref_access(builder, gc_ref, offset, size);
+        let pointer = func_env.prepare_gc_ref_access(
+            builder,
+            gc_ref,
+            Offset::Static(offset),
+            BoundsCheck::Access(ir::types::I64.bytes()),
+        );
         builder
             .ins()
             .load(ir::types::I64, ir::MemFlags::trusted(), pointer, 0)
@@ -47,8 +53,12 @@ impl DrcCompiler {
         new_ref_count: ir::Value,
     ) {
         let offset = func_env.offsets.vm_drc_header_ref_count();
-        let size = ir::types::I64.bytes();
-        let pointer = func_env.prepare_gc_ref_access(builder, gc_ref, offset, size);
+        let pointer = func_env.prepare_gc_ref_access(
+            builder,
+            gc_ref,
+            Offset::Static(offset),
+            BoundsCheck::Access(ir::types::I64.bytes()),
+        );
         builder
             .ins()
             .store(ir::MemFlags::trusted(), new_ref_count, pointer, 0);
@@ -86,7 +96,7 @@ impl DrcCompiler {
         let vmctx = builder.ins().global_value(ptr_ty, vmctx);
         let activations_table = builder.ins().load(
             ptr_ty,
-            ir::MemFlags::trusted(),
+            ir::MemFlags::trusted().with_readonly(),
             vmctx,
             i32::from(func_env.offsets.ptr.vmctx_gc_heap_data()),
         );
@@ -103,6 +113,45 @@ impl DrcCompiler {
             i32::try_from(func_env.offsets.vm_gc_ref_activation_table_end()).unwrap(),
         );
         (activations_table, next, end)
+    }
+
+    /// Write to an uninitialized field or element inside a GC object.
+    fn init_field(
+        &mut self,
+        func_env: &mut FuncEnvironment<'_>,
+        builder: &mut FunctionBuilder<'_>,
+        field_addr: ir::Value,
+        ty: WasmStorageType,
+        val: ir::Value,
+    ) -> WasmResult<()> {
+        // Data inside GC objects is always little endian.
+        let flags = ir::MemFlags::trusted().with_endianness(ir::Endianness::Little);
+
+        match ty {
+            WasmStorageType::Val(WasmValType::Ref(r))
+                if r.heap_type.top() == WasmHeapTopType::Func =>
+            {
+                write_func_ref_at_addr(func_env, builder, r, flags, field_addr, val)?;
+            }
+            WasmStorageType::Val(WasmValType::Ref(r)) => {
+                self.translate_init_gc_reference(func_env, builder, r, field_addr, val, flags)?;
+            }
+            WasmStorageType::I8 => {
+                assert_eq!(builder.func.dfg.value_type(val), ir::types::I32);
+                builder.ins().istore8(flags, val, field_addr, 0);
+            }
+            WasmStorageType::I16 => {
+                assert_eq!(builder.func.dfg.value_type(val), ir::types::I32);
+                builder.ins().istore16(flags, val, field_addr, 0);
+            }
+            WasmStorageType::Val(_) => {
+                let size_of_access = wasmtime_environ::byte_size_of_wasm_ty_in_gc_heap(&ty);
+                assert_eq!(builder.func.dfg.value_type(val).bytes(), size_of_access);
+                builder.ins().store(flags, val, field_addr, 0);
+            }
+        }
+
+        Ok(())
     }
 
     /// Write to an uninitialized GC reference field, initializing it.
@@ -134,9 +183,7 @@ impl DrcCompiler {
                 builder.ins().store(flags, null, dst, 0);
             } else {
                 let zero = builder.ins().iconst(ir::types::I32, 0);
-                builder
-                    .ins()
-                    .trapz(zero, ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE));
+                builder.ins().trapz(zero, TRAP_INTERNAL_ASSERT);
             }
             return Ok(());
         };
@@ -207,9 +254,106 @@ impl DrcCompiler {
     }
 }
 
+/// Emit CLIF to call the `gc_raw_alloc` libcall.
+///
+/// It is the caller's responsibility to ensure that `size` fits within the
+/// `VMGcKind`'s unused bits.
+fn emit_gc_raw_alloc(
+    func_env: &mut FuncEnvironment<'_>,
+    builder: &mut FunctionBuilder<'_>,
+    kind: VMGcKind,
+    ty: ModuleInternedTypeIndex,
+    size: ir::Value,
+    align: u32,
+) -> ir::Value {
+    let gc_alloc_raw_builtin = func_env.builtin_functions.gc_alloc_raw(builder.func);
+    let vmctx = func_env.vmctx_val(&mut builder.cursor());
+
+    let kind = builder
+        .ins()
+        .iconst(ir::types::I32, i64::from(kind.as_u32()));
+
+    let ty = builder.ins().iconst(ir::types::I32, i64::from(ty.as_u32()));
+
+    assert!(align.is_power_of_two());
+    let align = builder.ins().iconst(ir::types::I32, i64::from(align));
+
+    let call_inst = builder
+        .ins()
+        .call(gc_alloc_raw_builtin, &[vmctx, kind, ty, size, align]);
+
+    let gc_ref = builder.func.dfg.first_result(call_inst);
+    builder.declare_value_needs_stack_map(gc_ref);
+
+    gc_ref
+}
+
 impl GcCompiler for DrcCompiler {
     fn layouts(&self) -> &dyn GcTypeLayouts {
         &self.layouts
+    }
+
+    fn alloc_array(
+        &mut self,
+        func_env: &mut FuncEnvironment<'_>,
+        builder: &mut FunctionBuilder<'_>,
+        array_type_index: TypeIndex,
+        init: super::ArrayInit<'_>,
+    ) -> WasmResult<ir::Value> {
+        let interned_type_index = func_env.module.types[array_type_index];
+
+        let len_offset = gc_compiler(func_env)?.layouts().array_length_field_offset();
+        let array_layout = func_env.array_layout(interned_type_index);
+        let base_size = array_layout.base_size;
+        let align = array_layout.align;
+        let len_to_elems_delta = base_size.checked_sub(len_offset).unwrap();
+
+        // First, compute the array's total size from its base size, element
+        // size, and length.
+        let size = emit_array_size(builder, array_layout, init);
+
+        // Second, now that we have the array object's total size, call the
+        // `gc_alloc_raw` builtin libcall to allocate the array.
+        let array_ref = emit_gc_raw_alloc(
+            func_env,
+            builder,
+            VMGcKind::ArrayRef,
+            interned_type_index,
+            size,
+            align,
+        );
+
+        // Write the array's length into the appropriate slot.
+        //
+        // Note: we don't need to bounds-check the GC ref access here, since we
+        // trust the results of the allocation libcall.
+        let base = func_env.get_gc_heap_base(builder);
+        let extended_array_ref =
+            uextend_i32_to_pointer_type(builder, func_env.pointer_type(), array_ref);
+        let object_addr = builder.ins().iadd(base, extended_array_ref);
+        let len_addr = builder.ins().iadd_imm(object_addr, i64::from(len_offset));
+        let len = init.len(&mut builder.cursor());
+        builder
+            .ins()
+            .store(ir::MemFlags::trusted(), len, len_addr, 0);
+
+        // Finally, initialize the elements.
+        let len_to_elems_delta = builder
+            .ins()
+            .iconst(ir::types::I64, i64::from(len_to_elems_delta));
+        let elems_addr = builder.ins().iadd(len_addr, len_to_elems_delta);
+        init.initialize(
+            func_env,
+            builder,
+            interned_type_index,
+            base_size,
+            size,
+            elems_addr,
+            |func_env, builder, elem_ty, elem_addr, val| {
+                self.init_field(func_env, builder, elem_addr, elem_ty, val)
+            },
+        )?;
+        Ok(array_ref)
     }
 
     fn alloc_struct(
@@ -221,87 +365,47 @@ impl GcCompiler for DrcCompiler {
     ) -> WasmResult<ir::Value> {
         // First, call the `gc_alloc_raw` builtin libcall to allocate the
         // struct.
-
-        let gc_alloc_raw_builtin = func_env.builtin_functions.gc_alloc_raw(builder.func);
-        let vmctx = func_env.vmctx_val(&mut builder.cursor());
-        let kind = builder
-            .ins()
-            .iconst(ir::types::I32, i64::from(VMGcKind::StructRef.as_u32()));
-
         let interned_type_index = func_env.module.types[struct_type_index];
-        let interned_type_index_val = builder
-            .ins()
-            .iconst(ir::types::I32, i64::from(interned_type_index.as_u32()));
 
         let struct_layout = func_env.struct_layout(interned_type_index);
+
+        // Copy some stuff out of the struct layout to avoid borrowing issues.
         let struct_size = struct_layout.size;
+        let struct_align = struct_layout.align;
         let field_offsets: SmallVec<[_; 8]> = struct_layout.fields.iter().copied().collect();
         assert_eq!(field_vals.len(), field_offsets.len());
 
-        let size = builder
-            .ins()
-            .iconst(ir::types::I32, i64::from(struct_layout.size));
-        let align = builder
-            .ins()
-            .iconst(ir::types::I32, i64::from(struct_layout.align));
+        assert_eq!(VMGcKind::MASK & struct_size, 0);
+        assert_eq!(VMGcKind::UNUSED_MASK & struct_size, struct_size);
+        let struct_size_val = builder.ins().iconst(ir::types::I32, i64::from(struct_size));
 
-        let call_inst = builder.ins().call(
-            gc_alloc_raw_builtin,
-            &[vmctx, kind, interned_type_index_val, size, align],
+        let struct_ref = emit_gc_raw_alloc(
+            func_env,
+            builder,
+            VMGcKind::StructRef,
+            interned_type_index,
+            struct_size_val,
+            struct_align,
         );
-        let struct_ref = builder.inst_results(call_inst)[0];
-
-        let struct_ty = match &func_env.types[interned_type_index].composite_type {
-            WasmCompositeType::Struct(s) => s,
-            _ => unreachable!(),
-        };
-        let field_types: SmallVec<[_; 8]> = struct_ty.fields.iter().cloned().collect();
-        assert_eq!(field_vals.len(), field_types.len());
 
         // Second, initialize each of the newly-allocated struct's fields.
-
-        for ((ty, val), offset) in field_types.into_iter().zip(field_vals).zip(field_offsets) {
-            let size_of_access =
-                wasmtime_environ::byte_size_of_wasm_ty_in_gc_heap(&ty.element_type);
-            assert!(offset + size_of_access <= struct_size);
-
-            let field_addr =
-                func_env.prepare_gc_ref_access(builder, struct_ref, offset, size_of_access);
-
-            match &ty.element_type {
-                WasmStorageType::Val(WasmValType::Ref(r))
-                    if r.heap_type.top() == WasmHeapTopType::Func =>
-                {
-                    unimplemented!("funcrefs inside the GC heap")
-                }
-                WasmStorageType::Val(WasmValType::Ref(r)) => {
-                    self.translate_init_gc_reference(
-                        func_env,
-                        builder,
-                        *r,
-                        field_addr,
-                        *val,
-                        ir::MemFlags::trusted(),
-                    )?;
-                }
-                WasmStorageType::I8 => {
-                    builder
-                        .ins()
-                        .istore8(ir::MemFlags::trusted(), *val, field_addr, 0);
-                }
-                WasmStorageType::I16 => {
-                    builder
-                        .ins()
-                        .istore16(ir::MemFlags::trusted(), *val, field_addr, 0);
-                }
-                WasmStorageType::Val(_) => {
-                    assert_eq!(builder.func.dfg.value_type(*val).bytes(), size_of_access);
-                    builder
-                        .ins()
-                        .store(ir::MemFlags::trusted(), *val, field_addr, 0);
-                }
-            }
-        }
+        //
+        // Note: we don't need to bounds-check the GC ref access here, since we
+        // trust the results of the allocation libcall.
+        let base = func_env.get_gc_heap_base(builder);
+        let extended_struct_ref =
+            uextend_i32_to_pointer_type(builder, func_env.pointer_type(), struct_ref);
+        let raw_ptr_to_struct = builder.ins().iadd(base, extended_struct_ref);
+        initialize_struct_fields(
+            func_env,
+            builder,
+            interned_type_index,
+            raw_ptr_to_struct,
+            field_vals,
+            |func_env, builder, ty, field_addr, val| {
+                self.init_field(func_env, builder, field_addr, ty, val)
+            },
+        )?;
 
         Ok(struct_ref)
     }
@@ -315,10 +419,6 @@ impl GcCompiler for DrcCompiler {
         flags: ir::MemFlags,
     ) -> WasmResult<ir::Value> {
         assert!(ty.is_vmgcref_type());
-        assert!(
-            flags.explicit_endianness().is_none(),
-            "GC references are always native-endian"
-        );
 
         let (reference_type, needs_stack_map) = func_env.reference_type(ty.heap_type);
         debug_assert!(needs_stack_map);
@@ -333,9 +433,7 @@ impl GcCompiler for DrcCompiler {
                 // is a block terminator, and we still need to integrate with
                 // the rest of the surrounding code.
                 let zero = builder.ins().iconst(ir::types::I32, 0);
-                builder
-                    .ins()
-                    .trapz(zero, ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE));
+                builder.ins().trapz(zero, TRAP_INTERNAL_ASSERT);
             }
             return Ok(null);
         };
@@ -416,7 +514,7 @@ impl GcCompiler for DrcCompiler {
         builder.switch_to_block(non_null_gc_ref_block);
         builder.seal_block(non_null_gc_ref_block);
         let (activations_table, next, end) = self.load_bump_region(func_env, builder);
-        let bump_region_is_full = builder.ins().icmp(ir::condcodes::IntCC::Equal, next, end);
+        let bump_region_is_full = builder.ins().icmp(IntCC::Equal, next, end);
         builder
             .ins()
             .brif(bump_region_is_full, gc_block, &[], no_gc_block, &[]);
@@ -467,10 +565,6 @@ impl GcCompiler for DrcCompiler {
         flags: ir::MemFlags,
     ) -> WasmResult<()> {
         assert!(ty.is_vmgcref_type());
-        assert!(
-            flags.explicit_endianness().is_none(),
-            "GC references are always native-endian"
-        );
 
         let (ref_ty, needs_stack_map) = func_env.reference_type(ty.heap_type);
         debug_assert!(needs_stack_map);
@@ -487,9 +581,7 @@ impl GcCompiler for DrcCompiler {
                 // is a block terminator, and we still need to integrate with
                 // the rest of the surrounding code.
                 let zero = builder.ins().iconst(ir::types::I32, 0);
-                builder
-                    .ins()
-                    .trapz(zero, ir::TrapCode::User(crate::DEBUG_ASSERT_TRAP_CODE));
+                builder.ins().trapz(zero, TRAP_INTERNAL_ASSERT);
             }
             return Ok(());
         };
@@ -619,10 +711,7 @@ impl GcCompiler for DrcCompiler {
         builder.seal_block(dec_ref_block);
         let ref_count = self.load_ref_count(func_env, builder, old_val);
         let new_ref_count = builder.ins().iadd_imm(ref_count, -1);
-        let old_val_needs_drop =
-            builder
-                .ins()
-                .icmp_imm(ir::condcodes::IntCC::Equal, new_ref_count, 0);
+        let old_val_needs_drop = builder.ins().icmp_imm(IntCC::Equal, new_ref_count, 0);
         builder.ins().brif(
             old_val_needs_drop,
             drop_old_val_block,

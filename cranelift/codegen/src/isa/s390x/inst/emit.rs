@@ -368,34 +368,6 @@ pub fn mem_imm16_emit(
     }
 }
 
-pub fn mem_mem_emit(
-    dst: &MemArgPair,
-    src: &MemArgPair,
-    len_minus_one: u8,
-    opcode_ss: u8,
-    add_trap: bool,
-    sink: &mut MachBuffer<Inst>,
-    _state: &mut EmitState,
-) {
-    if add_trap {
-        if let Some(trap_code) = dst.flags.trap_code().or(src.flags.trap_code()) {
-            sink.add_trap(trap_code);
-        }
-    }
-
-    put(
-        sink,
-        &enc_ss_a(
-            opcode_ss,
-            dst.base,
-            dst.disp.bits(),
-            src.base,
-            src.disp.bits(),
-            len_minus_one,
-        ),
-    );
-}
-
 pub fn mem_vrx_emit(
     rd: Reg,
     mem: &MemArg,
@@ -960,31 +932,6 @@ fn enc_siy(opcode: u16, b1: Reg, d1: u32, i2: u8) -> [u8; 6] {
     enc[3] = dl1_lo;
     enc[4] = dh1;
     enc[5] = opcode2;
-    enc
-}
-
-/// SSa-type instructions.
-///
-///   47     39 31 27 15 11
-///   opcode  l b1 d1 b2 d2
-///       40 32 28 16 12  0
-///
-///
-fn enc_ss_a(opcode: u8, b1: Reg, d1: u32, b2: Reg, d2: u32, l: u8) -> [u8; 6] {
-    let b1 = machreg_to_gpr(b1) & 0x0f;
-    let d1_lo = (d1 & 0xff) as u8;
-    let d1_hi = ((d1 >> 8) & 0x0f) as u8;
-    let b2 = machreg_to_gpr(b2) & 0x0f;
-    let d2_lo = (d2 & 0xff) as u8;
-    let d2_hi = ((d2 >> 8) & 0x0f) as u8;
-
-    let mut enc: [u8; 6] = [0; 6];
-    enc[0] = opcode;
-    enc[1] = l;
-    enc[2] = b1 << 4 | d1_hi;
-    enc[3] = d1_lo;
-    enc[4] = b2 << 4 | d2_hi;
-    enc[5] = d2_lo;
     enc
 }
 
@@ -1689,7 +1636,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri);
 
                 let opcode = 0xb91d; // DSGFR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::SDivMod64 { rd, ri, rn } => {
@@ -1699,7 +1646,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri);
 
                 let opcode = 0xb90d; // DSGR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::UDivMod32 { rd, ri, rn } => {
@@ -1712,7 +1659,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri2);
 
                 let opcode = 0xb997; // DLR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::UDivMod64 { rd, ri, rn } => {
@@ -1725,7 +1672,7 @@ impl Inst {
                 debug_assert_eq!(rd2.to_reg(), ri2);
 
                 let opcode = 0xb987; // DLGR
-                let trap_code = TrapCode::IntegerDivisionByZero;
+                let trap_code = TrapCode::INTEGER_DIVISION_BY_ZERO;
                 put_with_trap(sink, &enc_rre(opcode, rd1.to_reg(), rn), trap_code);
             }
             &Inst::Flogr { rd, rn } => {
@@ -2185,16 +2132,6 @@ impl Inst {
                 };
                 mem_imm16_emit(imm, &mem, opcode, true, sink, emit_info, state);
             }
-            &Inst::Mvc {
-                ref dst,
-                ref src,
-                len_minus_one,
-            } => {
-                let dst = dst.clone();
-                let src = src.clone();
-                let opcode = 0xd2; // MVC
-                mem_mem_emit(&dst, &src, len_minus_one, opcode, true, sink, state);
-            }
 
             &Inst::LoadMultiple64 { rt, rt2, ref mem } => {
                 let mem = mem.clone();
@@ -2248,9 +2185,7 @@ impl Inst {
                 put(sink, &enc_rre(opcode, rd.to_reg(), rm));
             }
             &Inst::MovPReg { rd, rm } => {
-                let rm: Reg = rm.into();
-                debug_assert!([regs::gpr(0), regs::gpr(14), regs::gpr(15)].contains(&rm));
-                Inst::Mov64 { rd, rm }.emit(sink, emit_info, state);
+                Inst::Mov64 { rd, rm: rm.into() }.emit(sink, emit_info, state);
             }
             &Inst::Mov32 { rd, rm } => {
                 let opcode = 0x18; // LR
@@ -3258,8 +3193,6 @@ impl Inst {
                 state.nominal_sp_offset += size;
             }
             &Inst::Call { link, ref info } => {
-                debug_assert_eq!(link.to_reg(), gpr(14));
-
                 let opcode = 0xc05; // BRASL
 
                 // Add relocation for target function.  This has to be done *before*
@@ -3278,8 +3211,6 @@ impl Inst {
                 state.nominal_sp_offset -= info.callee_pop_size;
             }
             &Inst::CallInd { link, ref info } => {
-                debug_assert_eq!(link.to_reg(), gpr(14));
-
                 if let Some(s) = state.take_stack_map() {
                     let offset = sink.cur_offset() + 2;
                     sink.push_user_stack_map(state, offset, s);
@@ -3319,11 +3250,7 @@ impl Inst {
                 put(sink, &enc_rr(opcode, gpr(15), rn));
                 sink.add_call_site();
             }
-            &Inst::ElfTlsGetOffset {
-                ref symbol, link, ..
-            } => {
-                debug_assert_eq!(link.to_reg(), gpr(14));
-
+            &Inst::ElfTlsGetOffset { ref symbol, .. } => {
                 let opcode = 0xc05; // BRASL
 
                 // Add relocation for target function. This has to be done
@@ -3342,7 +3269,6 @@ impl Inst {
             &Inst::Args { .. } => {}
             &Inst::Rets { .. } => {}
             &Inst::Ret { link } => {
-                debug_assert_eq!(link, gpr(14));
                 let opcode = 0x07; // BCR
                 put(sink, &enc_rr(opcode, gpr(15), link));
             }
@@ -3453,6 +3379,36 @@ impl Inst {
                 // Lowering produces an EmitIsland before using a JTSequence, so we can safely
                 // disable the worst-case-size check in this case.
                 start_off = sink.cur_offset();
+            }
+
+            Inst::StackProbeLoop {
+                probe_count,
+                guard_size,
+            } => {
+                // Emit the loop start label
+                let loop_start = sink.get_label();
+                sink.bind_label(loop_start, state.ctrl_plane_mut());
+
+                // aghi %r15, -GUARD_SIZE
+                let inst = Inst::AluRSImm16 {
+                    alu_op: ALUOp::Add64,
+                    rd: writable_stack_reg(),
+                    ri: stack_reg(),
+                    imm: -guard_size,
+                };
+                inst.emit(sink, emit_info, state);
+
+                // mvi 0(%r15), 0
+                let inst = Inst::StoreImm8 {
+                    imm: 0,
+                    mem: MemArg::reg(stack_reg(), MemFlags::trusted()),
+                };
+                inst.emit(sink, emit_info, state);
+
+                // brct PROBE_COUNT, LOOP_START
+                let opcode = 0xa76; // BRCT
+                sink.use_label_at_offset(sink.cur_offset(), loop_start, LabelUse::BranchRI);
+                put(sink, &enc_ri_b(opcode, probe_count.to_reg(), 0));
             }
 
             &Inst::Unwind { ref inst } => {

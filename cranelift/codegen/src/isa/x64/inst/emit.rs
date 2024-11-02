@@ -9,6 +9,7 @@ use crate::isa::x64::encoding::rex::{
 use crate::isa::x64::encoding::vex::{VexInstruction, VexVectorLength};
 use crate::isa::x64::inst::args::*;
 use crate::isa::x64::inst::*;
+use crate::isa::x64::lower::isle::generated_code::{Atomic128RmwSeqOp, AtomicRmwSeqOp};
 
 /// A small helper to generate a signed conversion instruction.
 fn emit_signed_cvt(
@@ -115,6 +116,7 @@ pub(crate) fn emit(
         match iset_requirement {
             // Cranelift assumes SSE2 at least.
             InstructionSet::SSE | InstructionSet::SSE2 => true,
+            InstructionSet::CMPXCHG16b => info.isa_flags.use_cmpxchg16b(),
             InstructionSet::SSSE3 => info.isa_flags.use_ssse3(),
             InstructionSet::SSE41 => info.isa_flags.use_sse41(),
             InstructionSet::SSE42 => info.isa_flags.use_sse42(),
@@ -197,7 +199,7 @@ pub(crate) fn emit(
                 }
 
                 RegMemImm::Mem { addr } => {
-                    let amode = addr.finalize(state, sink);
+                    let amode = addr.finalize(state.frame_layout(), sink);
                     // Here we revert to the "normal" G-E ordering.
                     emit_std_reg_mem(sink, prefix, opcode_m, 1, reg_g, &amode, rex, 0);
                 }
@@ -254,9 +256,10 @@ pub(crate) fn emit(
             src1_dst,
             src2,
             op,
+            lock,
         } => {
             let src2 = src2.to_reg();
-            let src1_dst = src1_dst.finalize(state, sink).clone();
+            let src1_dst = src1_dst.finalize(state.frame_layout(), sink).clone();
 
             let opcode = match op {
                 AluRmiROpcode::Add => 0x01,
@@ -267,10 +270,11 @@ pub(crate) fn emit(
                 _ => panic!("Unsupported read-modify-write ALU opcode"),
             };
 
-            let prefix = if *size == OperandSize::Size16 {
-                LegacyPrefixes::_66
-            } else {
-                LegacyPrefixes::None
+            let prefix = match (size, lock) {
+                (OperandSize::Size16, false) => LegacyPrefixes::_66,
+                (OperandSize::Size16, true) => LegacyPrefixes::_66F0,
+                (_, false) => LegacyPrefixes::None,
+                (_, true) => LegacyPrefixes::_F0,
             };
             let opcode = if *size == OperandSize::Size8 {
                 opcode - 1
@@ -304,7 +308,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let w = match size {
@@ -363,7 +369,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, num_opcodes, dst, src, rex_flags);
                 }
                 RegMem::Mem { addr: src } => {
-                    let amode = src.finalize(state, sink).clone();
+                    let amode = src.finalize(state.frame_layout(), sink).clone();
                     emit_std_reg_mem(sink, prefix, opcode, num_opcodes, dst, &amode, rex_flags, 0);
                 }
             }
@@ -375,7 +381,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (opcode, opcode_ext) = match op {
@@ -406,7 +414,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let opcode = match op {
@@ -527,7 +537,7 @@ pub(crate) fn emit(
                     )
                 }
                 RegMem::Mem { addr: src } => {
-                    let amode = src.finalize(state, sink);
+                    let amode = src.finalize(state.frame_layout(), sink);
                     emit_std_enc_mem(
                         sink,
                         prefix,
@@ -573,7 +583,7 @@ pub(crate) fn emit(
                     emit_std_enc_enc(sink, prefix, 0xF7, 1, subopcode, src, rex_flags)
                 }
                 RegMem::Mem { addr: src } => {
-                    let amode = src.finalize(state, sink);
+                    let amode = src.finalize(state.frame_layout(), sink);
                     emit_std_enc_mem(sink, prefix, 0xF7, 1, subopcode, &amode, rex_flags, 0);
                 }
             }
@@ -613,7 +623,7 @@ pub(crate) fn emit(
                     emit_std_enc_enc(sink, prefix, 0xF6, 1, subopcode, src, rex_flags)
                 }
                 RegMem::Mem { addr } => {
-                    let amode = addr.finalize(state, sink);
+                    let amode = addr.finalize(state.frame_layout(), sink);
                     emit_std_enc_mem(sink, prefix, 0xF6, 1, subopcode, &amode, rex_flags, 0);
                 }
             }
@@ -637,7 +647,7 @@ pub(crate) fn emit(
                 }
 
                 RegMem::Mem { addr } => {
-                    let amode = addr.finalize(state, sink);
+                    let amode = addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, 0x0FAF, 2, dst, &amode, rex, 0);
                 }
             }
@@ -675,7 +685,7 @@ pub(crate) fn emit(
                 }
 
                 RegMem::Mem { addr } => {
-                    let amode = addr.finalize(state, sink);
+                    let amode = addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, opcode, 1, dst, &amode, rex, imm_size);
                 }
             }
@@ -697,7 +707,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let dst_hi = dst_hi.to_real_reg().unwrap().hw_enc();
@@ -821,7 +833,7 @@ pub(crate) fn emit(
             let inst = match size {
                 OperandSize::Size8 => Inst::div8(
                     DivSignedness::Signed,
-                    TrapCode::IntegerDivisionByZero,
+                    TrapCode::INTEGER_DIVISION_BY_ZERO,
                     RegMem::reg(divisor),
                     Gpr::unwrap_new(regs::rax()),
                     Writable::from_reg(Gpr::unwrap_new(regs::rax())),
@@ -829,7 +841,7 @@ pub(crate) fn emit(
                 _ => Inst::div(
                     size,
                     DivSignedness::Signed,
-                    TrapCode::IntegerDivisionByZero,
+                    TrapCode::INTEGER_DIVISION_BY_ZERO,
                     RegMem::reg(divisor),
                     Gpr::unwrap_new(regs::rax()),
                     Gpr::unwrap_new(regs::rdx()),
@@ -877,7 +889,7 @@ pub(crate) fn emit(
         }
 
         Inst::MovImmM { size, simm32, dst } => {
-            let dst = &dst.finalize(state, sink).clone();
+            let dst = &dst.finalize(state.frame_layout(), sink).clone();
             let default_rex = RexFlags::clear_w();
             let default_opcode = 0xC7;
             let bytes = size.to_bytes();
@@ -989,7 +1001,7 @@ pub(crate) fn emit(
                 }
 
                 RegMem::Mem { addr: src } => {
-                    let src = &src.finalize(state, sink).clone();
+                    let src = &src.finalize(state.frame_layout(), sink).clone();
 
                     emit_std_reg_mem(
                         sink,
@@ -1007,7 +1019,7 @@ pub(crate) fn emit(
 
         Inst::Mov64MR { src, dst } => {
             let dst = dst.to_reg().to_reg();
-            let src = &src.finalize(state, sink).clone();
+            let src = &src.finalize(state.frame_layout(), sink).clone();
 
             emit_std_reg_mem(
                 sink,
@@ -1023,7 +1035,7 @@ pub(crate) fn emit(
 
         Inst::LoadEffectiveAddress { addr, dst, size } => {
             let dst = dst.to_reg().to_reg();
-            let amode = addr.finalize(state, sink).clone();
+            let amode = addr.finalize(state.frame_layout(), sink).clone();
 
             // If this `lea` can actually get encoded as an `add` then do that
             // instead. Currently all candidate `iadd`s become an `lea`
@@ -1147,7 +1159,7 @@ pub(crate) fn emit(
                 }
 
                 RegMem::Mem { addr: src } => {
-                    let src = &src.finalize(state, sink).clone();
+                    let src = &src.finalize(state.frame_layout(), sink).clone();
 
                     emit_std_reg_mem(
                         sink,
@@ -1165,7 +1177,7 @@ pub(crate) fn emit(
 
         Inst::MovRM { size, src, dst } => {
             let src = src.to_reg();
-            let dst = &dst.finalize(state, sink).clone();
+            let dst = &dst.finalize(state.frame_layout(), sink).clone();
 
             let prefix = match size {
                 OperandSize::Size16 => LegacyPrefixes::_66,
@@ -1293,7 +1305,7 @@ pub(crate) fn emit(
                         emit_std_reg_reg(sink, prefix, opcode_bytes, 2, dst, reg, rex);
                     }
                     RegMemImm::Mem { addr } => {
-                        let addr = &addr.finalize(state, sink).clone();
+                        let addr = &addr.finalize(state.frame_layout(), sink).clone();
                         emit_std_reg_mem(sink, prefix, opcode_bytes, 2, dst, addr, rex, 0);
                     }
                     RegMemImm::Imm { .. } => unreachable!(),
@@ -1340,7 +1352,7 @@ pub(crate) fn emit(
                 }
 
                 RegMemImm::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink).clone();
+                    let addr = &addr.finalize(state.frame_layout(), sink).clone();
                     // Whereas here we revert to the "normal" G-E ordering for CMP.
                     let opcode = match (*size, is_cmp) {
                         (OperandSize::Size8, true) => 0x3A,
@@ -1435,7 +1447,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, 2, dst, reg, rex_flags);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink).clone();
+                    let addr = &addr.finalize(state.frame_layout(), sink).clone();
                     emit_std_reg_mem(sink, prefix, opcode, 2, dst, addr, rex_flags, 0);
                 }
             }
@@ -1491,7 +1503,7 @@ pub(crate) fn emit(
                 }
 
                 RegMemImm::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_enc_mem(
                         sink,
                         LegacyPrefixes::None,
@@ -1703,7 +1715,7 @@ pub(crate) fn emit(
                 }
 
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_enc_mem(
                         sink,
                         LegacyPrefixes::None,
@@ -1942,7 +1954,7 @@ pub(crate) fn emit(
                 }
 
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_enc_mem(
                         sink,
                         LegacyPrefixes::None,
@@ -2127,7 +2139,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, num_opcodes, reg_g, reg_e, rex);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, opcode, num_opcodes, reg_g, addr, rex, 0);
                 }
             };
@@ -2153,7 +2165,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, len, dst, reg, rex);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     // N.B.: bytes_at_end == 1, because of the `imm` byte below.
                     emit_std_reg_mem(sink, prefix, opcode, len, dst, addr, rex, 1);
                 }
@@ -2167,7 +2179,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (prefix, map, w, opcode) = match op {
@@ -2194,7 +2208,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (opcode, opcode_ext, w) = match op {
@@ -2361,7 +2377,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, length, reg_g, reg_e, rex);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, opcode, length, reg_g, addr, rex, 0);
                 }
             }
@@ -2394,7 +2410,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, length, reg_g, reg_e, rex);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, opcode, length, reg_g, addr, rex, 0);
                 }
             }
@@ -2459,7 +2475,9 @@ pub(crate) fn emit(
                 RegMemImm::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMemImm::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMemImm::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (prefix, map, opcode) = match op {
@@ -2605,7 +2623,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (w, prefix, map, opcode) = match op {
@@ -2644,7 +2664,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (w, map, opcode) = match op {
@@ -2683,7 +2705,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (w, map, opcode) = match op {
@@ -2750,7 +2774,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
             let mask = mask.to_reg();
 
@@ -2779,7 +2805,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (prefix, map, opcode) = match op {
@@ -2843,7 +2871,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (prefix, map, opcode) = match op {
@@ -2879,7 +2909,7 @@ pub(crate) fn emit(
 
         Inst::XmmMovRMVex { op, src, dst } => {
             let src = src.to_reg();
-            let dst = dst.clone().finalize(state, sink);
+            let dst = dst.clone().finalize(state.frame_layout(), sink);
 
             let (prefix, map, opcode) = match op {
                 AvxOpcode::Vmovdqu => (LegacyPrefixes::_F3, OpcodeMap::_0F, 0x7F),
@@ -2901,7 +2931,7 @@ pub(crate) fn emit(
 
         Inst::XmmMovRMImmVex { op, src, dst, imm } => {
             let src = src.to_reg();
-            let dst = dst.clone().finalize(state, sink);
+            let dst = dst.clone().finalize(state.frame_layout(), sink);
 
             let (w, prefix, map, opcode) = match op {
                 AvxOpcode::Vpextrb => (false, LegacyPrefixes::_66, OpcodeMap::_0F3A, 0x14),
@@ -2996,7 +3026,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (prefix, map, opcode) = match op {
@@ -3025,7 +3057,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (prefix, map, opcode) = match op {
@@ -3067,7 +3101,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
             let dst = dst.to_reg().to_reg();
             if let Some(src1) = reused_src {
@@ -3232,7 +3268,7 @@ pub(crate) fn emit(
                     }
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     assert!(
                         !regs_swapped,
                         "No existing way to encode a mem argument in the ModRM r/m field."
@@ -3263,7 +3299,7 @@ pub(crate) fn emit(
                 SseOpcode::Movupd => (LegacyPrefixes::_66, 0x0F11),
                 _ => unimplemented!("Opcode {:?} not implemented", op),
             };
-            let dst = &dst.finalize(state, sink);
+            let dst = &dst.finalize(state.frame_layout(), sink);
             emit_std_reg_mem(sink, prefix, opcode, 2, src, dst, RexFlags::clear_w(), 0);
         }
 
@@ -3283,7 +3319,7 @@ pub(crate) fn emit(
             } else {
                 RexFlags::clear_w()
             };
-            let dst = &dst.finalize(state, sink);
+            let dst = &dst.finalize(state.frame_layout(), sink);
             emit_std_reg_mem(sink, prefix, opcode, 3, src, dst, rex, 1);
             sink.put1(*imm);
         }
@@ -3355,7 +3391,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, 2, reg_g, reg_e, rex);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, opcode, 2, reg_g, addr, rex, 0);
                 }
             }
@@ -3378,7 +3414,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, len, src1, reg, rex);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, opcode, len, src1, addr, rex, 0);
                 }
             }
@@ -3407,7 +3443,7 @@ pub(crate) fn emit(
                     emit_std_reg_reg(sink, prefix, opcode, 2, dst, src2, rex);
                 }
                 RegMem::Mem { addr } => {
-                    let addr = &addr.finalize(state, sink);
+                    let addr = &addr.finalize(state.frame_layout(), sink);
                     emit_std_reg_mem(sink, prefix, opcode, 2, dst, addr, rex, 0);
                 }
             }
@@ -3426,7 +3462,9 @@ pub(crate) fn emit(
                 RegMem::Reg { reg } => {
                     RegisterOrAmode::Register(reg.to_real_reg().unwrap().hw_enc().into())
                 }
-                RegMem::Mem { addr } => RegisterOrAmode::Amode(addr.finalize(state, sink)),
+                RegMem::Mem { addr } => {
+                    RegisterOrAmode::Amode(addr.finalize(state.frame_layout(), sink))
+                }
             };
 
             let (prefix, map, opcode) = match op {
@@ -3692,7 +3730,7 @@ pub(crate) fn emit(
                     inst.emit(sink, info, state);
                 }
             } else {
-                let inst = Inst::trap_if(CC::P, TrapCode::BadConversionToInteger);
+                let inst = Inst::trap_if(CC::P, TrapCode::BAD_CONVERSION_TO_INTEGER);
                 inst.emit(sink, info, state);
 
                 // Check if INT_MIN was the correct result: determine the smallest floating point
@@ -3732,7 +3770,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
 
                 // no trap if src >= or > threshold
-                let inst = Inst::trap_if(no_overflow_cc.invert(), TrapCode::IntegerOverflow);
+                let inst = Inst::trap_if(no_overflow_cc.invert(), TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
 
                 // If positive, it was a real overflow.
@@ -3745,7 +3783,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
 
                 // no trap if 0 >= src
-                let inst = Inst::trap_if(CC::B, TrapCode::IntegerOverflow);
+                let inst = Inst::trap_if(CC::B, TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
             }
 
@@ -3857,7 +3895,7 @@ pub(crate) fn emit(
                 sink.bind_label(not_nan, state.ctrl_plane_mut());
             } else {
                 // Trap.
-                let inst = Inst::trap_if(CC::P, TrapCode::BadConversionToInteger);
+                let inst = Inst::trap_if(CC::P, TrapCode::BAD_CONVERSION_TO_INTEGER);
                 inst.emit(sink, info, state);
             }
 
@@ -3887,7 +3925,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
             } else {
                 // Trap.
-                let inst = Inst::trap(TrapCode::IntegerOverflow);
+                let inst = Inst::trap(TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
             }
 
@@ -3928,7 +3966,7 @@ pub(crate) fn emit(
                 inst.emit(sink, info, state);
                 sink.bind_label(next_is_large, state.ctrl_plane_mut());
             } else {
-                let inst = Inst::trap_if(CC::L, TrapCode::IntegerOverflow);
+                let inst = Inst::trap_if(CC::L, TrapCode::INTEGER_OVERFLOW);
                 inst.emit(sink, info, state);
             }
 
@@ -4033,8 +4071,79 @@ pub(crate) fn emit(
                 _ => unreachable!(),
             };
             let rex = RexFlags::from((OperandSize::from_ty(*ty), replacement));
-            let amode = mem.finalize(state, sink);
+            let amode = mem.finalize(state.frame_layout(), sink);
             emit_std_reg_mem(sink, prefix, opcodes, 2, replacement, &amode, rex, 0);
+        }
+
+        Inst::LockCmpxchg16b {
+            replacement_low,
+            replacement_high,
+            expected_low,
+            expected_high,
+            mem,
+            dst_old_low,
+            dst_old_high,
+        } => {
+            let mem = mem.clone();
+            debug_assert_eq!(*replacement_low, regs::rbx());
+            debug_assert_eq!(*replacement_high, regs::rcx());
+            debug_assert_eq!(*expected_low, regs::rax());
+            debug_assert_eq!(*expected_high, regs::rdx());
+            debug_assert_eq!(dst_old_low.to_reg(), regs::rax());
+            debug_assert_eq!(dst_old_high.to_reg(), regs::rdx());
+
+            let amode = mem.finalize(state.frame_layout(), sink);
+            // lock cmpxchg16b (mem)
+            // Note that 0xF0 is the Lock prefix.
+            emit_std_enc_mem(
+                sink,
+                LegacyPrefixes::_F0,
+                0x0FC7,
+                2,
+                1,
+                &amode,
+                RexFlags::set_w(),
+                0,
+            );
+        }
+
+        Inst::LockXadd {
+            size,
+            operand,
+            mem,
+            dst_old,
+        } => {
+            debug_assert_eq!(dst_old.to_reg(), *operand);
+            // lock xadd{b,w,l,q} %operand, (mem)
+            // Note that 0xF0 is the Lock prefix.
+            let (prefix, opcodes) = match size {
+                OperandSize::Size8 => (LegacyPrefixes::_F0, 0x0FC0),
+                OperandSize::Size16 => (LegacyPrefixes::_66F0, 0x0FC1),
+                OperandSize::Size32 => (LegacyPrefixes::_F0, 0x0FC1),
+                OperandSize::Size64 => (LegacyPrefixes::_F0, 0x0FC1),
+            };
+            let rex = RexFlags::from((*size, *operand));
+            let amode = mem.finalize(state.frame_layout(), sink);
+            emit_std_reg_mem(sink, prefix, opcodes, 2, *operand, &amode, rex, 0);
+        }
+
+        Inst::Xchg {
+            size,
+            operand,
+            mem,
+            dst_old,
+        } => {
+            debug_assert_eq!(dst_old.to_reg(), *operand);
+            // xchg{b,w,l,q} %operand, (mem)
+            let (prefix, opcodes) = match size {
+                OperandSize::Size8 => (LegacyPrefixes::None, 0x86),
+                OperandSize::Size16 => (LegacyPrefixes::_66, 0x87),
+                OperandSize::Size32 => (LegacyPrefixes::None, 0x87),
+                OperandSize::Size64 => (LegacyPrefixes::None, 0x87),
+            };
+            let rex = RexFlags::from((*size, *operand));
+            let amode = mem.finalize(state.frame_layout(), sink);
+            emit_std_reg_mem(sink, prefix, opcodes, 1, *operand, &amode, rex, 0);
         }
 
         Inst::AtomicRmwSeq {
@@ -4049,7 +4158,7 @@ pub(crate) fn emit(
             let temp = *temp;
             let dst_old = *dst_old;
             debug_assert_eq!(dst_old.to_reg(), regs::rax());
-            let mem = mem.finalize(state, sink).clone();
+            let mem = mem.finalize(state.frame_layout(), sink).clone();
 
             // Emit this:
             //    mov{zbq,zwq,zlq,q}     (%r_address), %rax    // rax = old value
@@ -4061,15 +4170,6 @@ pub(crate) fn emit(
             //
             // Operand conventions: IN:  %r_address, %r_operand OUT: %rax (old
             //    value), %r_temp (trashed), %rflags (trashed)
-            //
-            // In the case where the operation is 'xchg', the "`op`q"
-            // instruction is instead: movq                    %r_operand,
-            //   %r_temp so that we simply write in the destination, the "2nd
-            // arg for `op`".
-            //
-            // TODO: this sequence can be significantly improved (e.g., to `lock
-            // <op>`) when it is known that `dst_old` is not used later, see
-            // https://github.com/bytecodealliance/wasmtime/issues/2153.
             let again_label = sink.get_label();
 
             // mov{zbq,zwq,zlq,q} (%r_address), %rax
@@ -4085,13 +4185,8 @@ pub(crate) fn emit(
             i2.emit(sink, info, state);
 
             let operand_rmi = RegMemImm::reg(operand);
-            use inst_common::MachAtomicRmwOp as RmwOp;
+            use AtomicRmwSeqOp as RmwOp;
             match op {
-                RmwOp::Xchg => {
-                    // movq %r_operand, %r_temp
-                    let i3 = Inst::mov_r_r(OperandSize::Size64, operand, temp);
-                    i3.emit(sink, info, state);
-                }
                 RmwOp::Nand => {
                     // andq %r_operand, %r_temp
                     let i3 =
@@ -4122,20 +4217,13 @@ pub(crate) fn emit(
                     let i4 = Inst::cmove(OperandSize::Size64, cc, RegMem::reg(operand), temp);
                     i4.emit(sink, info, state);
                 }
-                _ => {
+                RmwOp::And | RmwOp::Or | RmwOp::Xor => {
                     // opq %r_operand, %r_temp
                     let alu_op = match op {
-                        RmwOp::Add => AluRmiROpcode::Add,
-                        RmwOp::Sub => AluRmiROpcode::Sub,
                         RmwOp::And => AluRmiROpcode::And,
                         RmwOp::Or => AluRmiROpcode::Or,
                         RmwOp::Xor => AluRmiROpcode::Xor,
-                        RmwOp::Xchg
-                        | RmwOp::Nand
-                        | RmwOp::Umin
-                        | RmwOp::Umax
-                        | RmwOp::Smin
-                        | RmwOp::Smax => unreachable!(),
+                        _ => unreachable!(),
                     };
                     let i3 = Inst::alu_rmi_r(OperandSize::Size64, alu_op, operand_rmi, temp);
                     i3.emit(sink, info, state);
@@ -4152,6 +4240,176 @@ pub(crate) fn emit(
                 dst_old,
             };
             i4.emit(sink, info, state);
+
+            // jnz again
+            one_way_jmp(sink, CC::NZ, again_label);
+        }
+
+        Inst::Atomic128RmwSeq {
+            op,
+            mem,
+            operand_low,
+            operand_high,
+            temp_low,
+            temp_high,
+            dst_old_low,
+            dst_old_high,
+        } => {
+            let operand_low = *operand_low;
+            let operand_high = *operand_high;
+            let temp_low = *temp_low;
+            let temp_high = *temp_high;
+            let dst_old_low = *dst_old_low;
+            let dst_old_high = *dst_old_high;
+            debug_assert_eq!(temp_low.to_reg(), regs::rbx());
+            debug_assert_eq!(temp_high.to_reg(), regs::rcx());
+            debug_assert_eq!(dst_old_low.to_reg(), regs::rax());
+            debug_assert_eq!(dst_old_high.to_reg(), regs::rdx());
+            let mem = mem.finalize(state.frame_layout(), sink).clone();
+
+            let again_label = sink.get_label();
+
+            // Load the initial value.
+            Inst::load(types::I64, mem.clone(), dst_old_low, ExtKind::ZeroExtend)
+                .emit(sink, info, state);
+            Inst::load(types::I64, mem.offset(8), dst_old_high, ExtKind::ZeroExtend)
+                .emit(sink, info, state);
+
+            // again:
+            sink.bind_label(again_label, state.ctrl_plane_mut());
+
+            // Move old value to temp registers.
+            Inst::mov_r_r(OperandSize::Size64, dst_old_low.to_reg(), temp_low)
+                .emit(sink, info, state);
+            Inst::mov_r_r(OperandSize::Size64, dst_old_high.to_reg(), temp_high)
+                .emit(sink, info, state);
+
+            // Perform the operation.
+            let operand_low_rmi = RegMemImm::reg(operand_low);
+            let operand_high_rmi = RegMemImm::reg(operand_high);
+            use Atomic128RmwSeqOp as RmwOp;
+            match op {
+                RmwOp::Nand => {
+                    // temp &= operand
+                    Inst::alu_rmi_r(
+                        OperandSize::Size64,
+                        AluRmiROpcode::And,
+                        operand_low_rmi,
+                        temp_low,
+                    )
+                    .emit(sink, info, state);
+                    Inst::alu_rmi_r(
+                        OperandSize::Size64,
+                        AluRmiROpcode::And,
+                        operand_high_rmi,
+                        temp_high,
+                    )
+                    .emit(sink, info, state);
+
+                    // temp = !temp
+                    Inst::not(OperandSize::Size64, temp_low).emit(sink, info, state);
+                    Inst::not(OperandSize::Size64, temp_high).emit(sink, info, state);
+                }
+                RmwOp::Umin | RmwOp::Umax | RmwOp::Smin | RmwOp::Smax => {
+                    // Do a comparison with LHS temp and RHS operand.
+                    // `cmp_rmi_r` and `alu_rmi_r` have opposite argument orders.
+                    Inst::cmp_rmi_r(OperandSize::Size64, temp_low.to_reg(), operand_low_rmi)
+                        .emit(sink, info, state);
+                    // This will clobber `temp_high`
+                    Inst::alu_rmi_r(
+                        OperandSize::Size64,
+                        AluRmiROpcode::Sbb,
+                        operand_high_rmi,
+                        temp_high,
+                    )
+                    .emit(sink, info, state);
+                    // Restore the clobbered value
+                    Inst::mov_r_r(OperandSize::Size64, dst_old_high.to_reg(), temp_high)
+                        .emit(sink, info, state);
+                    let cc = match op {
+                        RmwOp::Umin => CC::NB,
+                        RmwOp::Umax => CC::B,
+                        RmwOp::Smin => CC::NL,
+                        RmwOp::Smax => CC::L,
+                        _ => unreachable!(),
+                    };
+                    Inst::cmove(OperandSize::Size64, cc, operand_low.into(), temp_low)
+                        .emit(sink, info, state);
+                    Inst::cmove(OperandSize::Size64, cc, operand_high.into(), temp_high)
+                        .emit(sink, info, state);
+                }
+                RmwOp::Add | RmwOp::Sub | RmwOp::And | RmwOp::Or | RmwOp::Xor => {
+                    // temp op= operand
+                    let (op_low, op_high) = match op {
+                        RmwOp::Add => (AluRmiROpcode::Add, AluRmiROpcode::Adc),
+                        RmwOp::Sub => (AluRmiROpcode::Sub, AluRmiROpcode::Sbb),
+                        RmwOp::And => (AluRmiROpcode::And, AluRmiROpcode::And),
+                        RmwOp::Or => (AluRmiROpcode::Or, AluRmiROpcode::Or),
+                        RmwOp::Xor => (AluRmiROpcode::Xor, AluRmiROpcode::Xor),
+                        _ => unreachable!(),
+                    };
+                    Inst::alu_rmi_r(OperandSize::Size64, op_low, operand_low_rmi, temp_low)
+                        .emit(sink, info, state);
+                    Inst::alu_rmi_r(OperandSize::Size64, op_high, operand_high_rmi, temp_high)
+                        .emit(sink, info, state);
+                }
+            }
+
+            // cmpxchg16b (mem)
+            Inst::LockCmpxchg16b {
+                replacement_low: temp_low.to_reg(),
+                replacement_high: temp_high.to_reg(),
+                expected_low: dst_old_low.to_reg(),
+                expected_high: dst_old_high.to_reg(),
+                mem: Box::new(mem.into()),
+                dst_old_low,
+                dst_old_high,
+            }
+            .emit(sink, info, state);
+
+            // jnz again
+            one_way_jmp(sink, CC::NZ, again_label);
+        }
+
+        Inst::Atomic128XchgSeq {
+            mem,
+            operand_low,
+            operand_high,
+            dst_old_low,
+            dst_old_high,
+        } => {
+            let operand_low = *operand_low;
+            let operand_high = *operand_high;
+            let dst_old_low = *dst_old_low;
+            let dst_old_high = *dst_old_high;
+            debug_assert_eq!(operand_low, regs::rbx());
+            debug_assert_eq!(operand_high, regs::rcx());
+            debug_assert_eq!(dst_old_low.to_reg(), regs::rax());
+            debug_assert_eq!(dst_old_high.to_reg(), regs::rdx());
+            let mem = mem.finalize(state.frame_layout(), sink).clone();
+
+            let again_label = sink.get_label();
+
+            // Load the initial value.
+            Inst::load(types::I64, mem.clone(), dst_old_low, ExtKind::ZeroExtend)
+                .emit(sink, info, state);
+            Inst::load(types::I64, mem.offset(8), dst_old_high, ExtKind::ZeroExtend)
+                .emit(sink, info, state);
+
+            // again:
+            sink.bind_label(again_label, state.ctrl_plane_mut());
+
+            // cmpxchg16b (mem)
+            Inst::LockCmpxchg16b {
+                replacement_low: operand_low,
+                replacement_high: operand_high,
+                expected_low: dst_old_low.to_reg(),
+                expected_high: dst_old_high.to_reg(),
+                mem: Box::new(mem.into()),
+                dst_old_low,
+                dst_old_high,
+            }
+            .emit(sink, info, state);
 
             // jnz again
             one_way_jmp(sink, CC::NZ, again_label);

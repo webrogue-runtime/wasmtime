@@ -99,6 +99,8 @@ impl Inst {
             | Inst::LoadEffectiveAddress { .. }
             | Inst::LoadExtName { .. }
             | Inst::LockCmpxchg { .. }
+            | Inst::LockXadd { .. }
+            | Inst::Xchg { .. }
             | Inst::Mov64MR { .. }
             | Inst::MovImmM { .. }
             | Inst::MovRM { .. }
@@ -138,6 +140,10 @@ impl Inst {
             | Inst::Unwind { .. }
             | Inst::DummyUse { .. }
             | Inst::AluConstOp { .. } => smallvec![],
+
+            Inst::LockCmpxchg16b { .. }
+            | Inst::Atomic128RmwSeq { .. }
+            | Inst::Atomic128XchgSeq { .. } => smallvec![InstructionSet::CMPXCHG16b],
 
             Inst::AluRmRVex { op, .. } => op.available_from(),
             Inst::UnaryRmR { op, .. } => op.available_from(),
@@ -697,12 +703,14 @@ impl PrettyPrint for Inst {
                 op,
                 src1_dst,
                 src2,
+                lock,
             } => {
                 let size_bytes = size.to_bytes();
                 let src2 = pretty_print_reg(src2.to_reg(), size_bytes);
                 let src1_dst = src1_dst.pretty_print(size_bytes);
                 let op = ljustify2(op.to_string(), suffix_bwlq(*size));
-                format!("{op} {src2}, {src1_dst}")
+                let prefix = if *lock { "lock " } else { "" };
+                format!("{prefix}{op} {src2}, {src1_dst}")
             }
             Inst::AluRmRVex {
                 size,
@@ -1815,11 +1823,94 @@ impl PrettyPrint for Inst {
                 )
             }
 
+            Inst::LockCmpxchg16b {
+                replacement_low,
+                replacement_high,
+                expected_low,
+                expected_high,
+                mem,
+                dst_old_low,
+                dst_old_high,
+                ..
+            } => {
+                let replacement_low = pretty_print_reg(*replacement_low, 8);
+                let replacement_high = pretty_print_reg(*replacement_high, 8);
+                let expected_low = pretty_print_reg(*expected_low, 8);
+                let expected_high = pretty_print_reg(*expected_high, 8);
+                let dst_old_low = pretty_print_reg(dst_old_low.to_reg(), 8);
+                let dst_old_high = pretty_print_reg(dst_old_high.to_reg(), 8);
+                let mem = mem.pretty_print(16);
+                format!(
+                    "lock cmpxchg16b {mem}, replacement={replacement_high}:{replacement_low}, expected={expected_high}:{expected_low}, dst_old={dst_old_high}:{dst_old_low}"
+                )
+            }
+
+            Inst::LockXadd {
+                size,
+                operand,
+                mem,
+                dst_old,
+            } => {
+                let operand = pretty_print_reg(*operand, size.to_bytes());
+                let dst_old = pretty_print_reg(dst_old.to_reg(), size.to_bytes());
+                let mem = mem.pretty_print(size.to_bytes());
+                let suffix = suffix_bwlq(*size);
+                format!("lock xadd{suffix} {operand}, {mem}, dst_old={dst_old}")
+            }
+
+            Inst::Xchg {
+                size,
+                operand,
+                mem,
+                dst_old,
+            } => {
+                let operand = pretty_print_reg(*operand, size.to_bytes());
+                let dst_old = pretty_print_reg(dst_old.to_reg(), size.to_bytes());
+                let mem = mem.pretty_print(size.to_bytes());
+                let suffix = suffix_bwlq(*size);
+                format!("xchg{suffix} {operand}, {mem}, dst_old={dst_old}")
+            }
+
             Inst::AtomicRmwSeq { ty, op, .. } => {
                 let ty = ty.bits();
                 format!(
-                    "atomically {{ {ty}_bits_at_[%r9]) {op:?}= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }}"
+                    "atomically {{ {ty}_bits_at_[%r9] {op:?}= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }}"
                 )
+            }
+
+            Inst::Atomic128RmwSeq {
+                op,
+                mem,
+                operand_low,
+                operand_high,
+                temp_low,
+                temp_high,
+                dst_old_low,
+                dst_old_high,
+            } => {
+                let operand_low = pretty_print_reg(*operand_low, 8);
+                let operand_high = pretty_print_reg(*operand_high, 8);
+                let temp_low = pretty_print_reg(temp_low.to_reg(), 8);
+                let temp_high = pretty_print_reg(temp_high.to_reg(), 8);
+                let dst_old_low = pretty_print_reg(dst_old_low.to_reg(), 8);
+                let dst_old_high = pretty_print_reg(dst_old_high.to_reg(), 8);
+                let mem = mem.pretty_print(16);
+                format!("atomically {{ {dst_old_high}:{dst_old_low} = {mem}; {temp_high}:{temp_low} = {dst_old_high}:{dst_old_low} {op:?} {operand_high}:{operand_low}; {mem} = {temp_high}:{temp_low} }}")
+            }
+
+            Inst::Atomic128XchgSeq {
+                mem,
+                operand_low,
+                operand_high,
+                dst_old_low,
+                dst_old_high,
+            } => {
+                let operand_low = pretty_print_reg(*operand_low, 8);
+                let operand_high = pretty_print_reg(*operand_high, 8);
+                let dst_old_low = pretty_print_reg(dst_old_low.to_reg(), 8);
+                let dst_old_high = pretty_print_reg(dst_old_high.to_reg(), 8);
+                let mem = mem.pretty_print(16);
+                format!("atomically {{ {dst_old_high}:{dst_old_low} = {mem}; {mem} = {operand_high}:{operand_low} }}")
             }
 
             Inst::Fence { kind } => match kind {
@@ -2462,6 +2553,47 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             mem.get_operands(collector);
         }
 
+        Inst::LockCmpxchg16b {
+            replacement_low,
+            replacement_high,
+            expected_low,
+            expected_high,
+            mem,
+            dst_old_low,
+            dst_old_high,
+            ..
+        } => {
+            collector.reg_fixed_use(replacement_low, regs::rbx());
+            collector.reg_fixed_use(replacement_high, regs::rcx());
+            collector.reg_fixed_use(expected_low, regs::rax());
+            collector.reg_fixed_use(expected_high, regs::rdx());
+            collector.reg_fixed_def(dst_old_low, regs::rax());
+            collector.reg_fixed_def(dst_old_high, regs::rdx());
+            mem.get_operands(collector);
+        }
+
+        Inst::LockXadd {
+            operand,
+            mem,
+            dst_old,
+            ..
+        } => {
+            collector.reg_use(operand);
+            collector.reg_reuse_def(dst_old, 0);
+            mem.get_operands(collector);
+        }
+
+        Inst::Xchg {
+            operand,
+            mem,
+            dst_old,
+            ..
+        } => {
+            collector.reg_use(operand);
+            collector.reg_reuse_def(dst_old, 0);
+            mem.get_operands(collector);
+        }
+
         Inst::AtomicRmwSeq {
             operand,
             temp,
@@ -2474,6 +2606,42 @@ fn x64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             // This `fixed_def` is needed because `CMPXCHG` always uses this
             // register implicitly.
             collector.reg_fixed_def(dst_old, regs::rax());
+            mem.get_operands_late(collector)
+        }
+
+        Inst::Atomic128RmwSeq {
+            operand_low,
+            operand_high,
+            temp_low,
+            temp_high,
+            dst_old_low,
+            dst_old_high,
+            mem,
+            ..
+        } => {
+            // All registers are collected in the `Late` position so that they don't overlap.
+            collector.reg_late_use(operand_low);
+            collector.reg_late_use(operand_high);
+            collector.reg_fixed_def(temp_low, regs::rbx());
+            collector.reg_fixed_def(temp_high, regs::rcx());
+            collector.reg_fixed_def(dst_old_low, regs::rax());
+            collector.reg_fixed_def(dst_old_high, regs::rdx());
+            mem.get_operands_late(collector)
+        }
+
+        Inst::Atomic128XchgSeq {
+            operand_low,
+            operand_high,
+            dst_old_low,
+            dst_old_high,
+            mem,
+            ..
+        } => {
+            // All registers are collected in the `Late` position so that they don't overlap.
+            collector.reg_fixed_late_use(operand_low, regs::rbx());
+            collector.reg_fixed_late_use(operand_high, regs::rcx());
+            collector.reg_fixed_def(dst_old_low, regs::rax());
+            collector.reg_fixed_def(dst_old_high, regs::rdx());
             mem.get_operands_late(collector)
         }
 

@@ -3,19 +3,23 @@
 //! This crate provides an implementation of the `wasmtime_environ::Compiler`
 //! and `wasmtime_environ::CompilerBuilder` traits.
 
+// See documentation in crates/wasmtime/src/runtime.rs for why this is
+// selectively enabled here.
+#![warn(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use cranelift_codegen::{
     binemit,
     cursor::FuncCursor,
-    ir::{self, AbiParam, ArgumentPurpose, ExternalName, InstBuilder, Signature},
+    ir::{self, AbiParam, ArgumentPurpose, ExternalName, InstBuilder, Signature, TrapCode},
     isa::{CallConv, TargetIsa},
     settings, FinalizedMachReloc, FinalizedRelocTarget, MachTrap,
 };
 use cranelift_entity::PrimaryMap;
-use cranelift_wasm::{FuncIndex, WasmFuncType, WasmHeapTopType, WasmHeapType, WasmValType};
 
 use target_lexicon::Architecture;
 use wasmtime_environ::{
-    BuiltinFunctionIndex, FlagValue, RelocationTarget, Trap, TrapInformation, Tunables,
+    BuiltinFunctionIndex, FlagValue, FuncIndex, RelocationTarget, Trap, TrapInformation, Tunables,
+    WasmFuncType, WasmHeapTopType, WasmHeapType, WasmValType,
 };
 
 pub use builder::builder;
@@ -31,9 +35,32 @@ mod compiler;
 mod debug;
 mod func_environ;
 mod gc;
+mod translate;
 
-/// Trap code used for debug assertions we emit in our JIT code.
-const DEBUG_ASSERT_TRAP_CODE: u16 = u16::MAX;
+const TRAP_INTERNAL_ASSERT: TrapCode = TrapCode::unwrap_user(1);
+const TRAP_OFFSET: u8 = 2;
+pub const TRAP_ALWAYS: TrapCode =
+    TrapCode::unwrap_user(Trap::AlwaysTrapAdapter as u8 + TRAP_OFFSET);
+pub const TRAP_CANNOT_ENTER: TrapCode =
+    TrapCode::unwrap_user(Trap::CannotEnterComponent as u8 + TRAP_OFFSET);
+pub const TRAP_INDIRECT_CALL_TO_NULL: TrapCode =
+    TrapCode::unwrap_user(Trap::IndirectCallToNull as u8 + TRAP_OFFSET);
+pub const TRAP_BAD_SIGNATURE: TrapCode =
+    TrapCode::unwrap_user(Trap::BadSignature as u8 + TRAP_OFFSET);
+pub const TRAP_NULL_REFERENCE: TrapCode =
+    TrapCode::unwrap_user(Trap::NullReference as u8 + TRAP_OFFSET);
+pub const TRAP_ALLOCATION_TOO_LARGE: TrapCode =
+    TrapCode::unwrap_user(Trap::AllocationTooLarge as u8 + TRAP_OFFSET);
+pub const TRAP_ARRAY_OUT_OF_BOUNDS: TrapCode =
+    TrapCode::unwrap_user(Trap::ArrayOutOfBounds as u8 + TRAP_OFFSET);
+pub const TRAP_UNREACHABLE: TrapCode =
+    TrapCode::unwrap_user(Trap::UnreachableCodeReached as u8 + TRAP_OFFSET);
+pub const TRAP_HEAP_MISALIGNED: TrapCode =
+    TrapCode::unwrap_user(Trap::HeapMisaligned as u8 + TRAP_OFFSET);
+pub const TRAP_TABLE_OUT_OF_BOUNDS: TrapCode =
+    TrapCode::unwrap_user(Trap::TableOutOfBounds as u8 + TRAP_OFFSET);
+pub const TRAP_CAST_FAILURE: TrapCode =
+    TrapCode::unwrap_user(Trap::CastFailure as u8 + TRAP_OFFSET);
 
 /// Creates a new cranelift `Signature` with no wasm params/results for the
 /// given calling convention.
@@ -212,17 +239,6 @@ fn to_flag_value(v: &settings::Value) -> FlagValue<'static> {
     }
 }
 
-/// A custom code with `TrapCode::User` which is used by always-trap shims which
-/// indicates that, as expected, the always-trapping function indeed did trap.
-/// This effectively provides a better error message as opposed to a bland
-/// "unreachable code reached"
-pub const ALWAYS_TRAP_CODE: u16 = 100;
-
-/// A custom code with `TrapCode::User` corresponding to being unable to reenter
-/// a component due to its reentrance limitations. This is used in component
-/// adapters to provide a more useful error message in such situations.
-pub const CANNOT_ENTER_CODE: u16 = 101;
-
 /// Converts machine traps to trap information.
 pub fn mach_trap_to_trap(trap: &MachTrap) -> Option<TrapInformation> {
     let &MachTrap { offset, code } = trap;
@@ -234,29 +250,18 @@ pub fn mach_trap_to_trap(trap: &MachTrap) -> Option<TrapInformation> {
 
 fn clif_trap_to_env_trap(trap: ir::TrapCode) -> Option<Trap> {
     Some(match trap {
-        ir::TrapCode::StackOverflow => Trap::StackOverflow,
-        ir::TrapCode::HeapOutOfBounds => Trap::MemoryOutOfBounds,
-        ir::TrapCode::HeapMisaligned => Trap::HeapMisaligned,
-        ir::TrapCode::TableOutOfBounds => Trap::TableOutOfBounds,
-        ir::TrapCode::IndirectCallToNull => Trap::IndirectCallToNull,
-        ir::TrapCode::BadSignature => Trap::BadSignature,
-        ir::TrapCode::IntegerOverflow => Trap::IntegerOverflow,
-        ir::TrapCode::IntegerDivisionByZero => Trap::IntegerDivisionByZero,
-        ir::TrapCode::BadConversionToInteger => Trap::BadConversionToInteger,
-        ir::TrapCode::UnreachableCodeReached => Trap::UnreachableCodeReached,
-        ir::TrapCode::Interrupt => Trap::Interrupt,
-        ir::TrapCode::User(ALWAYS_TRAP_CODE) => Trap::AlwaysTrapAdapter,
-        ir::TrapCode::User(CANNOT_ENTER_CODE) => Trap::CannotEnterComponent,
-        ir::TrapCode::NullReference => Trap::NullReference,
-        ir::TrapCode::ArrayOutOfBounds => Trap::ArrayOutOfBounds,
+        ir::TrapCode::STACK_OVERFLOW => Trap::StackOverflow,
+        ir::TrapCode::HEAP_OUT_OF_BOUNDS => Trap::MemoryOutOfBounds,
+        ir::TrapCode::INTEGER_OVERFLOW => Trap::IntegerOverflow,
+        ir::TrapCode::INTEGER_DIVISION_BY_ZERO => Trap::IntegerDivisionByZero,
+        ir::TrapCode::BAD_CONVERSION_TO_INTEGER => Trap::BadConversionToInteger,
 
         // These do not get converted to wasmtime traps, since they
         // shouldn't ever be hit in theory. Instead of catching and handling
         // these, we let the signal crash the process.
-        ir::TrapCode::User(DEBUG_ASSERT_TRAP_CODE) => return None,
+        TRAP_INTERNAL_ASSERT => return None,
 
-        // these should never be emitted by wasmtime-cranelift
-        ir::TrapCode::User(_) => unreachable!(),
+        other => Trap::from_u8(other.as_raw().get() - TRAP_OFFSET).unwrap(),
     })
 }
 

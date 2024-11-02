@@ -31,7 +31,14 @@
 //! function declarations. Many bits and pieces are copied or translated from
 //! the SpiderMonkey implementation and it should pass all the tests!
 
-#![allow(non_snake_case, clippy::cast_sign_loss)]
+#![allow(
+    // FFI bindings here for C/etc don't follow Rust's naming conventions.
+    non_snake_case,
+    // Platform-specific code has a lot of false positives with these lints so
+    // like Unix disable the lints for this module.
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
 
 use crate::runtime::module::lookup_code;
 use crate::runtime::vm::sys::traphandlers::wasmtime_longjmp;
@@ -48,7 +55,7 @@ use mach2::thread_act::*;
 use mach2::thread_status::*;
 use mach2::traps::*;
 use std::io;
-use std::mem::{self, MaybeUninit};
+use std::mem;
 use std::ptr::addr_of_mut;
 use std::thread;
 use wasmtime_environ::Trap;
@@ -62,7 +69,7 @@ pub struct TrapHandler {
     thread: Option<thread::JoinHandle<()>>,
 }
 
-static mut PREV_SIGBUS: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
+static mut PREV_SIGBUS: libc::sigaction = unsafe { mem::zeroed() };
 
 impl TrapHandler {
     pub unsafe fn new() -> TrapHandler {
@@ -96,7 +103,7 @@ impl TrapHandler {
             handler.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
             handler.sa_sigaction = sigbus_handler as usize;
             libc::sigemptyset(&mut handler.sa_mask);
-            if libc::sigaction(libc::SIGBUS, &handler, PREV_SIGBUS.as_mut_ptr()) != 0 {
+            if libc::sigaction(libc::SIGBUS, &handler, addr_of_mut!(PREV_SIGBUS)) != 0 {
                 panic!(
                     "unable to install signal handler: {}",
                     io::Error::last_os_error(),
@@ -142,7 +149,7 @@ unsafe extern "C" fn sigbus_handler(
     });
 
     super::signals::delegate_signal_to_previous_handler(
-        PREV_SIGBUS.as_ptr(),
+        addr_of_mut!(PREV_SIGBUS),
         signum,
         siginfo,
         context,

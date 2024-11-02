@@ -352,8 +352,7 @@ async fn async_with_pooling_stacks() {
     let mut config = Config::new();
     config.async_support(true);
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(0);
+    config.memory_guard_size(0);
     config.static_memory_maximum_size(1 << 16);
 
     let engine = Engine::new(&config).unwrap();
@@ -377,8 +376,7 @@ async fn async_host_func_with_pooling_stacks() -> Result<()> {
     let mut config = Config::new();
     config.async_support(true);
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(0);
+    config.memory_guard_size(0);
     config.static_memory_maximum_size(1 << 16);
 
     let mut store = Store::new(&Engine::new(&config)?, ());
@@ -970,7 +968,10 @@ async fn gc_preserves_externref_on_historical_async_stacks() -> Result<()> {
         "",
         "test",
         |cx: Caller<'_, _>, val: i32, handle: Option<Rooted<ExternRef>>| -> Result<()> {
-            assert_eq!(handle.unwrap().data(&cx)?.downcast_ref(), Some(&val));
+            assert_eq!(
+                handle.unwrap().data(&cx)?.unwrap().downcast_ref(),
+                Some(&val)
+            );
             Ok(())
         },
     )?;

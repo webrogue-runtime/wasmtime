@@ -1,8 +1,7 @@
-use crate::PrimaryMap;
+use crate::{ModuleInternedRecGroupIndex, ModuleInternedTypeIndex, PrimaryMap, WasmSubType};
 use core::ops::{Index, Range};
 use cranelift_entity::{packed_option::PackedOption, SecondaryMap};
 use serde_derive::{Deserialize, Serialize};
-use wasmtime_types::{ModuleInternedRecGroupIndex, ModuleInternedTypeIndex, WasmSubType};
 
 /// All types used in a core wasm module.
 ///
@@ -86,8 +85,6 @@ impl ModuleTypes {
 #[cfg(feature = "compile")]
 impl ModuleTypes {
     /// Associate `trampoline_ty` as the trampoline type for `for_ty`.
-    ///
-    /// This is really only for use by the `ModuleTypesBuilder`.
     pub fn set_trampoline_type(
         &mut self,
         for_ty: ModuleInternedTypeIndex,

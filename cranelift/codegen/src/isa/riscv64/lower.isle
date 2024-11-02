@@ -565,7 +565,7 @@
 ;; Traps if the input register is zero, otherwise returns the same register.
 (decl nonzero_divisor (XReg) XReg)
 (rule (nonzero_divisor val)
-  (let ((_ InstOutput (gen_trapif (IntCC.Equal) val (zero_reg) (TrapCode.IntegerDivisionByZero))))
+  (let ((_ InstOutput (gen_trapif (IntCC.Equal) val (zero_reg) (TrapCode.INTEGER_DIVISION_BY_ZERO))))
     val))
 
 ;;;; Rules for `sdiv` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -614,7 +614,7 @@
       (_ InstOutput (gen_trapif
                       (IntCC.Equal)
                       no_int_overflow (zero_reg)
-                      (TrapCode.IntegerOverflow))))
+                      (TrapCode.INTEGER_OVERFLOW))))
       y))
 
 ;;;; Rules for `urem` ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -1020,7 +1020,8 @@
 (rule 1 (gen_bswap (ty_int_ref_16_to_64 ty) x)
   (if-let half_ty (ty_half_width ty))
   (if-let half_size (u64_to_imm12 (ty_bits half_ty)))
-  (let (;; This swaps the top bytes and zeroes the bottom bytes, so that
+  (let (
+        ;; This swaps the top bytes and zeroes the bottom bytes, so that
         ;; we can or it with the bottom bytes later.
         (swap_top XReg (gen_bswap half_ty x))
         (top XReg (rv_slli swap_top half_size))
@@ -1205,7 +1206,8 @@
   (if-let two (u64_to_uimm5 2))
   (if-let four (u64_to_uimm5 4))
 
-  (let (;; x = x - ((x >> 1) & 0x55555555);
+  (let (
+        ;; x = x - ((x >> 1) & 0x55555555);
         (mask_55 XReg (imm (lane_type ty) (u64_and 0x5555555555555555 (ty_mask (lane_type ty)))))
         (count2_shr VReg (rv_vsrl_vi x one (unmasked) ty))
         (count2_and VReg (rv_vand_vx count2_shr mask_55 (unmasked) ty))
@@ -1793,7 +1795,8 @@
 ;; NaN. We handle this by manually checking if one of the inputs is a NaN
 ;; and selecting based on that result.
 (rule 0 (lower (has_type (ty_supported_float ty) (fmin x y)))
-  (let (;; Check if both inputs are not nan.
+  (let (
+        ;; Check if both inputs are not nan.
         (is_ordered FloatCompare (fcmp_to_float_compare (FloatCC.Ordered) ty x y))
         ;; `fadd` returns a nan if any of the inputs is a NaN.
         (nan FReg (rv_fadd ty (FRM.RNE) x y))
@@ -1825,7 +1828,8 @@
 ;; NaN. We handle this by manually checking if one of the inputs is a NaN
 ;; and selecting based on that result.
 (rule 0 (lower (has_type (ty_supported_float ty) (fmax x y)))
-  (let (;; Check if both inputs are not nan.
+  (let (
+        ;; Check if both inputs are not nan.
         (is_ordered FloatCompare (fcmp_to_float_compare (FloatCC.Ordered) ty x y))
         ;; `fadd` returns a NaN if any of the inputs is a NaN.
         (nan FReg (rv_fadd ty (FRM.RNE) x y))
@@ -2356,11 +2360,11 @@
 ;; Unsure whether that needs to be preserved across function calls and/or would
 ;; cause other problems. Also unsure whether it's actually more performant.
 (rule (lower (has_type ity (fcvt_to_uint v @ (value_type fty))))
-  (let ((_ InstOutput (gen_trapz (rv_feq fty v v) (TrapCode.BadConversionToInteger)))
+  (let ((_ InstOutput (gen_trapz (rv_feq fty v v) (TrapCode.BAD_CONVERSION_TO_INTEGER)))
         (min FReg (imm fty (fcvt_umin_bound fty $false)))
-        (_ InstOutput (gen_trapnz (rv_fle fty v min) (TrapCode.IntegerOverflow)))
+        (_ InstOutput (gen_trapnz (rv_fle fty v min) (TrapCode.INTEGER_OVERFLOW)))
         (max FReg (imm fty (fcvt_umax_bound fty ity $false)))
-        (_ InstOutput (gen_trapnz (rv_fge fty v max) (TrapCode.IntegerOverflow))))
+        (_ InstOutput (gen_trapnz (rv_fge fty v max) (TrapCode.INTEGER_OVERFLOW))))
     (lower_inbounds_fcvt_to_uint ity fty v)))
 
 (decl lower_inbounds_fcvt_to_uint (Type Type FReg) XReg)
@@ -2373,11 +2377,11 @@
 
 ;; NB: see above with `fcvt_to_uint` as this is similar
 (rule (lower (has_type ity (fcvt_to_sint v @ (value_type fty))))
-  (let ((_ InstOutput (gen_trapz (rv_feq fty v v) (TrapCode.BadConversionToInteger)))
+  (let ((_ InstOutput (gen_trapz (rv_feq fty v v) (TrapCode.BAD_CONVERSION_TO_INTEGER)))
         (min FReg (imm fty (fcvt_smin_bound fty ity $false)))
-        (_ InstOutput (gen_trapnz (rv_fle fty v min) (TrapCode.IntegerOverflow)))
+        (_ InstOutput (gen_trapnz (rv_fle fty v min) (TrapCode.INTEGER_OVERFLOW)))
         (max FReg (imm fty (fcvt_smax_bound fty ity $false)))
-        (_ InstOutput (gen_trapnz (rv_fge fty v max) (TrapCode.IntegerOverflow))))
+        (_ InstOutput (gen_trapnz (rv_fge fty v max) (TrapCode.INTEGER_OVERFLOW))))
     (lower_inbounds_fcvt_to_sint ity fty v)))
 
 (decl lower_inbounds_fcvt_to_sint (Type Type FReg) XReg)

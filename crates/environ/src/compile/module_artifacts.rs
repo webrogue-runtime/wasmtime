@@ -4,13 +4,13 @@
 use crate::prelude::*;
 use crate::{
     obj, CompiledFunctionInfo, CompiledModuleInfo, DebugInfoData, DefinedFuncIndex, FunctionLoc,
-    FunctionName, MemoryInitialization, Metadata, ModuleTranslation, PrimaryMap, Tunables,
+    FunctionName, MemoryInitialization, Metadata, ModuleInternedTypeIndex, ModuleTranslation,
+    PrimaryMap, Tunables,
 };
 use anyhow::{bail, Result};
 use object::write::{Object, SectionId, StandardSegment, WritableBuffer};
 use object::SectionKind;
 use std::ops::Range;
-use wasmtime_types::ModuleInternedTypeIndex;
 
 /// Helper structure to create an ELF file as a compilation artifact.
 ///
@@ -237,7 +237,6 @@ impl<'a> ObjectBuilder<'a> {
             wasm_to_array_trampolines,
             func_names,
             meta: Metadata {
-                native_debug_info_present: self.tunables.generate_native_debuginfo,
                 has_unparsed_debuginfo,
                 code_section_offset: debuginfo.wasm_file.code_section_offset,
                 has_wasm_debuginfo: self.tunables.parse_wasm_debuginfo,

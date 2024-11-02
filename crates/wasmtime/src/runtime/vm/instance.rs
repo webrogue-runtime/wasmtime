@@ -27,9 +27,9 @@ use sptr::Strict;
 use wasmtime_environ::{
     packed_option::ReservedValue, DataIndex, DefinedGlobalIndex, DefinedMemoryIndex,
     DefinedTableIndex, ElemIndex, EntityIndex, EntityRef, EntitySet, FuncIndex, GlobalIndex,
-    HostPtr, MemoryIndex, MemoryPlan, Module, ModuleInternedTypeIndex, PrimaryMap, PtrSize,
-    TableIndex, TableInitialValue, TableSegmentElements, Trap, VMOffsets, VMSharedTypeIndex,
-    WasmHeapTopType, VMCONTEXT_MAGIC,
+    HostPtr, MemoryIndex, Module, ModuleInternedTypeIndex, PrimaryMap, PtrSize, TableIndex,
+    TableInitialValue, TableSegmentElements, Trap, VMOffsets, VMSharedTypeIndex, WasmHeapTopType,
+    VMCONTEXT_MAGIC,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::Wmemcheck;
@@ -162,7 +162,7 @@ impl Instance {
         req: InstanceAllocationRequest,
         memories: PrimaryMap<DefinedMemoryIndex, (MemoryAllocationIndex, Memory)>,
         tables: PrimaryMap<DefinedTableIndex, (TableAllocationIndex, Table)>,
-        memory_plans: &PrimaryMap<MemoryIndex, MemoryPlan>,
+        memory_tys: &PrimaryMap<MemoryIndex, wasmtime_environ::Memory>,
     ) -> InstanceHandle {
         // The allocation must be *at least* the size required of `Instance`.
         let layout = Self::alloc_layout(req.runtime_info.offsets());
@@ -177,7 +177,7 @@ impl Instance {
         let dropped_data = EntitySet::with_capacity(module.passive_data_map.len());
 
         #[cfg(not(feature = "wmemcheck"))]
-        let _ = memory_plans;
+        let _ = memory_tys;
 
         ptr::write(
             ptr,
@@ -195,10 +195,10 @@ impl Instance {
                 #[cfg(feature = "wmemcheck")]
                 wmemcheck_state: {
                     if req.wmemcheck {
-                        let size = memory_plans
+                        let size = memory_tys
                             .iter()
                             .next()
-                            .map(|plan| plan.1.memory.limits.min)
+                            .map(|memory| memory.1.limits.min)
                             .unwrap_or(0)
                             * 64
                             * 1024;
@@ -469,6 +469,29 @@ impl Instance {
         ptr
     }
 
+    /// Serves a similar purpose as `OpaqueRootScope`, but for situations where
+    /// you need to enter a GC scope (which would normally require mutably
+    /// borrowing the instance's underlying store) but also access to `Instance`
+    /// methods that will internally mutably borrow that store as well.
+    pub(crate) fn with_gc_lifo_scope<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let store_ptr = self.store();
+        let scope = unsafe { (*store_ptr).gc_roots().enter_lifo_scope() };
+        let _exit_scope = ExitScopeOnDrop(store_ptr, scope);
+        return f(self);
+
+        // Use an RAII type to exit the scope when it's dropped, so that we exit
+        // the scope even if `f` panics.
+        struct ExitScopeOnDrop(*mut dyn VMStore, usize);
+
+        impl Drop for ExitScopeOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    (*self.0).exit_gc_lifo_scope(self.1);
+                }
+            }
+        }
+    }
+
     pub(crate) unsafe fn set_store(&mut self, store: Option<*mut dyn VMStore>) {
         if let Some(store) = store {
             *self.vmctx_plus_offset_mut(self.offsets().ptr.vmctx_store()) = store;
@@ -490,8 +513,9 @@ impl Instance {
 
     unsafe fn set_gc_heap(&mut self, gc_store: Option<&mut GcStore>) {
         if let Some(gc_store) = gc_store {
-            *self.gc_heap_base() = gc_store.gc_heap.vmctx_gc_heap_base();
-            *self.gc_heap_bound() = gc_store.gc_heap.vmctx_gc_heap_bound();
+            let heap = gc_store.gc_heap.heap_slice_mut();
+            *self.gc_heap_base() = heap.as_mut_ptr();
+            *self.gc_heap_bound() = heap.len();
             *self.gc_heap_data() = gc_store.gc_heap.vmctx_gc_heap_data();
         } else {
             *self.gc_heap_base() = ptr::null_mut();
@@ -549,7 +573,7 @@ impl Instance {
         ExportTable {
             definition,
             vmctx,
-            table: self.env_module().table_plans[index].clone(),
+            table: self.env_module().tables[index],
         }
     }
 
@@ -564,7 +588,7 @@ impl Instance {
         ExportMemory {
             definition,
             vmctx,
-            memory: self.env_module().memory_plans[index].clone(),
+            memory: self.env_module().memories[index],
             index: def_index,
         }
     }
@@ -611,7 +635,7 @@ impl Instance {
 
     /// Get the given memory's page size, in bytes.
     pub(crate) fn memory_page_size(&self, index: MemoryIndex) -> usize {
-        usize::try_from(self.env_module().memory_plans[index].memory.page_size()).unwrap()
+        usize::try_from(self.env_module().memories[index].page_size()).unwrap()
     }
 
     /// Grow memory by the specified amount of pages.
@@ -804,6 +828,41 @@ impl Instance {
         }
     }
 
+    /// Get the passive elements segment at the given index.
+    ///
+    /// Returns an empty segment if the index is out of bounds or if the segment
+    /// has been dropped.
+    ///
+    /// The `storage` parameter should always be `None`; it is a bit of a hack
+    /// to work around lifetime issues.
+    pub(crate) fn passive_element_segment<'a>(
+        &self,
+        storage: &'a mut Option<(Arc<wasmtime_environ::Module>, TableSegmentElements)>,
+        elem_index: ElemIndex,
+    ) -> &'a TableSegmentElements {
+        debug_assert!(storage.is_none());
+        *storage = Some((
+            // TODO: this `clone()` shouldn't be necessary but is used for now to
+            // inform `rustc` that the lifetime of the elements here are
+            // disconnected from the lifetime of `self`.
+            self.env_module().clone(),
+            // NB: fall back to an expressions-based list of elements which
+            // doesn't have static type information (as opposed to
+            // `TableSegmentElements::Functions`) since we don't know what type
+            // is needed in the caller's context. Let the type be inferred by
+            // how they use the segment.
+            TableSegmentElements::Expressions(Box::new([])),
+        ));
+        let (module, empty) = storage.as_ref().unwrap();
+
+        match module.passive_elements_map.get(&elem_index) {
+            Some(index) if !self.dropped_elements.contains(elem_index) => {
+                &module.passive_elements[*index]
+            }
+            _ => empty,
+        }
+    }
+
     /// The `table.init` operation: initializes a portion of a table with a
     /// passive element.
     ///
@@ -819,23 +878,8 @@ impl Instance {
         src: u64,
         len: u64,
     ) -> Result<(), Trap> {
-        // TODO: this `clone()` shouldn't be necessary but is used for now to
-        // inform `rustc` that the lifetime of the elements here are
-        // disconnected from the lifetime of `self`.
-        let module = self.env_module().clone();
-
-        // NB: fall back to an expressions-based list of elements which doesn't
-        // have static type information (as opposed to `Functions`) since we
-        // don't know just yet what type the table has. The type will be be
-        // inferred in the next step within `table_init_segment`.
-        let empty = TableSegmentElements::Expressions(Box::new([]));
-
-        let elements = match module.passive_elements_map.get(&elem_index) {
-            Some(index) if !self.dropped_elements.contains(elem_index) => {
-                &module.passive_elements[*index]
-            }
-            _ => &empty,
-        };
+        let mut storage = None;
+        let elements = self.passive_element_segment(&mut storage, elem_index);
         let mut const_evaluator = ConstExprEvaluator::default();
         self.table_init_segment(&mut const_evaluator, table_index, elements, dst, src, len)
     }
@@ -874,13 +918,8 @@ impl Instance {
                     .get(src..)
                     .and_then(|s| s.get(..len))
                     .ok_or(Trap::TableOutOfBounds)?;
-                let mut context = ConstEvalContext::new(self, &module);
-                match module.table_plans[table_index]
-                    .table
-                    .ref_type
-                    .heap_type
-                    .top()
-                {
+                let mut context = ConstEvalContext::new(self);
+                match module.tables[table_index].ref_type.heap_type.top() {
                     WasmHeapTopType::Extern => table.init_gc_refs(
                         dst,
                         exprs.iter().map(|expr| unsafe {
@@ -1008,6 +1047,22 @@ impl Instance {
         Ok(())
     }
 
+    /// Get the internal storage range of a particular Wasm data segment.
+    pub(crate) fn wasm_data_range(&self, index: DataIndex) -> Range<u32> {
+        match self.env_module().passive_data_map.get(&index) {
+            Some(range) if !self.dropped_data.contains(index) => range.clone(),
+            _ => 0..0,
+        }
+    }
+
+    /// Given an internal storage range of a Wasm data segment (or subset of a
+    /// Wasm data segment), get the data's raw bytes.
+    pub(crate) fn wasm_data(&self, range: Range<u32>) -> &[u8] {
+        let start = usize::try_from(range.start).unwrap();
+        let end = usize::try_from(range.end).unwrap();
+        &self.runtime_info.wasm_data()[start..end]
+    }
+
     /// Performs the `memory.init` operation.
     ///
     /// # Errors
@@ -1023,15 +1078,8 @@ impl Instance {
         src: u32,
         len: u32,
     ) -> Result<(), Trap> {
-        let range = match self.env_module().passive_data_map.get(&data_index).cloned() {
-            Some(range) if !self.dropped_data.contains(data_index) => range,
-            _ => 0..0,
-        };
+        let range = self.wasm_data_range(data_index);
         self.memory_init_segment(memory_index, range, dst, src, len)
-    }
-
-    pub(crate) fn wasm_data(&self, range: Range<u32>) -> &[u8] {
-        &self.runtime_info.wasm_data()[range.start as usize..range.end as usize]
     }
 
     pub(crate) fn memory_init_segment(
@@ -1103,8 +1151,7 @@ impl Instance {
 
         if elt_ty == TableElementType::Func {
             for i in range {
-                let gc_store = unsafe { (*self.store()).unwrap_gc_store_mut() };
-                let value = match self.tables[idx].1.get(gc_store, i) {
+                let value = match self.tables[idx].1.get(None, i) {
                     Some(value) => value,
                     None => {
                         // Out-of-bounds; caller will handle by likely
@@ -1236,7 +1283,7 @@ impl Instance {
 
         // Initialize the defined tables
         let mut ptr = self.vmctx_plus_offset_mut(offsets.vmctx_tables_begin());
-        for i in 0..module.table_plans.len() - module.num_imported_tables {
+        for i in 0..module.num_defined_tables() {
             ptr::write(ptr, self.tables[DefinedTableIndex::new(i)].1.vmtable());
             ptr = ptr.add(1);
         }
@@ -1248,10 +1295,10 @@ impl Instance {
         // definitions of memories owned (not shared) in the module.
         let mut ptr = self.vmctx_plus_offset_mut(offsets.vmctx_memories_begin());
         let mut owned_ptr = self.vmctx_plus_offset_mut(offsets.vmctx_owned_memories_begin());
-        for i in 0..module.memory_plans.len() - module.num_imported_memories {
+        for i in 0..module.num_defined_memories() {
             let defined_memory_index = DefinedMemoryIndex::new(i);
             let memory_index = module.memory_index(defined_memory_index);
-            if module.memory_plans[memory_index].memory.shared {
+            if module.memories[memory_index].shared {
                 let def_ptr = self.memories[defined_memory_index]
                     .1
                     .as_shared_memory()
@@ -1266,34 +1313,12 @@ impl Instance {
             ptr = ptr.add(1);
         }
 
-        // Initialize the defined globals
-        let mut const_evaluator = ConstExprEvaluator::default();
-        self.initialize_vmctx_globals(&mut const_evaluator, module);
-    }
-
-    unsafe fn initialize_vmctx_globals(
-        &mut self,
-        const_evaluator: &mut ConstExprEvaluator,
-        module: &Module,
-    ) {
-        for (index, init) in module.global_initializers.iter() {
-            let mut context = ConstEvalContext::new(self, module);
-            let raw = const_evaluator
-                .eval(&mut context, init)
-                .expect("should be a valid const expr");
-
-            let to = self.global_ptr(index);
-            let wasm_ty = module.globals[module.global_index(index)].wasm_ty;
-
-            #[cfg(feature = "wmemcheck")]
-            if index.index() == 0 && wasm_ty == wasmtime_environ::WasmValType::I32 {
-                if let Some(wmemcheck) = &mut self.wmemcheck_state {
-                    let size = usize::try_from(raw.get_i32()).unwrap();
-                    wmemcheck.set_stack_size(size);
-                }
-            }
-
-            ptr::write(to, VMGlobalDefinition::from_val_raw(wasm_ty, raw));
+        // Zero-initialize the globals so that nothing is uninitialized memory
+        // after this function returns. The globals are actually initialized
+        // with their const expression initializers after the instance is fully
+        // allocated.
+        for (index, _init) in module.global_initializers.iter() {
+            ptr::write(self.global_ptr(index), VMGlobalDefinition::new());
         }
     }
 
@@ -1409,7 +1434,7 @@ impl InstanceHandle {
     pub fn all_tables<'a>(
         &'a mut self,
     ) -> impl ExactSizeIterator<Item = (TableIndex, ExportTable)> + 'a {
-        let indices = (0..self.module().table_plans.len())
+        let indices = (0..self.module().tables.len())
             .map(|i| TableIndex::new(i))
             .collect::<Vec<_>>();
         indices.into_iter().map(|i| (i, self.get_exported_table(i)))
@@ -1433,7 +1458,7 @@ impl InstanceHandle {
     pub fn all_memories<'a>(
         &'a mut self,
     ) -> impl ExactSizeIterator<Item = (MemoryIndex, ExportMemory)> + 'a {
-        let indices = (0..self.module().memory_plans.len())
+        let indices = (0..self.module().memories.len())
             .map(|i| MemoryIndex::new(i))
             .collect::<Vec<_>>();
         indices

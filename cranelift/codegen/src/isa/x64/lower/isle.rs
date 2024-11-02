@@ -22,8 +22,8 @@ use crate::{
         inst::{args::*, regs, ReturnCallInfo},
     },
     machinst::{
-        isle::*, ArgPair, CallInfo, InsnInput, InstOutput, IsTailCall, MachAtomicRmwOp, MachInst,
-        VCodeConstant, VCodeConstantData,
+        isle::*, ArgPair, CallInfo, InsnInput, InstOutput, IsTailCall, MachInst, VCodeConstant,
+        VCodeConstantData,
     },
 };
 use alloc::vec::Vec;
@@ -39,6 +39,7 @@ type BoxCallIndInfo = Box<CallInfo<RegMem>>;
 type BoxReturnCallInfo = Box<ReturnCallInfo<ExternalName>>;
 type BoxReturnCallIndInfo = Box<ReturnCallInfo<Reg>>;
 type VecArgPair = Vec<ArgPair>;
+type BoxSyntheticAmode = Box<SyntheticAmode>;
 
 pub struct SinkableLoad {
     inst: Inst,
@@ -238,6 +239,11 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     #[inline]
     fn use_sse42(&mut self) -> bool {
         self.backend.x64_flags.use_sse42()
+    }
+
+    #[inline]
+    fn use_cmpxchg16b(&mut self) -> bool {
+        self.backend.x64_flags.use_cmpxchg16b()
     }
 
     #[inline]
@@ -610,11 +616,6 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     }
 
     #[inline]
-    fn atomic_rmw_op_to_mach_atomic_rmw_op(&mut self, op: &AtomicRmwOp) -> MachAtomicRmwOp {
-        MachAtomicRmwOp::from(*op)
-    }
-
-    #[inline]
     fn preg_rbp(&mut self) -> PReg {
         regs::rbp().to_real_reg().unwrap().into()
     }
@@ -938,6 +939,10 @@ impl Context for IsleContext<'_, '_, MInst, X64Backend> {
     fn writable_invalid_gpr(&mut self) -> WritableGpr {
         let reg = Gpr::new(self.invalid_reg()).unwrap();
         WritableGpr::from_reg(reg)
+    }
+
+    fn box_synthetic_amode(&mut self, amode: &SyntheticAmode) -> BoxSyntheticAmode {
+        Box::new(amode.clone())
     }
 }
 

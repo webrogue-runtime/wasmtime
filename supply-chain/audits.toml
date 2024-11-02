@@ -1055,6 +1055,15 @@ Nothing outside the realm of what one would expect from a bitflags generator,
 all as expected.
 """
 
+[[audits.bitflags]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+delta = "2.4.1 -> 2.6.0"
+notes = """
+Changes in how macros are invoked and various bits and pieces of macro-fu.
+Otherwise no major changes and nothing dealing with `unsafe`.
+"""
+
 [[audits.block-buffer]]
 who = "Benjamin Bouvier <public@benj.me>"
 criteria = "safe-to-deploy"
@@ -1111,11 +1120,21 @@ who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "3.2.0 -> 3.3.0"
 
+[[audits.cap-fs-ext]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "3.3.0 -> 3.4.0"
+
 [[audits.cap-net-ext]]
 who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "3.2.0 -> 3.3.0"
 
+[[audits.cap-net-ext]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "3.3.0 -> 3.4.0"
+
 [[audits.cap-primitives]]
 who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
@@ -1144,6 +1163,11 @@ notes = "The Bytecode Alliance is the author of this crate."
 who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "3.2.0 -> 3.3.0"
+
+[[audits.cap-primitives]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "3.3.0 -> 3.4.0"
 
 [[audits.cap-rand]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -1168,6 +1192,11 @@ who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "3.2.0 -> 3.3.0"
 
+[[audits.cap-rand]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "3.3.0 -> 3.4.0"
+
 [[audits.cap-std]]
 who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
@@ -1196,6 +1225,11 @@ notes = "The Bytecode Alliance is the author of this crate."
 who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "3.2.0 -> 3.3.0"
+
+[[audits.cap-std]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "3.3.0 -> 3.4.0"
 
 [[audits.cap-tempfile]]
 who = "Dan Gohman <dev@sunfishcode.online>"
@@ -1243,6 +1277,11 @@ notes = "The Bytecode Alliance is the author of this crate."
 who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "3.2.0 -> 3.3.0"
+
+[[audits.cap-time-ext]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "3.3.0 -> 3.4.0"
 
 [[audits.cargo-platform]]
 who = "Pat Hickey <phickey@fastly.com>"
@@ -1310,6 +1349,12 @@ version = "0.2.0"
 who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
 version = "0.2.0"
+
+[[audits.cipher]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+version = "0.4.4"
+notes = "Most unsafe is hidden by `inout` dependency; only remaining unsafe is raw-splitting a slice and an unreachable hint. Older versions of this regularly reach ~150k daily downloads."
 
 [[audits.cobs]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -1461,6 +1506,12 @@ who = "Benjamin Bouvier <public@benj.me>"
 criteria = "safe-to-deploy"
 delta = "0.9.0 -> 0.10.3"
 
+[[audits.easy-smt]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+version = "0.2.2"
+notes = "This crate is authored by trusted Bytecode Alliance members."
+
 [[audits.ed25519]]
 who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
@@ -1469,6 +1520,12 @@ notes = """
 This diff brings in a number of minor updates of which none are related to
 `unsafe` code or anything system-related like filesystems.
 """
+
+[[audits.either]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+delta = "1.8.1 -> 1.13.0"
+notes = "More utilities and such for the `Either` type, no `unsafe` code."
 
 [[audits.embedded-io]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -1829,6 +1886,12 @@ is otherwise certified. This doesn't contain unnecessary `unsafe` and
 additionally doesn't reach for ambient capabilities.
 """
 
+[[audits.inout]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+version = "0.1.3"
+notes = "A part of RustCrypto/utils, this crate is designed to handle unsafe buffers and carefully documents the safety concerns throughout. Older versions of this tally up to ~130k daily downloads."
+
 [[audits.io-extras]]
 who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
@@ -1846,6 +1909,11 @@ who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "0.17.2 -> 0.17.4"
 notes = "Just a dependency version bump"
+
+[[audits.io-extras]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "0.18.2 -> 0.18.3"
 
 [[audits.io-lifetimes]]
 who = "Dan Gohman <dev@sunfishcode.online>"
@@ -1989,6 +2057,11 @@ who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
 delta = "0.2.153 -> 0.2.158"
 notes = "More platforms, more definitions, more headers, it's still just `libc`"
+
+[[audits.libc]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "0.2.158 -> 0.2.161"
 
 [[audits.libfuzzer-sys]]
 who = "Nick Fitzgerald <fitzgen@gmail.com>"
@@ -2143,6 +2216,12 @@ criteria = "safe-to-deploy"
 delta = "0.7.1 -> 0.8.0"
 notes = "Minor updates, using new Rust features like `const`, no major changes."
 
+[[audits.miniz_oxide]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.0 -> 0.7.4"
+notes = "Very few changes here, only minor updates here and there."
+
 [[audits.mio]]
 who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
@@ -2247,6 +2326,12 @@ who = "Andrew Brown <andrew.brown@intel.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.0 -> 0.7.2"
 
+[[audits.openvino]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+delta = "0.7.2 -> 0.8.0"
+notes = "No new unsafe functionality, just brings in openvino-sys changes and other minor improvements."
+
 [[audits.openvino-finder]]
 who = "Matthew Tamayo-Rios <matthew@geekbeast.com>"
 criteria = "safe-to-deploy"
@@ -2270,6 +2355,12 @@ who = "Andrew Brown <andrew.brown@intel.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.0 -> 0.7.2"
 
+[[audits.openvino-finder]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+delta = "0.7.2 -> 0.8.0"
+notes = "No logic changes in version bump."
+
 [[audits.openvino-sys]]
 who = "Matthew Tamayo-Rios <matthew@geekbeast.com>"
 criteria = "safe-to-deploy"
@@ -2292,6 +2383,12 @@ delta = "0.5.0 -> 0.6.0"
 who = "Andrew Brown <andrew.brown@intel.com>"
 criteria = "safe-to-deploy"
 delta = "0.6.0 -> 0.7.2"
+
+[[audits.openvino-sys]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+delta = "0.7.2 -> 0.8.0"
+notes = "This diff simply re-generates slightly newer C headers with a slightly newer version of bindgen."
 
 [[audits.ort]]
 who = "Andrew Brown <andrew.brown@intel.com>"
@@ -2475,6 +2572,18 @@ criteria = "safe-to-deploy"
 delta = "0.6.1 -> 0.7.0"
 notes = "The Bytecode Alliance is the author of this crate."
 
+[[audits.region]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+delta = "2.2.0 -> 3.0.2"
+notes = """
+This release brings a number of refactorings and new platforms to be supported
+in the crate. Lots of `unsafe` code because that's what the crate is
+fundamentally doing, managing virtual memory. That being said it's all largely
+the same as before where it's all as expected and the `unsafe` has to do with
+managing OS APIs.
+"""
+
 [[audits.rustc-demangle]]
 who = "Alex Crichton <alex@alexcrichton.com>"
 criteria = "safe-to-deploy"
@@ -2521,6 +2630,11 @@ who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "0.38.34 -> 0.38.37"
 
+[[audits.rustix]]
+who = "Dan Gohman <dev@sunfishcode.online>"
+criteria = "safe-to-deploy"
+delta = "0.38.37 -> 0.38.38"
+
 [[audits.rustls]]
 who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
@@ -2548,6 +2662,12 @@ who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
 delta = "0.100.1 -> 0.101.4"
 
+[[audits.safetensors]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+version = "0.3.3"
+notes = "No unsafe, just a serialization library for tensors."
+
 [[audits.sct]]
 who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
@@ -2559,6 +2679,12 @@ who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
 version = "1.0.17"
 notes = "plenty of unsafe pointer and vec tricks, but in well-structured and commented code that appears to be correct"
+
+[[audits.sha1]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+delta = "0.10.5 -> 0.10.6"
+notes = "Only new code is some loongarch64 additions which include assembly code for that platform."
 
 [[audits.sha1_smol]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -2610,6 +2736,12 @@ and in particular the new `NonNull::new_unchecked`s look ok.
 Most of the rest of the changes are adding some new unstable features which
 aren't enabled by default.
 """
+
+[[audits.smallvec]]
+who = "Alex Crichton <alex@alexcrichton.com>"
+criteria = "safe-to-deploy"
+delta = "1.11.0 -> 1.13.2"
+notes = "Mostly minor updates, the one semi-substantial update looks good."
 
 [[audits.socket2]]
 who = "Alex Crichton <alex@alexcrichton.com>"
@@ -2684,6 +2816,12 @@ who = "Dan Gohman <dev@sunfishcode.online>"
 criteria = "safe-to-deploy"
 delta = "0.25.6 -> 0.25.7"
 notes = "This is a minor bug-fix update."
+
+[[audits.tch]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+version = "0.17.0"
+notes = "Since this uses the generated functions from torch-sys, it has many (~3k) instances of unsafe; this is expected."
 
 [[audits.tempfile]]
 who = "Pat Hickey <phickey@fastly.com>"
@@ -2784,6 +2922,12 @@ who = "Pat Hickey <phickey@fastly.com>"
 criteria = "safe-to-deploy"
 version = "0.7.4"
 notes = "Alex Crichton audited the safety of src/sync/reusable_box.rs, I audited the remainder of the crate."
+
+[[audits.torch-sys]]
+who = "Andrew Brown <andrew.brown@intel.com>"
+criteria = "safe-to-deploy"
+version = "0.17.0"
+notes = "Intrinsically unsafe since it wraps the FFI to the libtorch library; it also has a complex `build.rs` to download and link the binaries for the system. This crate seems to be the accepted solution for interfacing with PyTorch from Rust (1m+ crate downloads all time)."
 
 [[audits.tracing]]
 who = "Alex Crichton <alex@alexcrichton.com>"

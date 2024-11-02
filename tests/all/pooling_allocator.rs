@@ -6,8 +6,7 @@ fn successful_instantiation() -> Result<()> {
     let pool = crate::small_pool_config();
     let mut config = Config::new();
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(0);
+    config.memory_guard_size(0);
     config.static_memory_maximum_size(1 << 16);
 
     let engine = Engine::new(&config)?;
@@ -27,8 +26,7 @@ fn memory_limit() -> Result<()> {
     pool.max_memory_size(3 << 16);
     let mut config = Config::new();
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(1 << 16);
+    config.memory_guard_size(1 << 16);
     config.static_memory_maximum_size(3 << 16);
     config.wasm_multi_memory(true);
 
@@ -201,8 +199,7 @@ fn memory_zeroed() -> Result<()> {
     pool.max_memory_size(1 << 16).table_elements(0);
     let mut config = Config::new();
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(0);
+    config.memory_guard_size(0);
     config.static_memory_maximum_size(1 << 16);
 
     let engine = Engine::new(&config)?;
@@ -239,8 +236,7 @@ fn table_limit() -> Result<()> {
     pool.table_elements(TABLE_ELEMENTS);
     let mut config = Config::new();
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(0);
+    config.memory_guard_size(0);
     config.static_memory_maximum_size(1 << 16);
 
     let engine = Engine::new(&config)?;
@@ -375,8 +371,7 @@ fn table_zeroed() -> Result<()> {
     let pool = crate::small_pool_config();
     let mut config = Config::new();
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(0);
+    config.memory_guard_size(0);
     config.static_memory_maximum_size(1 << 16);
 
     let engine = Engine::new(&config)?;
@@ -411,8 +406,7 @@ fn total_core_instances_limit() -> Result<()> {
     pool.total_core_instances(INSTANCE_LIMIT);
     let mut config = Config::new();
     config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
-    config.dynamic_memory_guard_size(0);
-    config.static_memory_guard_size(0);
+    config.memory_guard_size(0);
     config.static_memory_maximum_size(1 << 16);
 
     let engine = Engine::new(&config)?;
@@ -702,7 +696,7 @@ fn dynamic_memory_pooling_allocator() -> Result<()> {
         pool.max_memory_size(max_size as usize);
         let mut config = Config::new();
         config.static_memory_maximum_size(max_size);
-        config.dynamic_memory_guard_size(guard_size);
+        config.memory_guard_size(guard_size);
         config.allocation_strategy(InstanceAllocationStrategy::Pooling(pool));
 
         let engine = Engine::new(&config)?;
@@ -1213,5 +1207,93 @@ fn decommit_batching() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[test]
+fn tricky_empty_table_with_empty_virtual_memory_alloc() -> Result<()> {
+    // Configure the pooling allocator to have no access to virtual memory, e.g.
+    // no table elements but a single table. This should technically support a
+    // single empty table being allocated into it but virtual memory isn't
+    // actually allocated here.
+    let mut cfg = PoolingAllocationConfig::default();
+    cfg.table_elements(0);
+    cfg.total_memories(0);
+    cfg.total_tables(1);
+    cfg.total_stacks(0);
+    cfg.total_core_instances(1);
+    cfg.max_memory_size(0);
+
+    let mut c = Config::new();
+    c.allocation_strategy(InstanceAllocationStrategy::Pooling(cfg));
+
+    // Disable lazy init to actually try to get this to do something interesting
+    // at runtime.
+    c.table_lazy_init(false);
+
+    let engine = Engine::new(&c)?;
+
+    // This module has a single empty table, with a single empty element
+    // segment. Nothing actually goes wrong here, it should instantiate
+    // successfully. Along the way though the empty mmap above will get viewed
+    // as an array-of-pointers, so everything internally should all line up to
+    // work ok.
+    let module = Module::new(
+        &engine,
+        r#"
+(module
+    (table 0 funcref)
+    (elem (i32.const 0) func)
+)
+"#,
+    )?;
+    let mut store = Store::new(&engine, ());
+    Instance::new(&mut store, &module, &[])?;
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn custom_page_sizes_reusing_same_slot() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_custom_page_sizes(true);
+    let mut cfg = PoolingAllocationConfig::default();
+    // force the memories below to collide in the same memory slot
+    cfg.total_memories(1);
+    config.allocation_strategy(InstanceAllocationStrategy::Pooling(cfg));
+    let engine = Engine::new(&config)?;
+
+    // Instantiate one module, leaving the slot 5 bytes big (but one page
+    // accessible)
+    {
+        let m1 = Module::new(
+            &engine,
+            r#"
+                (module
+                    (memory 5 (pagesize 1))
+
+                    (data (i32.const 0) "a")
+                )
+            "#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        Instance::new(&mut store, &m1, &[])?;
+    }
+
+    // Instantiate a second module, which should work
+    {
+        let m2 = Module::new(
+            &engine,
+            r#"
+                (module
+                    (memory 6 (pagesize 1))
+
+                    (data (i32.const 0) "a")
+                )
+            "#,
+        )?;
+        let mut store = Store::new(&engine, ());
+        Instance::new(&mut store, &m2, &[])?;
+    }
     Ok(())
 }

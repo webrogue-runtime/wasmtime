@@ -11,6 +11,18 @@ pub use regalloc2::RegClass;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Reg(PReg);
 
+pub(crate) type WritableReg = cranelift_codegen::Writable<Reg>;
+
+/// Mark a given register as writable. This macro constructs
+/// a [`cranelift_codegen::Writable`].
+macro_rules! writable {
+    ($e:expr) => {
+        cranelift_codegen::Writable::from_reg($e)
+    };
+}
+
+pub(crate) use writable;
+
 impl Reg {
     /// Create a register from its encoding and class.
     pub fn from(class: RegClass, enc: usize) -> Self {
@@ -28,7 +40,6 @@ impl Reg {
     }
 
     /// Create a new floating point register from encoding.
-    #[allow(dead_code)]
     pub fn float(enc: usize) -> Self {
         Self::new(PReg::new(enc, RegClass::Float))
     }

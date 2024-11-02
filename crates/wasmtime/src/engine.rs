@@ -54,7 +54,7 @@ struct EngineInner {
     #[cfg(feature = "runtime")]
     allocator: Box<dyn crate::runtime::vm::InstanceAllocator + Send + Sync>,
     #[cfg(feature = "runtime")]
-    gc_runtime: Arc<dyn GcRuntime>,
+    gc_runtime: Option<Arc<dyn GcRuntime>>,
     #[cfg(feature = "runtime")]
     profiler: Box<dyn crate::profiling_agent::ProfilingAgent>,
     #[cfg(feature = "runtime")]
@@ -175,6 +175,7 @@ impl Engine {
         }
     }
 
+    #[inline]
     pub(crate) fn tunables(&self) -> &Tunables {
         &self.inner.tunables
     }
@@ -306,8 +307,9 @@ impl Engine {
             // runtime.
             "libcall_call_conv" => *value == FlagValue::Enum("isa_default".into()),
             "preserve_frame_pointers" => *value == FlagValue::Bool(true),
-            "enable_probestack" => *value == FlagValue::Bool(crate::config::probestack_supported(target.architecture)),
+            "enable_probestack" => *value == FlagValue::Bool(true),
             "probestack_strategy" => *value == FlagValue::Enum("inline".into()),
+            "enable_multi_ret_implicit_sret" => *value == FlagValue::Bool(true),
 
             // Features wasmtime doesn't use should all be disabled, since
             // otherwise if they are enabled it could change the behavior of
@@ -426,6 +428,7 @@ impl Engine {
             "has_mie2" => "mie2",
 
             // x64 features to detect
+            "has_cmpxchg16b" => "cmpxchg16b",
             "has_sse3" => "sse3",
             "has_ssse3" => "ssse3",
             "has_sse41" => "sse4.1",
@@ -585,8 +588,12 @@ impl Engine {
         self.inner.allocator.as_ref()
     }
 
-    pub(crate) fn gc_runtime(&self) -> &Arc<dyn GcRuntime> {
-        &self.inner.gc_runtime
+    pub(crate) fn gc_runtime(&self) -> Result<&Arc<dyn GcRuntime>> {
+        if let Some(rt) = &self.inner.gc_runtime {
+            Ok(rt)
+        } else {
+            bail!("no GC runtime: GC disabled at compile time or configuration time")
+        }
     }
 
     pub(crate) fn profiler(&self) -> &dyn crate::profiling_agent::ProfilingAgent {

@@ -1,23 +1,22 @@
 use crate::component::*;
 use crate::prelude::*;
-use crate::Module;
 use crate::ScopeVec;
 use crate::{
-    EntityIndex, ModuleEnvironment, ModuleTranslation, ModuleTypesBuilder, PrimaryMap, Tunables,
-    TypeConvert, WasmHeapType, WasmValType,
+    EngineOrModuleTypeIndex, EntityIndex, ModuleEnvironment, ModuleInternedTypeIndex,
+    ModuleTranslation, ModuleTypesBuilder, PrimaryMap, Tunables, TypeConvert, WasmHeapType,
+    WasmResult, WasmValType,
 };
 use anyhow::anyhow;
 use anyhow::{bail, Result};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::mem;
-use wasmparser::types::{
+use wasmparser::component_types::{
     AliasableResourceId, ComponentCoreModuleTypeId, ComponentEntityType, ComponentFuncTypeId,
-    ComponentInstanceTypeId, Types,
+    ComponentInstanceTypeId,
 };
+use wasmparser::types::Types;
 use wasmparser::{Chunk, ComponentImportName, Encoding, Parser, Payload, Validator};
-use wasmtime_types::ModuleInternedTypeIndex;
-use wasmtime_types::WasmResult;
 
 mod adapt;
 pub use self::adapt::*;
@@ -523,6 +522,11 @@ impl<'a, 'data> Translator<'a, 'data> {
                             core_func_index += 1;
                             LocalInitializer::ResourceRep(resource, ty)
                         }
+
+                        wasmparser::CanonicalFunction::ThreadSpawn { .. }
+                        | wasmparser::CanonicalFunction::ThreadHwConcurrency => {
+                            bail!("unsupported intrinsic")
+                        }
                     };
                     self.result.initializers.push(init);
                 }
@@ -926,10 +930,7 @@ impl<'a, 'data> Translator<'a, 'data> {
     fn core_func_signature(&mut self, index: u32) -> WasmResult<ModuleInternedTypeIndex> {
         let types = self.validator.types(0).unwrap();
         let id = types.core_function_at(index);
-        let module = Module::default();
-        self.types
-            .module_types_builder()
-            .intern_type(&module, types, id)
+        self.types.module_types_builder().intern_type(types, id)
     }
 }
 
@@ -982,10 +983,7 @@ mod pre_inlining {
             self.types.lookup_heap_type(index)
         }
 
-        fn lookup_type_index(
-            &self,
-            index: wasmparser::UnpackedIndex,
-        ) -> wasmtime_types::EngineOrModuleTypeIndex {
+        fn lookup_type_index(&self, index: wasmparser::UnpackedIndex) -> EngineOrModuleTypeIndex {
             self.types.lookup_type_index(index)
         }
     }

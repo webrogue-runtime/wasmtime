@@ -46,9 +46,9 @@
 //! final `Component`.
 
 use crate::component::translate::*;
+use crate::{EntityType, IndexType};
 use std::borrow::Cow;
-use wasmparser::types::{ComponentAnyTypeId, ComponentCoreModuleTypeId};
-use wasmtime_types::IndexType;
+use wasmparser::component_types::{ComponentAnyTypeId, ComponentCoreModuleTypeId};
 
 pub(super) fn run(
     types: &mut ComponentTypesBuilder,
@@ -966,8 +966,8 @@ impl<'a> Inliner<'a> {
             Some(memory) => match &self.runtime_instances[memory.instance] {
                 InstanceModule::Static(idx) => match &memory.item {
                     ExportItem::Index(i) => {
-                        let plan = &self.nested_modules[*idx].module.memory_plans[*i];
-                        match plan.memory.idx_type {
+                        let ty = &self.nested_modules[*idx].module.memories[*i];
+                        match ty.idx_type {
                             IndexType::I32 => false,
                             IndexType::I64 => true,
                         }
@@ -976,7 +976,7 @@ impl<'a> Inliner<'a> {
                 },
                 InstanceModule::Import(ty) => match &memory.item {
                     ExportItem::Name(name) => match types[*ty].exports[name] {
-                        wasmtime_types::EntityType::Memory(m) => match m.idx_type {
+                        EntityType::Memory(m) => match m.idx_type {
                             IndexType::I32 => false,
                             IndexType::I64 => true,
                         },

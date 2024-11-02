@@ -568,7 +568,7 @@ impl ArrayRef {
         Ok(gc_ref.as_arrayref_unchecked())
     }
 
-    fn layout(&self, store: &AutoAssertNoGc<'_>) -> Result<GcArrayLayout> {
+    pub(crate) fn layout(&self, store: &AutoAssertNoGc<'_>) -> Result<GcArrayLayout> {
         assert!(self.comes_from_same_store(&store));
         let type_index = self.type_index(store)?;
         let layout = store
@@ -694,7 +694,7 @@ impl ArrayRef {
         store: &mut AutoAssertNoGc<'_>,
         gc_ref: VMGcRef,
     ) -> Rooted<Self> {
-        debug_assert!(!gc_ref.is_i31());
+        debug_assert!(gc_ref.is_arrayref(&*store.unwrap_gc_store().gc_heap));
         Rooted::new(store, gc_ref)
     }
 }

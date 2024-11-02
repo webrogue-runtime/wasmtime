@@ -147,6 +147,7 @@ use crate::CodegenResult;
 use alloc::vec::Vec;
 use regalloc2::{MachineEnv, PRegSet};
 use smallvec::{smallvec, SmallVec};
+use std::borrow::ToOwned;
 use std::sync::OnceLock;
 
 // We use a generic implementation that factors out ABI commonalities.
@@ -290,7 +291,7 @@ impl ABIMachineSpec for S390xMachineDeps {
 
     fn compute_arg_locs(
         call_conv: isa::CallConv,
-        _flags: &settings::Flags,
+        flags: &settings::Flags,
         params: &[ir::AbiParam],
         args_or_rets: ArgsOrRets,
         add_ret_area_ptr: bool,
@@ -384,6 +385,14 @@ impl ABIMachineSpec for S390xMachineDeps {
                     extension: param.extension,
                 }
             } else {
+                if args_or_rets == ArgsOrRets::Rets && !flags.enable_multi_ret_implicit_sret() {
+                    return Err(crate::CodegenError::Unsupported(
+                        "Too many return values to fit in registers. \
+                        Use a StructReturn argument instead. (#9510)"
+                            .to_owned(),
+                    ));
+                }
+
                 // Compute size. Every argument or return value takes a slot of
                 // at least 8 bytes.
                 let size = (ty_bits(param.value_type) / 8) as u32;
@@ -567,7 +576,7 @@ impl ABIMachineSpec for S390xMachineDeps {
             rn: stack_reg(),
             rm: limit_reg,
             cond: Cond::from_intcc(IntCC::UnsignedLessThanOrEqual),
-            trap_code: ir::TrapCode::StackOverflow,
+            trap_code: ir::TrapCode::STACK_OVERFLOW,
         });
         insts
     }
@@ -648,12 +657,56 @@ impl ABIMachineSpec for S390xMachineDeps {
     }
 
     fn gen_inline_probestack(
-        _insts: &mut SmallInstVec<Self::I>,
+        insts: &mut SmallInstVec<Self::I>,
         _call_conv: isa::CallConv,
-        _frame_size: u32,
-        _guard_size: u32,
+        frame_size: u32,
+        guard_size: u32,
     ) {
-        unimplemented!("Inline stack probing is unimplemented on S390x");
+        // Number of probes that we need to perform
+        let probe_count = align_to(frame_size, guard_size) / guard_size;
+
+        // The stack probe loop currently takes 4 instructions and each unrolled
+        // probe takes 2.  Set this to 2 to keep the max size to 4 instructions.
+        const PROBE_MAX_UNROLL: u32 = 2;
+
+        if probe_count <= PROBE_MAX_UNROLL {
+            // Unrolled probe loop.
+            for _ in 0..probe_count {
+                insts.extend(Self::gen_sp_reg_adjust(-(guard_size as i32)));
+
+                insts.push(Inst::StoreImm8 {
+                    imm: 0,
+                    mem: MemArg::reg(stack_reg(), MemFlags::trusted()),
+                });
+            }
+        } else {
+            // Explicit probe loop.
+
+            // Load the number of probes into a register used as loop counter.
+            // `gen_inline_probestack` is called after regalloc2, so we can
+            // use the nonallocatable spilltmp register for this purpose.
+            let probe_count_reg = writable_spilltmp_reg();
+            if let Ok(probe_count) = i16::try_from(probe_count) {
+                insts.push(Inst::Mov32SImm16 {
+                    rd: probe_count_reg,
+                    imm: probe_count,
+                });
+            } else {
+                insts.push(Inst::Mov32Imm {
+                    rd: probe_count_reg,
+                    imm: probe_count,
+                });
+            }
+
+            // Emit probe loop.  The guard size is assumed to fit in 16 bits.
+            insts.push(Inst::StackProbeLoop {
+                probe_count: probe_count_reg,
+                guard_size: i16::try_from(guard_size).unwrap(),
+            });
+        }
+
+        // Restore the stack pointer to its original position.
+        insts.extend(Self::gen_sp_reg_adjust((probe_count * guard_size) as i32));
     }
 
     fn gen_clobber_save(

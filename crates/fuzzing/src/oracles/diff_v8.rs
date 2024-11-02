@@ -32,6 +32,8 @@ impl V8Engine {
         config.min_memories = config.min_memories.min(1);
         config.max_memories = config.max_memories.min(1);
         config.memory64_enabled = false;
+        config.custom_page_sizes_enabled = false;
+        config.wide_arithmetic_enabled = false;
 
         Self {
             isolate: Rc::new(RefCell::new(v8::Isolate::new(Default::default()))),
@@ -50,7 +52,7 @@ impl DiffEngine for V8Engine {
         let mut isolate = self.isolate.borrow_mut();
         let isolate = &mut **isolate;
         let mut scope = v8::HandleScope::new(isolate);
-        let context = v8::Context::new(&mut scope);
+        let context = v8::Context::new(&mut scope, Default::default());
         let global = context.global(&mut scope);
         let mut scope = v8::ContextScope::new(&mut scope, context);
 

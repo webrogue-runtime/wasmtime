@@ -23,7 +23,6 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     // cranelift
     "cranelift-isle",
     "cranelift-entity",
-    "wasmtime-types",
     "cranelift-bforest",
     "cranelift-codegen-shared",
     "cranelift-codegen-meta",
@@ -34,7 +33,6 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     "cranelift-serde",
     "cranelift-module",
     "cranelift-frontend",
-    "cranelift-wasm",
     "cranelift-native",
     "cranelift-object",
     "cranelift-interpreter",
@@ -69,7 +67,7 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     "wasmtime-wasi",
     "wasmtime-wasi-http",
     "wasmtime-wasi-nn",
-    "wasmtime-wasi-runtime-config",
+    "wasmtime-wasi-config",
     "wasmtime-wasi-keyvalue",
     "wasmtime-wasi-threads",
     "wasmtime-wast",
@@ -90,7 +88,7 @@ const PUBLIC_CRATES: &[&str] = &[
     "wasmtime",
     "wasmtime-wasi",
     "wasmtime-wasi-nn",
-    "wasmtime-wasi-runtime-config",
+    "wasmtime-wasi-config",
     "wasmtime-wasi-keyvalue",
     "wasmtime-wasi-threads",
     "wasmtime-cli",
@@ -108,7 +106,6 @@ const PUBLIC_CRATES: &[&str] = &[
     "cranelift-serde",
     "cranelift-module",
     "cranelift-frontend",
-    "cranelift-wasm",
     "cranelift-native",
     "cranelift-object",
     "cranelift-interpreter",
@@ -428,15 +425,16 @@ fn publish(krate: &Crate) -> bool {
 
     // First make sure the crate isn't already published at this version. This
     // script may be re-run and there's no need to re-attempt previous work.
-    let output = cmd_output(
-        Command::new("curl").arg(&format!("https://crates.io/api/v1/crates/{}", krate.name)),
-    );
+    let output = cmd_output(Command::new("curl").arg(&format!(
+        "https://crates.io/api/v1/crates/{}/versions",
+        krate.name
+    )));
     if output.status.success()
         && String::from_utf8_lossy(&output.stdout)
-            .contains(&format!("\"newest_version\":\"{}\"", krate.version))
+            .contains(&format!("\"num\":\"{}\"", krate.version))
     {
         println!(
-            "skip publish {} because {} is latest version",
+            "skip publish {} because {} is already published",
             krate.name, krate.version,
         );
         return true;

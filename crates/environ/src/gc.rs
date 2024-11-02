@@ -9,12 +9,18 @@
 //! on our various `gc` cargo features is the actual garbage collection
 //! functions and their associated impact on binary size anyways.
 
-#[cfg(feature = "gc")]
+#[cfg(feature = "gc-drc")]
 pub mod drc;
 
+#[cfg(feature = "gc-null")]
+pub mod null;
+
 use crate::prelude::*;
+use crate::{
+    WasmArrayType, WasmCompositeInnerType, WasmCompositeType, WasmStorageType, WasmStructType,
+    WasmValType,
+};
 use core::alloc::Layout;
-use wasmtime_types::{WasmArrayType, WasmStorageType, WasmStructType, WasmValType};
 
 /// Discriminant to check whether GC reference is an `i31ref` or not.
 pub const I31_DISCRIMINANT: u64 = 1;
@@ -22,6 +28,18 @@ pub const I31_DISCRIMINANT: u64 = 1;
 /// A mask that can be used to check for non-null and non-i31ref GC references
 /// with a single bitwise-and operation.
 pub const NON_NULL_NON_I31_MASK: u64 = !I31_DISCRIMINANT;
+
+/// The size of the `VMGcHeader` in bytes.
+pub const VM_GC_HEADER_SIZE: u32 = 8;
+
+/// The minimum alignment of the `VMGcHeader` in bytes.
+pub const VM_GC_HEADER_ALIGN: u32 = 8;
+
+/// The offset of the `VMGcKind` field in the `VMGcHeader`.
+pub const VM_GC_HEADER_KIND_OFFSET: u32 = 0;
+
+/// The offset of the `VMSharedTypeIndex` field in the `VMGcHeader`.
+pub const VM_GC_HEADER_TYPE_INDEX_OFFSET: u32 = 4;
 
 /// Get the byte size of the given Wasm type when it is stored inside the GC
 /// heap.
@@ -37,9 +55,120 @@ pub fn byte_size_of_wasm_ty_in_gc_heap(ty: &WasmStorageType) -> u32 {
     }
 }
 
+/// Align `offset` up to `bytes`, updating `max_align` if `align` is the
+/// new maximum alignment, and returning the aligned offset.
+#[cfg(any(feature = "gc-drc", feature = "gc-null"))]
+fn align_up(offset: &mut u32, max_align: &mut u32, align: u32) -> u32 {
+    debug_assert!(max_align.is_power_of_two());
+    debug_assert!(align.is_power_of_two());
+    *offset = offset.checked_add(align - 1).unwrap() & !(align - 1);
+    *max_align = core::cmp::max(*max_align, align);
+    *offset
+}
+
+/// Define a new field of size and alignment `bytes`, updating the object's
+/// total `size` and `align` as necessary. The offset of the new field is
+/// returned.
+#[cfg(any(feature = "gc-drc", feature = "gc-null"))]
+fn field(size: &mut u32, align: &mut u32, bytes: u32) -> u32 {
+    let offset = align_up(size, align, bytes);
+    *size += bytes;
+    offset
+}
+
+/// Common code to define a GC array's layout, given the size and alignment of
+/// the collector's GC header and its expected offset of the array length field.
+#[cfg(any(feature = "gc-drc", feature = "gc-null"))]
+fn common_array_layout(
+    ty: &WasmArrayType,
+    header_size: u32,
+    header_align: u32,
+    expected_array_length_offset: u32,
+) -> GcArrayLayout {
+    assert!(header_size >= crate::VM_GC_HEADER_SIZE);
+    assert!(header_align >= crate::VM_GC_HEADER_ALIGN);
+
+    let mut size = header_size;
+    let mut align = header_align;
+
+    let length_field_offset = field(&mut size, &mut align, 4);
+    assert_eq!(length_field_offset, expected_array_length_offset);
+
+    let elem_size = byte_size_of_wasm_ty_in_gc_heap(&ty.0.element_type);
+    let elems_offset = align_up(&mut size, &mut align, elem_size);
+    assert_eq!(elems_offset, size);
+
+    GcArrayLayout {
+        base_size: size,
+        align,
+        elem_size,
+    }
+}
+
+/// Common code to define a GC struct's layout, given the size and alignment of
+/// the collector's GC header and its expected offset of the array length field.
+#[cfg(any(feature = "gc-drc", feature = "gc-null"))]
+fn common_struct_layout(
+    ty: &WasmStructType,
+    header_size: u32,
+    header_align: u32,
+) -> GcStructLayout {
+    assert!(header_size >= crate::VM_GC_HEADER_SIZE);
+    assert!(header_align >= crate::VM_GC_HEADER_ALIGN);
+
+    // Process each field, aligning it to its natural alignment.
+    //
+    // We don't try and do any fancy field reordering to minimize padding
+    // (yet?) because (a) the toolchain probably already did that and (b)
+    // we're just doing the simple thing first. We can come back and improve
+    // things here if we find that (a) isn't actually holding true in
+    // practice.
+    let mut size = header_size;
+    let mut align = header_align;
+
+    let fields = ty
+        .fields
+        .iter()
+        .map(|f| {
+            let field_size = byte_size_of_wasm_ty_in_gc_heap(&f.element_type);
+            field(&mut size, &mut align, field_size)
+        })
+        .collect();
+
+    // Ensure that the final size is a multiple of the alignment, for
+    // simplicity.
+    let align_size_to = align;
+    align_up(&mut size, &mut align, align_size_to);
+
+    GcStructLayout {
+        size,
+        align,
+        fields,
+    }
+}
+
 /// A trait for getting the layout of a Wasm GC struct or array inside a
 /// particular collector.
 pub trait GcTypeLayouts {
+    /// The offset of an array's length field.
+    ///
+    /// This must be the same for all arrays in the heap, regardless of their
+    /// element type.
+    fn array_length_field_offset(&self) -> u32;
+
+    /// Get this collector's layout for the given composite type.
+    ///
+    /// Returns `None` if the type is a function type, as functions are not
+    /// managed by the GC.
+    fn gc_layout(&self, ty: &WasmCompositeType) -> Option<GcLayout> {
+        assert!(!ty.shared);
+        match &ty.inner {
+            WasmCompositeInnerType::Array(ty) => Some(self.array_layout(ty).into()),
+            WasmCompositeInnerType::Struct(ty) => Some(self.struct_layout(ty).into()),
+            WasmCompositeInnerType::Func(_) => None,
+        }
+    }
+
     /// Get this collector's layout for the given array type.
     fn array_layout(&self, ty: &WasmArrayType) -> GcArrayLayout;
 
@@ -106,17 +235,13 @@ impl GcLayout {
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Not used yet, but added for completeness.
 pub struct GcArrayLayout {
-    /// The size of this array object, ignoring its elements.
-    pub size: u32,
+    /// The size of this array object, without any elements.
+    ///
+    /// The array's elements, if any, must begin at exactly this offset.
+    pub base_size: u32,
 
     /// The alignment of this array.
     pub align: u32,
-
-    /// The offset of the array's length.
-    pub length_field_offset: u32,
-
-    /// The offset from where this array's contiguous elements begin.
-    pub elems_offset: u32,
 
     /// The size and natural alignment of each element in this array.
     pub elem_size: u32,
@@ -124,14 +249,15 @@ pub struct GcArrayLayout {
 
 impl GcArrayLayout {
     /// Get the total size of this array for a given length of elements.
+    #[inline]
     pub fn size_for_len(&self, len: u32) -> u32 {
-        self.size + len * self.elem_size
+        self.elem_offset(len)
     }
 
     /// Get the offset of the `i`th element in an array with this layout.
     #[inline]
-    pub fn elem_offset(&self, i: u32, elem_size: u32) -> u32 {
-        self.elems_offset + i * elem_size
+    pub fn elem_offset(&self, i: u32) -> u32 {
+        self.base_size + i * self.elem_size
     }
 
     /// Get a `core::alloc::Layout` for an array of this type with the given
@@ -198,39 +324,42 @@ impl GcStructLayout {
 /// VMGcKind::EqRef`.
 ///
 /// Furthermore, this type only uses the highest 6 bits of its `u32`
-/// representation, allowing the lower 26 bytes to be bitpacked with other stuff
+/// representation, allowing the lower 27 bytes to be bitpacked with other stuff
 /// as users see fit.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[rustfmt::skip]
 #[allow(missing_docs)]
 pub enum VMGcKind {
-    ExternRef      = 0b010000 << 26,
-    ExternOfAnyRef = 0b011000 << 26,
-    AnyRef         = 0b100000 << 26,
-    AnyOfExternRef = 0b100100 << 26,
-    EqRef          = 0b101000 << 26,
-    ArrayRef       = 0b101001 << 26,
-    StructRef      = 0b101010 << 26,
+    ExternRef      = 0b01000 << 27,
+    AnyRef         = 0b10000 << 27,
+    EqRef          = 0b10100 << 27,
+    ArrayRef       = 0b10101 << 27,
+    StructRef      = 0b10110 << 27,
 }
 
 impl VMGcKind {
     /// Mask this value with a `u32` to get just the bits that `VMGcKind` uses.
-    pub const MASK: u32 = 0b111111 << 26;
+    pub const MASK: u32 = 0b11111 << 27;
 
     /// Mask this value with a `u32` that potentially contains a `VMGcKind` to
     /// get the bits that `VMGcKind` doesn't use.
     pub const UNUSED_MASK: u32 = !Self::MASK;
 
+    /// Does the given value fit in the unused bits of a `VMGcKind`?
+    #[inline]
+    pub fn value_fits_in_unused_bits(value: u32) -> bool {
+        (value & Self::UNUSED_MASK) == value
+    }
+
     /// Convert the given value into a `VMGcKind` by masking off the unused
     /// bottom bits.
+    #[inline]
     pub fn from_high_bits_of_u32(val: u32) -> VMGcKind {
         let masked = val & Self::MASK;
         match masked {
             x if x == Self::ExternRef.as_u32() => Self::ExternRef,
-            x if x == Self::ExternOfAnyRef.as_u32() => Self::ExternOfAnyRef,
             x if x == Self::AnyRef.as_u32() => Self::AnyRef,
-            x if x == Self::AnyOfExternRef.as_u32() => Self::AnyOfExternRef,
             x if x == Self::EqRef.as_u32() => Self::EqRef,
             x if x == Self::ArrayRef.as_u32() => Self::ArrayRef,
             x if x == Self::StructRef.as_u32() => Self::StructRef,
@@ -260,21 +389,11 @@ mod tests {
 
     #[test]
     fn kind_matches() {
-        let all = [
-            ExternRef,
-            ExternOfAnyRef,
-            AnyRef,
-            AnyOfExternRef,
-            EqRef,
-            ArrayRef,
-            StructRef,
-        ];
+        let all = [ExternRef, AnyRef, EqRef, ArrayRef, StructRef];
 
         for (sup, subs) in [
-            (ExternRef, vec![ExternOfAnyRef]),
-            (ExternOfAnyRef, vec![]),
-            (AnyRef, vec![AnyOfExternRef, EqRef, ArrayRef, StructRef]),
-            (AnyOfExternRef, vec![]),
+            (ExternRef, vec![]),
+            (AnyRef, vec![EqRef, ArrayRef, StructRef]),
             (EqRef, vec![ArrayRef, StructRef]),
             (ArrayRef, vec![]),
             (StructRef, vec![]),

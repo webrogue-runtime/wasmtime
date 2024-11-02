@@ -1,13 +1,14 @@
 use crate::module::{
-    FuncRefIndex, Initializer, MemoryInitialization, MemoryInitializer, MemoryPlan, Module,
-    TablePlan, TableSegment, TableSegmentElements,
+    FuncRefIndex, Initializer, MemoryInitialization, MemoryInitializer, Module, TableSegment,
+    TableSegmentElements,
 };
 use crate::prelude::*;
 use crate::{
-    DataIndex, DefinedFuncIndex, ElemIndex, EntityIndex, EntityType, FuncIndex, GlobalIndex,
-    InitMemory, MemoryIndex, ModuleTypesBuilder, PrimaryMap, StaticMemoryInitializer, TableIndex,
-    TableInitialValue, Tunables, TypeConvert, TypeIndex, Unsigned, WasmError, WasmHeapType,
-    WasmResult, WasmValType, WasmparserTypeConverter,
+    ConstExpr, ConstOp, DataIndex, DefinedFuncIndex, ElemIndex, EngineOrModuleTypeIndex,
+    EntityIndex, EntityType, FuncIndex, GlobalIndex, IndexType, InitMemory, MemoryIndex,
+    ModuleInternedTypeIndex, ModuleTypesBuilder, PrimaryMap, SizeOverflow, StaticMemoryInitializer,
+    TableIndex, TableInitialValue, Tunables, TypeConvert, TypeIndex, Unsigned, WasmError,
+    WasmHeapTopType, WasmHeapType, WasmResult, WasmValType, WasmparserTypeConverter,
 };
 use anyhow::{bail, Result};
 use cranelift_entity::packed_option::ReservedValue;
@@ -20,9 +21,6 @@ use wasmparser::{
     types::Types, CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
     FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser, Payload, TypeRef,
     Validator, ValidatorResources,
-};
-use wasmtime_types::{
-    ConstExpr, ConstOp, IndexType, ModuleInternedTypeIndex, SizeOverflow, WasmHeapTopType,
 };
 
 /// Object containing the standalone environment information.
@@ -241,7 +239,9 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
             Payload::TypeSection(types) => {
                 self.validator.type_section(&types)?;
 
-                let count = types.count();
+                let count = self.validator.types(0).unwrap().core_type_count_in_module();
+                log::trace!("interning {count} Wasm types");
+
                 let capacity = usize::try_from(count).unwrap();
                 self.result.module.types.reserve(capacity);
                 self.types.reserve_wasm_signatures(capacity);
@@ -256,15 +256,16 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 // groups, we need copy the duplicates over (shallowly) as well,
                 // so that our types index space doesn't have holes.
                 let mut type_index = 0;
-                for _ in 0..count {
+                while type_index < count {
                     let validator_types = self.validator.types(0).unwrap();
 
                     // Get the rec group for the current type index, which is
                     // always the first type defined in a rec group.
-                    let core_type_id = validator_types.core_type_at(type_index).unwrap_sub();
+                    log::trace!("looking up wasmparser type for index {type_index}");
+                    let core_type_id = validator_types.core_type_at_in_module(type_index);
                     log::trace!(
-                        "about to intern rec group for {core_type_id:?} = {:?}",
-                        validator_types[core_type_id]
+                        "  --> {core_type_id:?} = {:?}",
+                        validator_types[core_type_id],
                     );
                     let rec_group_id = validator_types.rec_group_id_of(core_type_id);
                     debug_assert_eq!(
@@ -276,11 +277,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                     // Intern the rec group and then fill in this module's types
                     // index space.
-                    let interned = self.types.intern_rec_group(
-                        &self.result.module,
-                        validator_types,
-                        rec_group_id,
-                    )?;
+                    let interned = self.types.intern_rec_group(validator_types, rec_group_id)?;
                     let elems = self.types.rec_group_elements(interned);
                     let len = elems.len();
                     self.result.module.types.reserve(len);
@@ -307,9 +304,7 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                             let interned_index = self.result.module.types[index];
                             self.result.module.num_imported_funcs += 1;
                             self.result.debuginfo.wasm_file.imported_func_count += 1;
-                            EntityType::Function(wasmtime_types::EngineOrModuleTypeIndex::Module(
-                                interned_index,
-                            ))
+                            EntityType::Function(EngineOrModuleTypeIndex::Module(interned_index))
                         }
                         TypeRef::Memory(ty) => {
                             self.result.module.num_imported_memories += 1;
@@ -348,13 +343,12 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
             Payload::TableSection(tables) => {
                 self.validator.table_section(&tables)?;
                 let cnt = usize::try_from(tables.count()).unwrap();
-                self.result.module.table_plans.reserve_exact(cnt);
+                self.result.module.tables.reserve_exact(cnt);
 
                 for entry in tables {
                     let wasmparser::Table { ty, init } = entry?;
                     let table = self.convert_table_type(&ty)?;
-                    let plan = TablePlan::for_table(table, &self.tunables);
-                    self.result.module.table_plans.push(plan);
+                    self.result.module.tables.push(table);
                     let init = match init {
                         wasmparser::TableInit::RefNull => TableInitialValue::Null {
                             precomputed: Vec::new(),
@@ -379,12 +373,11 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                 self.validator.memory_section(&memories)?;
 
                 let cnt = usize::try_from(memories.count()).unwrap();
-                self.result.module.memory_plans.reserve_exact(cnt);
+                self.result.module.memories.reserve_exact(cnt);
 
                 for entry in memories {
                     let memory = entry?;
-                    let plan = MemoryPlan::for_memory(memory.into(), &self.tunables);
-                    self.result.module.memory_plans.push(plan);
+                    self.result.module.memories.push(memory.into());
                 }
             }
 
@@ -772,14 +765,8 @@ and for re-adding support for interface types you can see this issue:
                 self.flag_func_escaped(func_index);
                 func_index
             }),
-            EntityType::Table(ty) => {
-                let plan = TablePlan::for_table(ty, &self.tunables);
-                EntityIndex::Table(self.result.module.table_plans.push(plan))
-            }
-            EntityType::Memory(ty) => {
-                let plan = MemoryPlan::for_memory(ty, &self.tunables);
-                EntityIndex::Memory(self.result.module.memory_plans.push(plan))
-            }
+            EntityType::Table(ty) => EntityIndex::Table(self.result.module.tables.push(ty)),
+            EntityType::Memory(ty) => EntityIndex::Memory(self.result.module.memories.push(ty)),
             EntityType::Global(ty) => EntityIndex::Global(self.result.module.globals.push(ty)),
             EntityType::Tag(_) => unimplemented!(),
         }
@@ -869,14 +856,13 @@ and for re-adding support for interface types you can see this issue:
 
 impl TypeConvert for ModuleEnvironment<'_, '_> {
     fn lookup_heap_type(&self, index: wasmparser::UnpackedIndex) -> WasmHeapType {
-        WasmparserTypeConverter::new(&self.types, &self.result.module).lookup_heap_type(index)
+        WasmparserTypeConverter::new(&self.types, |idx| self.result.module.types[idx])
+            .lookup_heap_type(index)
     }
 
-    fn lookup_type_index(
-        &self,
-        index: wasmparser::UnpackedIndex,
-    ) -> wasmtime_types::EngineOrModuleTypeIndex {
-        WasmparserTypeConverter::new(&self.types, &self.result.module).lookup_type_index(index)
+    fn lookup_type_index(&self, index: wasmparser::UnpackedIndex) -> EngineOrModuleTypeIndex {
+        WasmparserTypeConverter::new(&self.types, |idx| self.result.module.types[idx])
+            .lookup_type_index(index)
     }
 }
 
@@ -930,8 +916,8 @@ impl ModuleTranslation<'_> {
             // wasm module.
             segments: Vec<(usize, StaticMemoryInitializer)>,
         }
-        let mut info = PrimaryMap::with_capacity(self.module.memory_plans.len());
-        for _ in 0..self.module.memory_plans.len() {
+        let mut info = PrimaryMap::with_capacity(self.module.memories.len());
+        for _ in 0..self.module.memories.len() {
             info.push(Memory {
                 data_size: 0,
                 min_addr: u64::MAX,
@@ -950,16 +936,11 @@ impl ModuleTranslation<'_> {
                 &mut self,
                 memory_index: MemoryIndex,
             ) -> Result<u64, SizeOverflow> {
-                self.module.memory_plans[memory_index]
-                    .memory
-                    .minimum_byte_size()
+                self.module.memories[memory_index].minimum_byte_size()
             }
 
             fn eval_offset(&mut self, memory_index: MemoryIndex, expr: &ConstExpr) -> Option<u64> {
-                match (
-                    expr.ops(),
-                    self.module.memory_plans[memory_index].memory.idx_type,
-                ) {
+                match (expr.ops(), self.module.memories[memory_index].idx_type) {
                     (&[ConstOp::I32Const(offset)], IndexType::I32) => {
                         Some(offset.unsigned().into())
                     }
@@ -1012,7 +993,7 @@ impl ModuleTranslation<'_> {
             // initializer can be created. This can be handled technically but
             // would require some more changes to help fix the assert elsewhere
             // that this protects against.
-            if self.module.memory_plans[i].memory.page_size() < page_size {
+            if self.module.memories[i].page_size() < page_size {
                 return;
             }
 
@@ -1147,19 +1128,19 @@ impl ModuleTranslation<'_> {
 
         // First convert any element-initialized tables to images of just that
         // single function if the minimum size of the table allows doing so.
-        for ((_, init), (_, plan)) in self
+        for ((_, init), (_, table)) in self
             .module
             .table_initialization
             .initial_values
             .iter_mut()
             .zip(
                 self.module
-                    .table_plans
+                    .tables
                     .iter()
                     .skip(self.module.num_imported_tables),
             )
         {
-            let table_size = plan.table.limits.min;
+            let table_size = table.limits.min;
             if table_size > MAX_FUNC_TABLE_SIZE {
                 continue;
             }
@@ -1212,16 +1193,12 @@ impl ModuleTranslation<'_> {
                 Some(top) => top,
                 None => break,
             };
-            let table_size = self.module.table_plans[segment.table_index]
-                .table
-                .limits
-                .min;
+            let table_size = self.module.tables[segment.table_index].limits.min;
             if top > table_size || top > MAX_FUNC_TABLE_SIZE {
                 break;
             }
 
-            match self.module.table_plans[segment.table_index]
-                .table
+            match self.module.tables[segment.table_index]
                 .ref_type
                 .heap_type
                 .top()

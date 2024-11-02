@@ -4,6 +4,7 @@ use crate::bindings::sockets::network::{
 };
 use crate::network::{from_ipv4_addr, from_ipv6_addr, to_ipv4_addr, to_ipv6_addr};
 use crate::{SocketError, WasiImpl, WasiView};
+use anyhow::Error;
 use rustix::io::Errno;
 use std::io;
 use wasmtime::component::Resource;
@@ -14,6 +15,16 @@ where
 {
     fn convert_error_code(&mut self, error: SocketError) -> anyhow::Result<ErrorCode> {
         error.downcast()
+    }
+
+    fn network_error_code(&mut self, err: Resource<Error>) -> anyhow::Result<Option<ErrorCode>> {
+        let err = self.table().get(&err)?;
+
+        if let Some(err) = err.downcast_ref::<std::io::Error>() {
+            return Ok(Some(ErrorCode::from(err)));
+        }
+
+        Ok(None)
     }
 }
 
@@ -32,8 +43,14 @@ where
 
 impl From<io::Error> for ErrorCode {
     fn from(value: io::Error) -> Self {
+        (&value).into()
+    }
+}
+
+impl From<&io::Error> for ErrorCode {
+    fn from(value: &io::Error) -> Self {
         // Attempt the more detailed native error code first:
-        if let Some(errno) = Errno::from_io_error(&value) {
+        if let Some(errno) = Errno::from_io_error(value) {
             return errno.into();
         }
 
@@ -62,7 +79,13 @@ impl From<io::Error> for ErrorCode {
 
 impl From<Errno> for ErrorCode {
     fn from(value: Errno) -> Self {
-        match value {
+        (&value).into()
+    }
+}
+
+impl From<&Errno> for ErrorCode {
+    fn from(value: &Errno) -> Self {
+        match *value {
             Errno::WOULDBLOCK => ErrorCode::WouldBlock,
             #[allow(unreachable_patterns)] // EWOULDBLOCK and EAGAIN can have the same value.
             Errno::AGAIN => ErrorCode::WouldBlock,

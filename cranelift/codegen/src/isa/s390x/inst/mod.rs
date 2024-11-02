@@ -148,7 +148,6 @@ impl Inst {
             | Inst::StoreRev16 { .. }
             | Inst::StoreRev32 { .. }
             | Inst::StoreRev64 { .. }
-            | Inst::Mvc { .. }
             | Inst::LoadMultiple64 { .. }
             | Inst::StoreMultiple64 { .. }
             | Inst::Mov32 { .. }
@@ -227,6 +226,7 @@ impl Inst {
             | Inst::Debugtrap
             | Inst::Trap { .. }
             | Inst::JTSequence { .. }
+            | Inst::StackProbeLoop { .. }
             | Inst::LoadSymbolReloc { .. }
             | Inst::LoadAddr { .. }
             | Inst::Loop { .. }
@@ -564,10 +564,6 @@ fn s390x_get_operands(inst: &mut Inst, collector: &mut DenyReuseVisitor<impl Ope
         | Inst::StoreImm64SExt16 { mem, .. } => {
             memarg_operands(mem, collector);
         }
-        Inst::Mvc { dst, src, .. } => {
-            collector.reg_use(&mut dst.base);
-            collector.reg_use(&mut src.base);
-        }
         Inst::LoadMultiple64 { rt, rt2, mem, .. } => {
             memarg_operands(mem, collector);
             let first_regnum = rt.to_reg().to_real_reg().unwrap().hw_enc();
@@ -589,9 +585,8 @@ fn s390x_get_operands(inst: &mut Inst, collector: &mut DenyReuseVisitor<impl Ope
             collector.reg_use(rm);
         }
         Inst::MovPReg { rd, rm } => {
-            debug_assert!([gpr_preg(0), gpr_preg(14), gpr_preg(15)].contains(rm));
-            debug_assert!(rd.to_reg().is_virtual());
             collector.reg_def(rd);
+            collector.reg_fixed_nonallocatable(*rm);
         }
         Inst::Mov32 { rd, rm } => {
             collector.reg_def(rd);
@@ -928,7 +923,6 @@ fn s390x_get_operands(inst: &mut Inst, collector: &mut DenyReuseVisitor<impl Ope
             tls_offset,
             got,
             got_offset,
-            link,
             ..
         } => {
             collector.reg_fixed_use(got, gpr(12));
@@ -936,7 +930,7 @@ fn s390x_get_operands(inst: &mut Inst, collector: &mut DenyReuseVisitor<impl Ope
             collector.reg_fixed_def(tls_offset, gpr(2));
 
             let mut clobbers = S390xMachineDeps::get_regs_clobbered_by_call(CallConv::SystemV);
-            clobbers.add(link.to_reg().to_real_reg().unwrap().into());
+            clobbers.add(gpr_preg(14));
             clobbers.remove(gpr_preg(2));
             collector.reg_clobbers(clobbers);
         }
@@ -974,6 +968,9 @@ fn s390x_get_operands(inst: &mut Inst, collector: &mut DenyReuseVisitor<impl Ope
         Inst::LoadAddr { rd, mem } => {
             collector.reg_def(rd);
             memarg_operands(mem, collector);
+        }
+        Inst::StackProbeLoop { probe_count, .. } => {
+            collector.reg_early_def(probe_count);
         }
         Inst::Loop { body, .. } => {
             // `reuse_def` constraints can't be permitted in a Loop instruction because the operand
@@ -1936,22 +1933,6 @@ impl Inst {
                 let mem = mem.pretty_print_default();
 
                 format!("{mem_str}{op} {mem}, {imm}")
-            }
-            &Inst::Mvc {
-                ref dst,
-                ref src,
-                len_minus_one,
-            } => {
-                let dst = dst.clone();
-                let src = src.clone();
-                format!(
-                    "mvc {}({},{}), {}({})",
-                    dst.disp.pretty_print_default(),
-                    len_minus_one,
-                    show_reg(dst.base),
-                    src.disp.pretty_print_default(),
-                    show_reg(src.base)
-                )
             }
             &Inst::LoadMultiple64 { rt, rt2, ref mem } => {
                 let mem = mem.clone();
@@ -3148,7 +3129,6 @@ impl Inst {
                 } else {
                     "".to_string()
                 };
-                debug_assert_eq!(link, gpr(14));
                 format!(
                     "brasl {}, {}{}",
                     show_reg(link),
@@ -3164,7 +3144,6 @@ impl Inst {
                 } else {
                     "".to_string()
                 };
-                debug_assert_eq!(link, gpr(14));
                 format!("basr {}, {}{}", show_reg(link), rn, callee_pop_size)
             }
             &Inst::ReturnCall { ref info } => {
@@ -3184,20 +3163,14 @@ impl Inst {
                 };
                 format!("return_call_ind {rn}{callee_pop_size}")
             }
-            &Inst::ElfTlsGetOffset {
-                ref symbol,
-                ref link,
-                ..
-            } => {
-                let link = link.to_reg();
+            &Inst::ElfTlsGetOffset { ref symbol, .. } => {
                 let dest = match &**symbol {
                     SymbolReloc::TlsGd { name } => {
                         format!("tls_gdcall:{}", name.display(None))
                     }
                     _ => unreachable!(),
                 };
-                debug_assert_eq!(link, gpr(14));
-                format!("brasl {}, {}", show_reg(link), dest)
+                format!("brasl {}, {}", show_reg(gpr(14)), dest)
             }
             &Inst::Args { ref args } => {
                 let mut s = "args".to_string();
@@ -3218,7 +3191,6 @@ impl Inst {
                 s
             }
             &Inst::Ret { link } => {
-                debug_assert_eq!(link, gpr(14));
                 let link = show_reg(link);
                 format!("br {link}")
             }
@@ -3311,6 +3283,14 @@ impl Inst {
                 let mem = mem.pretty_print_default();
 
                 format!("{mem_str}{op} {rd}, {mem}")
+            }
+            &Inst::StackProbeLoop {
+                probe_count,
+                guard_size,
+            } => {
+                let probe_count = pretty_print_reg(probe_count.to_reg());
+                let stack_reg = pretty_print_reg(stack_reg());
+                format!("0: aghi {stack_reg}, -{guard_size} ; mvi 0({stack_reg}), 0 ; brct {probe_count}, 0b")
             }
             &Inst::Loop { ref body, cond } => {
                 let body = body

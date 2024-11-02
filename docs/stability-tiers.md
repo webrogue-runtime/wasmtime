@@ -73,6 +73,7 @@ For explanations of what each tier means see below.
 | Target               | Support for `#![no_std]`   | Support beyond CI checks    |
 | WebAssembly Proposal | [`memory64`]               | Unstable wasm proposal      |
 | WebAssembly Proposal | [`function-references`]    | Unstable wasm proposal      |
+| WebAssembly Proposal | [`wide-arithmetic`]        | Unstable wasm proposal      |
 
 [`memory64`]: https://github.com/WebAssembly/memory64/blob/master/proposals/memory64/Overview.md
 [`multi-memory`]: https://github.com/WebAssembly/multi-memory/blob/master/proposals/multi-memory/Overview.md
@@ -80,6 +81,7 @@ For explanations of what each tier means see below.
 [`component-model`]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/Explainer.md
 [`relaxed-simd`]: https://github.com/WebAssembly/relaxed-simd/blob/main/proposals/relaxed-simd/Overview.md
 [`function-references`]: https://github.com/WebAssembly/function-references/blob/main/proposals/function-references/Overview.md
+[`wide-arithmetic`]: https://github.com/WebAssembly/wide-arithmetic/blob/main/proposals/wide-arithmetic/Overview.md
 
 #### Tier 3
 
@@ -91,19 +93,21 @@ For explanations of what each tier means see below.
 | Target               | `aarch64-linux-android`           | CI testing, full-time maintainer |
 | Target               | `x86_64-linux-android`            | CI testing, full-time maintainer |
 | Target               | `x86_64-unknown-linux-musl` [^4]  | CI testing, full-time maintainer |
+| Target               | `x86_64-unknown-illumos`          | CI testing, full-time maintainer |
+| Target               | `x86_64-unknown-freebsd`          | CI testing, full-time maintainer |
 | Compiler Backend     | Winch on x86\_64                  | WebAssembly proposals (`simd`, `relaxed-simd`, `tail-call`, `reference-types`, `threads`)     |
 | Compiler Backend     | Winch on aarch64                  | Complete implementation     |
 | WebAssembly Proposal | [`gc`]                            | Complete implementation     |
 | WASI Proposal        | [`wasi-nn`]                       | More expansive CI testing   |
 | WASI Proposal        | [`wasi-threads`]                  | More CI, unstable proposal  |
-| WASI Proposal        | [`wasi-runtime-config`]           | unstable proposal           |
+| WASI Proposal        | [`wasi-config`]                   | unstable proposal           |
 | WASI Proposal        | [`wasi-keyvalue`]                 | unstable proposal           |
 | *misc*               | Non-Wasmtime Cranelift usage [^1] | CI testing, full-time maintainer |
 | *misc*               | DWARF debugging [^2]              | CI testing, full-time maintainer, improved quality |
 
 [`wasi-nn`]: https://github.com/WebAssembly/wasi-nn
 [`wasi-threads`]: https://github.com/WebAssembly/wasi-threads
-[`wasi-runtime-config`]: https://github.com/WebAssembly/wasi-runtime-config
+[`wasi-config`]: https://github.com/WebAssembly/wasi-config
 [`wasi-keyvalue`]: https://github.com/WebAssembly/wasi-keyvalue
 [`gc`]: https://github.com/WebAssembly/gc
 
@@ -139,20 +143,14 @@ features to figure out how best to implement them and at least move them to Tier
 3 above.
 
 * Target: ARM 32-bit
-* Target: [FreeBSD](https://github.com/bytecodealliance/wasmtime/issues/5499)
+* Target: [AArch64 FreeBSD](https://github.com/bytecodealliance/wasmtime/issues/5499)
 * Target: [NetBSD/OpenBSD](https://github.com/bytecodealliance/wasmtime/issues/6962)
 * Target: [i686 (32-bit Intel targets)](https://github.com/bytecodealliance/wasmtime/issues/1980)
-* Target: Android
 * Target: MIPS
 * Target: SPARC
 * Target: PowerPC
 * Target: RISC-V 32-bit
-* [WebAssembly proposal: `branch-hinting`](https://github.com/WebAssembly/branch-hinting)
-* [WebAssembly proposal: `exception-handling`](https://github.com/WebAssembly/exception-handling)
-* [WebAssembly proposal: `extended-const`](https://github.com/WebAssembly/extended-const)
-* [WebAssembly proposal: `flexible-vectors`](https://github.com/WebAssembly/flexible-vectors)
-* [WebAssembly proposal: `memory-control`](https://github.com/WebAssembly/memory-control)
-* [WebAssembly proposal: `stack-switching`](https://github.com/WebAssembly/stack-switching)
+* WebAssembly Proposals: see [documentation here](./stability-wasm-proposals.md)
 * [WASI proposal: `proxy-wasm`](https://github.com/proxy-wasm/spec)
 * [WASI proposal: `wasi-blob-store`](https://github.com/WebAssembly/wasi-blob-store)
 * [WASI proposal: `wasi-crypto`](https://github.com/WebAssembly/wasi-crypto)
@@ -303,6 +301,9 @@ Tier 1 features include:
 
 * Major changes affecting Tier 1 features require an RFC and prior agreement on
   the change before an implementation is committed.
+
+* WebAssembly proposals meet [all stabilization
+  requirements](./stability-wasm-proposals.md).
 
 A major inclusion point for this tier is intended to be the continuous fuzzing
 of Wasmtime. This implies a significant commitment of resources for fixing

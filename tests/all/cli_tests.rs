@@ -287,11 +287,7 @@ fn exit125_wasi_snapshot0() -> Result<()> {
             None,
         )?;
         dbg!(&output);
-        if cfg!(windows) {
-            assert_eq!(output.status.code().unwrap(), 1);
-        } else {
-            assert_eq!(output.status.code().unwrap(), 125);
-        }
+        assert_eq!(output.status.code().unwrap(), 125);
     }
     Ok(())
 }
@@ -301,11 +297,7 @@ fn exit125_wasi_snapshot0() -> Result<()> {
 fn exit125_wasi_snapshot1() -> Result<()> {
     let wasm = build_wasm("tests/all/cli_tests/exit125_wasi_snapshot1.wat")?;
     let output = run_wasmtime_for_output(&["-Ccache=n", wasm.path().to_str().unwrap()], None)?;
-    if cfg!(windows) {
-        assert_eq!(output.status.code().unwrap(), 1);
-    } else {
-        assert_eq!(output.status.code().unwrap(), 125);
-    }
+    assert_eq!(output.status.code().unwrap(), 125);
     Ok(())
 }
 
@@ -1161,6 +1153,27 @@ mod test_programs {
     }
 
     #[test]
+    fn cli_stdin_empty() -> Result<()> {
+        let mut child = get_wasmtime_command()?
+            .args(&["run", "-Wcomponent-model", CLI_STDIN_EMPTY_COMPONENT])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"not to be read")
+            .unwrap();
+        let output = child.wait_with_output()?;
+        println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+        println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success());
+        Ok(())
+    }
+
+    #[test]
     fn cli_stdin() -> Result<()> {
         let mut child = get_wasmtime_command()?
             .args(&["run", "-Wcomponent-model", CLI_STDIN_COMPONENT])
@@ -1302,6 +1315,21 @@ mod test_programs {
             .output()?;
         assert!(!output.status.success());
         assert_eq!(output.status.code(), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_exit_with_code() -> Result<()> {
+        let output = get_wasmtime_command()?
+            .args(&[
+                "run",
+                "-Wcomponent-model",
+                "-Scli-exit-with-code",
+                CLI_EXIT_WITH_CODE_COMPONENT,
+            ])
+            .output()?;
+        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(42));
         Ok(())
     }
 
@@ -1895,11 +1923,11 @@ stderr [1] :: after empty
     }
 
     #[tokio::test]
-    async fn cli_serve_runtime_config() -> Result<()> {
-        let server = WasmtimeServe::new(CLI_SERVE_RUNTIME_CONFIG_COMPONENT, |cmd| {
+    async fn cli_serve_config() -> Result<()> {
+        let server = WasmtimeServe::new(CLI_SERVE_CONFIG_COMPONENT, |cmd| {
             cmd.arg("-Scli");
-            cmd.arg("-Sruntime-config");
-            cmd.arg("-Sruntime-config-var=hello=world");
+            cmd.arg("-Sconfig");
+            cmd.arg("-Sconfig-var=hello=world");
         })?;
 
         let resp = server
@@ -1917,12 +1945,12 @@ stderr [1] :: after empty
     }
 
     #[test]
-    fn cli_runtime_config() -> Result<()> {
+    fn cli_config() -> Result<()> {
         run_wasmtime(&[
             "run",
-            "-Sruntime-config",
-            "-Sruntime-config-var=hello=world",
-            RUNTIME_CONFIG_GET_COMPONENT,
+            "-Sconfig",
+            "-Sconfig-var=hello=world",
+            CONFIG_GET_COMPONENT,
         ])?;
         Ok(())
     }

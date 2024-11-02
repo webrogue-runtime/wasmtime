@@ -76,16 +76,16 @@
 //! contents of `StoreOpaque`. This is an invariant that we, as the authors of
 //! `wasmtime`, must uphold for the public interface to be safe.
 
+use crate::hash_set::HashSet;
 use crate::instance::InstanceData;
 use crate::linker::Definition;
 use crate::module::RegisteredModuleId;
 use crate::prelude::*;
 use crate::runtime::vm::mpk::{self, ProtectionKey, ProtectionMask};
 use crate::runtime::vm::{
-    Backtrace, ExportGlobal, GcHeapAllocationIndex, GcRootsList, GcStore,
-    InstanceAllocationRequest, InstanceAllocator, InstanceHandle, ModuleRuntimeInfo,
-    OnDemandInstanceAllocator, SignalHandler, StoreBox, StorePtr, VMContext, VMFuncRef, VMGcRef,
-    VMRuntimeLimits, WasmFault,
+    Backtrace, ExportGlobal, GcRootsList, GcStore, InstanceAllocationRequest, InstanceAllocator,
+    InstanceHandle, ModuleRuntimeInfo, OnDemandInstanceAllocator, SignalHandler, StoreBox,
+    StorePtr, VMContext, VMFuncRef, VMGcRef, VMRuntimeLimits, WasmFault,
 };
 use crate::trampoline::VMHostGlobalContext;
 use crate::type_registry::RegisteredType;
@@ -324,7 +324,7 @@ pub struct StoreOpaque {
     gc_roots: RootSet,
     gc_roots_list: GcRootsList,
     // Types for which the embedder has created an allocator for.
-    gc_host_alloc_types: hashbrown::HashSet<RegisteredType>,
+    gc_host_alloc_types: HashSet<RegisteredType>,
 
     // Numbers of resources instantiated in this store, and their limits
     instance_count: usize,
@@ -542,7 +542,7 @@ impl<T> Store<T> {
                 gc_store: None,
                 gc_roots: RootSet::default(),
                 gc_roots_list: GcRootsList::default(),
-                gc_host_alloc_types: hashbrown::HashSet::default(),
+                gc_host_alloc_types: HashSet::default(),
                 modules: ModuleRegistry::default(),
                 func_refs: FuncRefs::default(),
                 host_globals: Vec::new(),
@@ -601,6 +601,7 @@ impl<T> Store<T> {
                         runtime_info: &shim,
                         wmemcheck: engine.config().wmemcheck,
                         pkey: None,
+                        tunables: engine.tunables(),
                     })
                     .expect("failed to allocate default callee")
             };
@@ -1291,8 +1292,8 @@ impl StoreOpaque {
         }
 
         let module = module.env_module();
-        let memories = module.memory_plans.len() - module.num_imported_memories;
-        let tables = module.table_plans.len() - module.num_imported_tables;
+        let memories = module.num_defined_memories();
+        let tables = module.num_defined_tables();
 
         bump(&mut self.instance_count, self.instance_limit, 1, "instance")?;
         bump(
@@ -1341,7 +1342,7 @@ impl StoreOpaque {
     }
 
     pub(crate) fn fill_func_refs(&mut self) {
-        self.func_refs.fill(&mut self.modules);
+        self.func_refs.fill(&self.modules);
     }
 
     pub(crate) fn push_instance_pre_func_refs(&mut self, func_refs: Arc<[VMFuncRef]>) {
@@ -1537,25 +1538,19 @@ impl StoreOpaque {
 
         #[cfg(feature = "gc")]
         fn allocate_gc_store(engine: &Engine) -> Result<GcStore> {
-            let (index, heap) = if engine.features().gc_types() {
-                engine
-                    .allocator()
-                    .allocate_gc_heap(&**engine.gc_runtime())?
-            } else {
-                (
-                    GcHeapAllocationIndex::default(),
-                    crate::runtime::vm::disabled_gc_heap(),
-                )
-            };
+            ensure!(
+                engine.features().gc_types(),
+                "cannot allocate a GC store when GC is disabled at configuration time"
+            );
+            let (index, heap) = engine
+                .allocator()
+                .allocate_gc_heap(&**engine.gc_runtime()?)?;
             Ok(GcStore::new(index, heap))
         }
 
         #[cfg(not(feature = "gc"))]
         fn allocate_gc_store(_engine: &Engine) -> Result<GcStore> {
-            Ok(GcStore::new(
-                GcHeapAllocationIndex::default(),
-                crate::runtime::vm::disabled_gc_heap(),
-            ))
+            bail!("cannot allocate a GC store: the `gc` feature was disabled at compile time")
         }
     }
 
@@ -1574,6 +1569,17 @@ impl StoreOpaque {
             self.allocate_gc_heap()?;
         }
         Ok(self.unwrap_gc_store_mut())
+    }
+
+    /// If this store is configured with a GC heap, return a mutable reference
+    /// to it. Otherwise, return `None`.
+    #[inline]
+    pub(crate) fn optional_gc_store_mut(&mut self) -> Result<Option<&mut GcStore>> {
+        if cfg!(not(feature = "gc")) || !self.engine.features().gc_types() {
+            Ok(None)
+        } else {
+            Ok(Some(self.gc_store_mut()?))
+        }
     }
 
     #[inline]
@@ -1613,6 +1619,8 @@ impl StoreOpaque {
             return;
         }
 
+        log::trace!("============ Begin GC ===========");
+
         // Take the GC roots out of `self` so we can borrow it mutably but still
         // call mutable methods on `self`.
         let mut roots = core::mem::take(&mut self.gc_roots_list);
@@ -1623,6 +1631,8 @@ impl StoreOpaque {
         // Restore the GC roots for the next GC.
         roots.clear();
         self.gc_roots_list = roots;
+
+        log::trace!("============ End GC ===========");
     }
 
     #[inline]
@@ -1661,6 +1671,8 @@ impl StoreOpaque {
             return;
         }
 
+        log::trace!("============ Begin Async GC ===========");
+
         // Take the GC roots out of `self` so we can borrow it mutably but still
         // call mutable methods on `self`.
         let mut roots = std::mem::take(&mut self.gc_roots_list);
@@ -1673,6 +1685,8 @@ impl StoreOpaque {
         // Restore the GC roots for the next GC.
         roots.clear();
         self.gc_roots_list = roots;
+
+        log::trace!("============ End Async GC ===========");
     }
 
     #[inline]
@@ -2749,14 +2763,8 @@ impl Drop for StoreOpaque {
 
             #[cfg(feature = "gc")]
             if let Some(gc_store) = self.gc_store.take() {
-                if self.engine.features().gc_types() {
-                    allocator.deallocate_gc_heap(gc_store.allocation_index, gc_store.gc_heap);
-                } else {
-                    // If GC types are not enabled, we are just dealing with a
-                    // dummy GC heap.
-                    debug_assert_eq!(gc_store.allocation_index, GcHeapAllocationIndex::default());
-                    debug_assert!(gc_store.gc_heap.as_any().is::<crate::vm::DisabledGcHeap>());
-                }
+                debug_assert!(self.engine.features().gc_types());
+                allocator.deallocate_gc_heap(gc_store.allocation_index, gc_store.gc_heap);
             }
 
             #[cfg(feature = "component-model")]

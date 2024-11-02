@@ -11,9 +11,9 @@ use std::collections::{
 use std::mem;
 use wasmparser::BlockType;
 use wasmtime_environ::{
-    BuiltinFunctionIndex, FuncIndex, GlobalIndex, MemoryIndex, MemoryPlan, MemoryStyle,
-    ModuleTranslation, ModuleTypesBuilder, PrimaryMap, PtrSize, TableIndex, TablePlan, TypeConvert,
-    TypeIndex, VMOffsets, WasmHeapType, WasmValType,
+    BuiltinFunctionIndex, FuncIndex, GlobalIndex, Memory, MemoryIndex, MemoryStyle,
+    ModuleTranslation, ModuleTypesBuilder, PrimaryMap, PtrSize, Table, TableIndex, Tunables,
+    TypeConvert, TypeIndex, VMOffsets, WasmHeapType, WasmValType,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +62,7 @@ pub enum HeapStyle {
 #[derive(Debug, Copy, Clone)]
 pub struct HeapData {
     /// The offset to the base of the heap.
-    /// Relative to the VMContext pointer if the WebAssembly memory is locally
+    /// Relative to the `VMContext` pointer if the WebAssembly memory is locally
     /// defined. Else this is relative to the location of the imported WebAssembly
     /// memory location.
     pub offset: u32,
@@ -116,6 +116,8 @@ pub struct FuncEnv<'a, 'translation: 'a, 'data: 'translation, P: PtrSize> {
     pub types: &'translation ModuleTypesBuilder,
     /// The built-in functions available to the JIT code.
     pub builtins: &'translation mut BuiltinFunctions,
+    /// Configurable code generation options.
+    tunables: &'translation Tunables,
     /// Track resolved table information.
     resolved_tables: HashMap<TableIndex, TableData>,
     /// Track resolved heap information.
@@ -151,6 +153,7 @@ impl<'a, 'translation, 'data, P: PtrSize> FuncEnv<'a, 'translation, 'data, P> {
         translation: &'translation ModuleTranslation<'data>,
         types: &'translation ModuleTypesBuilder,
         builtins: &'translation mut BuiltinFunctions,
+        tunables: &'translation Tunables,
         isa: &dyn TargetIsa,
         ptr_type: WasmValType,
     ) -> Self {
@@ -158,6 +161,7 @@ impl<'a, 'translation, 'data, P: PtrSize> FuncEnv<'a, 'translation, 'data, P> {
             vmoffsets,
             translation,
             types,
+            tunables,
             resolved_tables: HashMap::new(),
             resolved_heaps: HashMap::new(),
             resolved_callees: HashMap::new(),
@@ -289,31 +293,32 @@ impl<'a, 'translation, 'data, P: PtrSize> FuncEnv<'a, 'translation, 'data, P> {
                         ),
                     };
 
-                let plan = &self.translation.module.memory_plans[index];
-                let (min_size, max_size) = heap_limits(&plan);
-                let (style, offset_guard_size) = heap_style_and_offset_guard_size(&plan);
+                let memory = &self.translation.module.memories[index];
+                let (min_size, max_size) = heap_limits(memory);
+                let (style, offset_guard_size) =
+                    heap_style_and_offset_guard_size(memory, self.tunables);
 
                 *entry.insert(HeapData {
                     offset: base_offset,
                     import_from,
                     current_length_offset,
                     style,
-                    ty: match plan.memory.idx_type {
+                    ty: match memory.idx_type {
                         wasmtime_environ::IndexType::I32 => WasmValType::I32,
                         wasmtime_environ::IndexType::I64 => WasmValType::I64,
                     },
                     min_size,
                     max_size,
-                    page_size_log2: plan.memory.page_size_log2,
+                    page_size_log2: memory.page_size_log2,
                     offset_guard_size,
                 })
             }
         }
     }
 
-    /// Get a [`TablePlan`] from a [`TableIndex`].
-    pub fn table_plan(&mut self, index: TableIndex) -> &TablePlan {
-        &self.translation.module.table_plans[index]
+    /// Get a [`Table`] from a [`TableIndex`].
+    pub fn table(&mut self, index: TableIndex) -> &Table {
+        &self.translation.module.tables[index]
     }
 
     /// Returns true if Spectre mitigations are enabled for heap bounds check.
@@ -334,6 +339,7 @@ impl<'a, 'translation, 'data, P: PtrSize> FuncEnv<'a, 'translation, 'data, P> {
         match callee {
             Callee::Local(idx) | Callee::Import(idx) => {
                 let types = self.translation.get_types();
+                let types = types.as_ref();
                 let ty = types[types.core_function_at(idx.as_u32())].unwrap_func();
                 let val = || {
                     let converter = TypeConverter::new(self.translation, self.types);
@@ -396,16 +402,20 @@ pub(crate) struct TypeConverter<'a, 'data: 'a> {
 
 impl TypeConvert for TypeConverter<'_, '_> {
     fn lookup_heap_type(&self, idx: wasmparser::UnpackedIndex) -> WasmHeapType {
-        wasmtime_environ::WasmparserTypeConverter::new(self.types, &self.translation.module)
-            .lookup_heap_type(idx)
+        wasmtime_environ::WasmparserTypeConverter::new(self.types, |idx| {
+            self.translation.module.types[idx]
+        })
+        .lookup_heap_type(idx)
     }
 
     fn lookup_type_index(
         &self,
         index: wasmparser::UnpackedIndex,
     ) -> wasmtime_environ::EngineOrModuleTypeIndex {
-        wasmtime_environ::WasmparserTypeConverter::new(self.types, &self.translation.module)
-            .lookup_type_index(index)
+        wasmtime_environ::WasmparserTypeConverter::new(self.types, |idx| {
+            self.translation.module.types[idx]
+        })
+        .lookup_type_index(index)
     }
 }
 
@@ -415,34 +425,27 @@ impl<'a, 'data> TypeConverter<'a, 'data> {
     }
 }
 
-fn heap_style_and_offset_guard_size(plan: &MemoryPlan) -> (HeapStyle, u64) {
-    match plan {
-        MemoryPlan {
-            style: MemoryStyle::Static { byte_reservation },
-            offset_guard_size,
-            ..
-        } => (
+fn heap_style_and_offset_guard_size(memory: &Memory, tunables: &Tunables) -> (HeapStyle, u64) {
+    let (style, offset_guard_size) = MemoryStyle::for_memory(*memory, tunables);
+    match style {
+        MemoryStyle::Static { byte_reservation } => (
             HeapStyle::Static {
-                bound: *byte_reservation,
+                bound: byte_reservation,
             },
-            *offset_guard_size,
+            offset_guard_size,
         ),
 
-        MemoryPlan {
-            style: MemoryStyle::Dynamic { .. },
-            offset_guard_size,
-            ..
-        } => (HeapStyle::Dynamic, *offset_guard_size),
+        MemoryStyle::Dynamic { .. } => (HeapStyle::Dynamic, offset_guard_size),
     }
 }
 
-fn heap_limits(plan: &MemoryPlan) -> (u64, Option<u64>) {
+fn heap_limits(memory: &Memory) -> (u64, Option<u64>) {
     (
-        plan.memory.minimum_byte_size().unwrap_or_else(|_| {
+        memory.minimum_byte_size().unwrap_or_else(|_| {
             // 2^64 as a minimum doesn't fin in a 64 bit integer.
             // So in this case, the minimum is clamped to u64::MAX.
             u64::MAX
         }),
-        plan.memory.maximum_byte_size().ok(),
+        memory.maximum_byte_size().ok(),
     )
 }

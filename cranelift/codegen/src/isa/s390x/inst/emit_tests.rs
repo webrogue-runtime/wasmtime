@@ -2079,7 +2079,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9728056",
         "crte %r5, %r6",
@@ -2090,7 +2090,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9608056",
         "cgrte %r5, %r6",
@@ -2101,7 +2101,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9738056",
         "clrte %r5, %r6",
@@ -2112,7 +2112,7 @@ fn test_s390x_binemit() {
             rn: gpr(5),
             rm: gpr(6),
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "B9618056",
         "clgrte %r5, %r6",
@@ -2123,7 +2123,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: -32768,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7080008072",
         "cite %r7, -32768",
@@ -2134,7 +2134,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 32767,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC707FFF8072",
         "cite %r7, 32767",
@@ -2145,7 +2145,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: -32768,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7080008070",
         "cgite %r7, -32768",
@@ -2156,7 +2156,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 32767,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC707FFF8070",
         "cgite %r7, 32767",
@@ -2167,7 +2167,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 0,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7000008073",
         "clfite %r7, 0",
@@ -2178,7 +2178,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 65535,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC70FFFF8073",
         "clfite %r7, 65535",
@@ -2189,7 +2189,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 0,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC7000008071",
         "clgite %r7, 0",
@@ -2200,7 +2200,7 @@ fn test_s390x_binemit() {
             rn: gpr(7),
             imm: 65535,
             cond: Cond::from_mask(8),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "EC70FFFF8071",
         "clgite %r7, 65535",
@@ -6038,24 +6038,6 @@ fn test_s390x_binemit() {
     ));
 
     insns.push((
-        Inst::Mvc {
-            dst: MemArgPair {
-                base: gpr(2),
-                disp: UImm12::maybe_from_u64(0x345).unwrap(),
-                flags: MemFlags::trusted(),
-            },
-            src: MemArgPair {
-                base: gpr(8),
-                disp: UImm12::maybe_from_u64(0x9ab).unwrap(),
-                flags: MemFlags::trusted(),
-            },
-            len_minus_one: 255,
-        },
-        "D2FF234589AB",
-        "mvc 837(255,%r2), 2475(%r8)",
-    ));
-
-    insns.push((
         Inst::LoadMultiple64 {
             rt: writable_gpr(8),
             rt2: writable_gpr(12),
@@ -7007,7 +6989,7 @@ fn test_s390x_binemit() {
 
     insns.push((
         Inst::Trap {
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "0000",
         ".word 0x0000 # trap=stk_ovf",
@@ -7015,7 +6997,7 @@ fn test_s390x_binemit() {
     insns.push((
         Inst::TrapIf {
             cond: Cond::from_mask(1),
-            trap_code: TrapCode::StackOverflow,
+            trap_code: TrapCode::STACK_OVERFLOW,
         },
         "C01400000001",
         "jgo .+2 # trap=stk_ovf",
@@ -7048,6 +7030,15 @@ fn test_s390x_binemit() {
         },
         "1923C0D400000008BA456000C064FFFFFFFA",
         "0: cr %r2, %r3 ; jgnh 1f ; cs %r4, %r5, 0(%r6) ; jglh 0b ; 1:",
+    ));
+
+    insns.push((
+        Inst::StackProbeLoop {
+            probe_count: writable_gpr(1),
+            guard_size: 4096,
+        },
+        "A7FBF0009200F000A716FFFC",
+        "0: aghi %r15, -4096 ; mvi 0(%r15), 0 ; brct %r1, 0b",
     ));
 
     insns.push((

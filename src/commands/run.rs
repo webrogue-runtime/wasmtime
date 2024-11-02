@@ -23,12 +23,12 @@ use wasmtime_wasi_nn::wit::WasiNnView;
 #[cfg(feature = "wasi-threads")]
 use wasmtime_wasi_threads::WasiThreadsCtx;
 
+#[cfg(feature = "wasi-config")]
+use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 #[cfg(feature = "wasi-http")]
 use wasmtime_wasi_http::WasiHttpCtx;
 #[cfg(feature = "wasi-keyvalue")]
 use wasmtime_wasi_keyvalue::{WasiKeyValue, WasiKeyValueCtx, WasiKeyValueCtxBuilder};
-#[cfg(feature = "wasi-runtime-config")]
-use wasmtime_wasi_runtime_config::{WasiRuntimeConfig, WasiRuntimeConfigVariables};
 
 fn parse_preloads(s: &str) -> Result<(String, PathBuf)> {
     let parts: Vec<&str> = s.splitn(2, '=').collect();
@@ -230,11 +230,8 @@ impl RunCommand {
                 if store.data().preview1_ctx.is_some() {
                     return Err(wasi_common::maybe_exit_on_error(e));
                 } else if store.data().preview2_ctx.is_some() {
-                    if let Some(exit) = e
-                        .downcast_ref::<wasmtime_wasi::I32Exit>()
-                        .map(|c| c.process_exit_code())
-                    {
-                        std::process::exit(exit);
+                    if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                        std::process::exit(exit.0);
                     }
                     if e.is::<wasmtime::Trap>() {
                         eprintln!("Error: {e:?}");
@@ -652,7 +649,8 @@ impl RunCommand {
                 }
                 #[cfg(feature = "component-model")]
                 CliLinker::Component(linker) => {
-                    wasmtime_wasi::add_to_linker_async(linker)?;
+                    let link_options = self.run.compute_wasi_features();
+                    wasmtime_wasi::add_to_linker_with_options_async(linker, &link_options)?;
                     self.set_preview2_ctx(store)?;
                 }
             }
@@ -697,33 +695,33 @@ impl RunCommand {
             }
         }
 
-        if self.run.common.wasi.runtime_config == Some(true) {
-            #[cfg(not(feature = "wasi-runtime-config"))]
+        if self.run.common.wasi.config == Some(true) {
+            #[cfg(not(feature = "wasi-config"))]
             {
-                bail!("Cannot enable wasi-runtime-config when the binary is not compiled with this feature.");
+                bail!(
+                    "Cannot enable wasi-config when the binary is not compiled with this feature."
+                );
             }
-            #[cfg(all(feature = "wasi-runtime-config", feature = "component-model"))]
+            #[cfg(all(feature = "wasi-config", feature = "component-model"))]
             {
                 match linker {
                     CliLinker::Core(_) => {
-                        bail!("Cannot enable wasi-runtime-config for core wasm modules");
+                        bail!("Cannot enable wasi-config for core wasm modules");
                     }
                     CliLinker::Component(linker) => {
-                        let vars = WasiRuntimeConfigVariables::from_iter(
+                        let vars = WasiConfigVariables::from_iter(
                             self.run
                                 .common
                                 .wasi
-                                .runtime_config_var
+                                .config_var
                                 .iter()
                                 .map(|v| (v.key.clone(), v.value.clone())),
                         );
 
-                        wasmtime_wasi_runtime_config::add_to_linker(linker, |h| {
-                            WasiRuntimeConfig::new(
-                                Arc::get_mut(h.wasi_runtime_config.as_mut().unwrap()).unwrap(),
-                            )
+                        wasmtime_wasi_config::add_to_linker(linker, |h| {
+                            WasiConfig::new(Arc::get_mut(h.wasi_config.as_mut().unwrap()).unwrap())
                         })?;
-                        store.data_mut().wasi_runtime_config = Some(Arc::new(vars));
+                        store.data_mut().wasi_config = Some(Arc::new(vars));
                     }
                 }
             }
@@ -913,8 +911,8 @@ struct Host {
     #[cfg(feature = "profiling")]
     guest_profiler: Option<Arc<wasmtime::GuestProfiler>>,
 
-    #[cfg(feature = "wasi-runtime-config")]
-    wasi_runtime_config: Option<Arc<WasiRuntimeConfigVariables>>,
+    #[cfg(feature = "wasi-config")]
+    wasi_config: Option<Arc<WasiConfigVariables>>,
     #[cfg(feature = "wasi-keyvalue")]
     wasi_keyvalue: Option<Arc<WasiKeyValueCtx>>,
 }

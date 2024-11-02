@@ -15,6 +15,7 @@
 use super::*;
 use crate::ir::{MemFlags, UserExternalNameRef};
 use crate::isa::x64;
+use crate::isa::x64::lower::isle::generated_code::{Atomic128RmwSeqOp, AtomicRmwSeqOp};
 use alloc::vec::Vec;
 use cranelift_entity::EntityRef as _;
 
@@ -194,7 +195,7 @@ fn test_x64_emit() {
     let _w_rbp = Writable::<Reg>::from_reg(rbp);
     let w_r8 = Writable::<Reg>::from_reg(r8);
     let w_r9 = Writable::<Reg>::from_reg(r9);
-    let _w_r10 = Writable::<Reg>::from_reg(r10);
+    let w_r10 = Writable::<Reg>::from_reg(r10);
     let w_r11 = Writable::<Reg>::from_reg(r11);
     let w_r12 = Writable::<Reg>::from_reg(r12);
     let w_r13 = Writable::<Reg>::from_reg(r13);
@@ -1481,7 +1482,7 @@ fn test_x64_emit() {
             OperandSize::Size8,
             AluRmiROpcode::Xor,
             RegMemImm::imm(10),
-            _w_r10,
+            w_r10,
         ),
         "4180F20A",
         "xorb    %r10b, $10, %r10b",
@@ -1491,7 +1492,7 @@ fn test_x64_emit() {
             OperandSize::Size8,
             AluRmiROpcode::Xor,
             RegMemImm::reg(rcx),
-            _w_r10,
+            w_r10,
         ),
         "4130CA",
         "xorb    %r10b, %cl, %r10b",
@@ -1501,7 +1502,7 @@ fn test_x64_emit() {
             OperandSize::Size8,
             AluRmiROpcode::Xor,
             RegMemImm::reg(rsi),
-            _w_r10,
+            w_r10,
         ),
         "4130F2",
         "xorb    %r10b, %sil, %r10b",
@@ -1511,7 +1512,7 @@ fn test_x64_emit() {
             OperandSize::Size8,
             AluRmiROpcode::Xor,
             RegMemImm::reg(r11),
-            _w_r10,
+            w_r10,
         ),
         "4530DA",
         "xorb    %r10b, %r11b, %r10b",
@@ -1521,7 +1522,7 @@ fn test_x64_emit() {
             OperandSize::Size8,
             AluRmiROpcode::Xor,
             RegMemImm::reg(r15),
-            _w_r10,
+            w_r10,
         ),
         "4530FA",
         "xorb    %r10b, %r15b, %r10b",
@@ -1637,6 +1638,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Add,
             src1_dst: Amode::imm_reg(99, rdi).into(),
             src2: Gpr::unwrap_new(r12),
+            lock: false,
         },
         "44016763",
         "addl    %r12d, 99(%rdi)",
@@ -1649,6 +1651,7 @@ fn test_x64_emit() {
             src1_dst: Amode::imm_reg_reg_shift(0, Gpr::unwrap_new(rbp), Gpr::unwrap_new(rax), 3)
                 .into(),
             src2: Gpr::unwrap_new(rax),
+            lock: false,
         },
         "480144C500",
         "addq    %rax, 0(%rbp,%rax,8)",
@@ -1660,6 +1663,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Sub,
             src1_dst: Amode::imm_reg(0, rsp).into(),
             src2: Gpr::unwrap_new(rcx),
+            lock: false,
         },
         "290C24",
         "subl    %ecx, 0(%rsp)",
@@ -1671,6 +1675,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Sub,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(rax),
+            lock: false,
         },
         "48294500",
         "subq    %rax, 0(%rbp)",
@@ -1682,6 +1687,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::And,
             src1_dst: Amode::imm_reg(0, rsp).into(),
             src2: Gpr::unwrap_new(rcx),
+            lock: false,
         },
         "210C24",
         "andl    %ecx, 0(%rsp)",
@@ -1693,6 +1699,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::And,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(rax),
+            lock: false,
         },
         "48214500",
         "andq    %rax, 0(%rbp)",
@@ -1704,6 +1711,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Or,
             src1_dst: Amode::imm_reg(0, rsp).into(),
             src2: Gpr::unwrap_new(rcx),
+            lock: false,
         },
         "090C24",
         "orl     %ecx, 0(%rsp)",
@@ -1715,6 +1723,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Or,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(rax),
+            lock: false,
         },
         "48094500",
         "orq     %rax, 0(%rbp)",
@@ -1726,6 +1735,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Xor,
             src1_dst: Amode::imm_reg(0, rsp).into(),
             src2: Gpr::unwrap_new(rcx),
+            lock: false,
         },
         "310C24",
         "xorl    %ecx, 0(%rsp)",
@@ -1737,6 +1747,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Xor,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(rax),
+            lock: false,
         },
         "48314500",
         "xorq    %rax, 0(%rbp)",
@@ -1748,6 +1759,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Add,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(rax),
+            lock: false,
         },
         "66014500",
         "addw    %ax, 0(%rbp)",
@@ -1758,6 +1770,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Sub,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(r12),
+            lock: false,
         },
         "6644296500",
         "subw    %r12w, 0(%rbp)",
@@ -1769,6 +1782,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Add,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(rax),
+            lock: false,
         },
         "004500",
         "addb    %al, 0(%rbp)",
@@ -1779,6 +1793,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Sub,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(rbp),
+            lock: false,
         },
         "40286D00",
         "subb    %bpl, 0(%rbp)",
@@ -1789,6 +1804,7 @@ fn test_x64_emit() {
             op: AluRmiROpcode::Xor,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(r10),
+            lock: false,
         },
         "44305500",
         "xorb    %r10b, 0(%rbp)",
@@ -1799,9 +1815,55 @@ fn test_x64_emit() {
             op: AluRmiROpcode::And,
             src1_dst: Amode::imm_reg(0, rbp).into(),
             src2: Gpr::unwrap_new(r15),
+            lock: false,
         },
         "44207D00",
         "andb    %r15b, 0(%rbp)",
+    ));
+
+    insns.push((
+        Inst::AluRM {
+            size: OperandSize::Size64,
+            op: AluRmiROpcode::And,
+            src1_dst: Amode::imm_reg(0, rdx).into(),
+            src2: Gpr::unwrap_new(rax),
+            lock: true,
+        },
+        "F0482102",
+        "lock andq    %rax, 0(%rdx)",
+    ));
+    insns.push((
+        Inst::AluRM {
+            size: OperandSize::Size32,
+            op: AluRmiROpcode::Or,
+            src1_dst: Amode::imm_reg(0, rdx).into(),
+            src2: Gpr::unwrap_new(rax),
+            lock: true,
+        },
+        "F00902",
+        "lock orl     %eax, 0(%rdx)",
+    ));
+    insns.push((
+        Inst::AluRM {
+            size: OperandSize::Size16,
+            op: AluRmiROpcode::Xor,
+            src1_dst: Amode::imm_reg(0, rdx).into(),
+            src2: Gpr::unwrap_new(rax),
+            lock: true,
+        },
+        "66F03102",
+        "lock xorw    %ax, 0(%rdx)",
+    ));
+    insns.push((
+        Inst::AluRM {
+            size: OperandSize::Size8,
+            op: AluRmiROpcode::Add,
+            src1_dst: Amode::imm_reg(0, r9).into(),
+            src2: Gpr::unwrap_new(rax),
+            lock: true,
+        },
+        "F0410001",
+        "lock addb    %al, 0(%r9)",
     ));
 
     // ========================================================
@@ -1900,7 +1962,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size32,
             DivSignedness::Signed,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rsi()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1914,7 +1976,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size64,
             DivSignedness::Signed,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::r15()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1928,7 +1990,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size32,
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::r14()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1942,7 +2004,7 @@ fn test_x64_emit() {
         Inst::div(
             OperandSize::Size64,
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rdi()),
             Gpr::unwrap_new(regs::rax()),
             Gpr::unwrap_new(regs::rdx()),
@@ -1955,7 +2017,7 @@ fn test_x64_emit() {
     insns.push((
         Inst::div8(
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rax()),
             Gpr::unwrap_new(regs::rax()),
             WritableGpr::from_reg(Gpr::unwrap_new(regs::rax())),
@@ -1966,7 +2028,7 @@ fn test_x64_emit() {
     insns.push((
         Inst::div8(
             DivSignedness::Unsigned,
-            TrapCode::IntegerDivisionByZero,
+            TrapCode::INTEGER_DIVISION_BY_ZERO,
             RegMem::reg(regs::rsi()),
             Gpr::unwrap_new(regs::rax()),
             WritableGpr::from_reg(Gpr::unwrap_new(regs::rax())),
@@ -4984,66 +5046,233 @@ fn test_x64_emit() {
         "lock cmpxchgq %r10, -12345(%rcx,%rsi,8), expected=%rax, dst_old=%rax",
     ));
 
+    insns.push((
+        Inst::LockCmpxchg16b {
+            mem: Box::new(am2.clone()),
+            replacement_low: rbx,
+            replacement_high: rcx,
+            expected_low: rax,
+            expected_high: rdx,
+            dst_old_low: w_rax,
+            dst_old_high: w_rdx,
+        },
+        "F0480FC78CF1C7CFFFFF",
+        "lock cmpxchg16b -12345(%rcx,%rsi,8), replacement=%rcx:%rbx, expected=%rdx:%rax, dst_old=%rdx:%rax",
+    ));
+
+    // LockXadd
+    insns.push((
+        Inst::LockXadd {
+            size: OperandSize::Size64,
+            operand: r10,
+            mem: am3.clone(),
+            dst_old: w_r10,
+        },
+        "F04D0FC111",
+        "lock xaddq %r10, 0(%r9), dst_old=%r10",
+    ));
+    insns.push((
+        Inst::LockXadd {
+            size: OperandSize::Size32,
+            operand: r11,
+            mem: am3.clone(),
+            dst_old: w_r11,
+        },
+        "F0450FC119",
+        "lock xaddl %r11d, 0(%r9), dst_old=%r11d",
+    ));
+    insns.push((
+        Inst::LockXadd {
+            size: OperandSize::Size16,
+            operand: r12,
+            mem: am3.clone(),
+            dst_old: w_r12,
+        },
+        "66F0450FC121",
+        "lock xaddw %r12w, 0(%r9), dst_old=%r12w",
+    ));
+    insns.push((
+        Inst::LockXadd {
+            size: OperandSize::Size8,
+            operand: r13,
+            mem: am3.clone(),
+            dst_old: w_r13,
+        },
+        "F0450FC029",
+        "lock xaddb %r13b, 0(%r9), dst_old=%r13b",
+    ));
+
+    // Xchg
+    insns.push((
+        Inst::Xchg {
+            size: OperandSize::Size64,
+            operand: r10,
+            mem: am3.clone(),
+            dst_old: w_r10,
+        },
+        "4D8711",
+        "xchgq %r10, 0(%r9), dst_old=%r10",
+    ));
+    insns.push((
+        Inst::Xchg {
+            size: OperandSize::Size32,
+            operand: r11,
+            mem: am3.clone(),
+            dst_old: w_r11,
+        },
+        "458719",
+        "xchgl %r11d, 0(%r9), dst_old=%r11d",
+    ));
+    insns.push((
+        Inst::Xchg {
+            size: OperandSize::Size16,
+            operand: r12,
+            mem: am3.clone(),
+            dst_old: w_r12,
+        },
+        "66458721",
+        "xchgw %r12w, 0(%r9), dst_old=%r12w",
+    ));
+    insns.push((
+        Inst::Xchg {
+            size: OperandSize::Size8,
+            operand: r13,
+            mem: am3.clone(),
+            dst_old: w_r13,
+        },
+        "458629",
+        "xchgb %r13b, 0(%r9), dst_old=%r13b",
+    ));
+
     // AtomicRmwSeq
     insns.push((
         Inst::AtomicRmwSeq {
             ty: types::I8,
-            op: inst_common::MachAtomicRmwOp::Or,
+            op: AtomicRmwSeqOp::Or,
             mem: am3.clone(),
             operand: r10,
             temp: w_r11,
-            dst_old: w_rax
+            dst_old: w_rax,
         },
         "490FB6014989C34D09D3F0450FB0190F85EFFFFFFF",
-        "atomically { 8_bits_at_[%r9]) Or= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
+        "atomically { 8_bits_at_[%r9] Or= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }",
     ));
     insns.push((
         Inst::AtomicRmwSeq {
             ty: types::I16,
-            op: inst_common::MachAtomicRmwOp::And,
+            op: AtomicRmwSeqOp::And,
             mem: am3.clone(),
             operand: r10,
             temp: w_r11,
             dst_old: w_rax
         },
         "490FB7014989C34D21D366F0450FB1190F85EEFFFFFF",
-        "atomically { 16_bits_at_[%r9]) And= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
+        "atomically { 16_bits_at_[%r9] And= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
     ));
     insns.push((
         Inst::AtomicRmwSeq {
             ty: types::I32,
-            op: inst_common::MachAtomicRmwOp::Xchg,
+            op: AtomicRmwSeqOp::Nand,
             mem: am3.clone(),
             operand: r10,
             temp: w_r11,
             dst_old: w_rax
         },
-        "418B014989C34D89D3F0450FB1190F85EFFFFFFF",
-        "atomically { 32_bits_at_[%r9]) Xchg= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
+        "418B014989C34D21D349F7D3F0450FB1190F85ECFFFFFF",
+        "atomically { 32_bits_at_[%r9] Nand= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
     ));
     insns.push((
         Inst::AtomicRmwSeq {
             ty: types::I32,
-            op: inst_common::MachAtomicRmwOp::Umin,
+            op: AtomicRmwSeqOp::Umin,
             mem: am3.clone(),
             operand: r10,
             temp: w_r11,
             dst_old: w_rax
         },
         "418B014989C34539DA4D0F46DAF0450FB1190F85EBFFFFFF",
-        "atomically { 32_bits_at_[%r9]) Umin= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
+        "atomically { 32_bits_at_[%r9] Umin= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
     ));
     insns.push((
         Inst::AtomicRmwSeq {
             ty: types::I64,
-            op: inst_common::MachAtomicRmwOp::Add,
+            op: AtomicRmwSeqOp::Smax,
             mem: am3.clone(),
             operand: r10,
             temp: w_r11,
             dst_old: w_rax
         },
-        "498B014989C34D01D3F04D0FB1190F85EFFFFFFF",
-        "atomically { 64_bits_at_[%r9]) Add= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
+        "498B014989C34D39DA4D0F4DDAF04D0FB1190F85EBFFFFFF",
+        "atomically { 64_bits_at_[%r9] Smax= %r10; %rax = old_value_at_[%r9]; %r11, %rflags = trash }"
+    ));
+
+    // Atomic128RmwSeq
+    insns.push((
+        Inst::Atomic128RmwSeq {
+            op: Atomic128RmwSeqOp::Or,
+            mem: Box::new(am3.clone()),
+            operand_low: r10,
+            operand_high: r11,
+            temp_low: w_rbx,
+            temp_high: w_rcx,
+            dst_old_low: w_rax,
+            dst_old_high: w_rdx,
+        },
+        "498B01498B51084889C34889D14C09D34C09D9F0490FC7090F85E9FFFFFF",
+        "atomically { %rdx:%rax = 0(%r9); %rcx:%rbx = %rdx:%rax Or %r11:%r10; 0(%r9) = %rcx:%rbx }",
+    ));
+    insns.push((
+        Inst::Atomic128RmwSeq {
+            op: Atomic128RmwSeqOp::And,
+            mem: Box::new(am3.clone()),
+            operand_low: r10,
+            operand_high: r11,
+            temp_low: w_rbx,
+            temp_high: w_rcx,
+            dst_old_low: w_rax,
+            dst_old_high: w_rdx,
+        },
+        "498B01498B51084889C34889D14C21D34C21D9F0490FC7090F85E9FFFFFF",
+        "atomically { %rdx:%rax = 0(%r9); %rcx:%rbx = %rdx:%rax And %r11:%r10; 0(%r9) = %rcx:%rbx }"
+    ));
+    insns.push((
+        Inst::Atomic128RmwSeq {
+            op: Atomic128RmwSeqOp::Umin,
+            mem: Box::new(am3.clone()),
+            operand_low: r10,
+            operand_high: r11,
+            temp_low: w_rbx,
+            temp_high: w_rcx,
+            dst_old_low: w_rax,
+            dst_old_high: w_rdx,
+        },
+        "498B01498B51084889C34889D14C39D34C19D94889D1490F43DA490F43CBF0490FC7090F85DEFFFFFF",
+        "atomically { %rdx:%rax = 0(%r9); %rcx:%rbx = %rdx:%rax Umin %r11:%r10; 0(%r9) = %rcx:%rbx }"
+    ));
+    insns.push((
+        Inst::Atomic128RmwSeq {
+            op: Atomic128RmwSeqOp::Add,
+            mem: Box::new(am3.clone()),
+            operand_low: r10,
+            operand_high: r11,
+            temp_low: w_rbx,
+            temp_high: w_rcx,
+            dst_old_low: w_rax,
+            dst_old_high: w_rdx,
+        },
+        "498B01498B51084889C34889D14C01D34C11D9F0490FC7090F85E9FFFFFF",
+        "atomically { %rdx:%rax = 0(%r9); %rcx:%rbx = %rdx:%rax Add %r11:%r10; 0(%r9) = %rcx:%rbx }"
+    ));
+    insns.push((
+        Inst::Atomic128XchgSeq {
+            mem: am3.clone(),
+            operand_low: rbx,
+            operand_high: rcx,
+            dst_old_low: w_rax,
+            dst_old_high: w_rdx,
+        },
+        "498B01498B5108F0490FC7090F85F5FFFFFF",
+        "atomically { %rdx:%rax = 0(%r9); 0(%r9) = %rcx:%rbx }",
     ));
 
     // Fence
@@ -5074,8 +5303,8 @@ fn test_x64_emit() {
 
     insns.push((Inst::Hlt, "CC", "hlt"));
 
-    let trap_code = TrapCode::UnreachableCodeReached;
-    insns.push((Inst::Ud2 { trap_code }, "0F0B", "ud2 unreachable"));
+    let trap_code = TrapCode::INTEGER_OVERFLOW;
+    insns.push((Inst::Ud2 { trap_code }, "0F0B", "ud2 int_ovf"));
 
     insns.push((
         Inst::ElfTlsGetAddr {
@@ -5115,6 +5344,7 @@ fn test_x64_emit() {
 
     use crate::settings::Configurable;
     let mut isa_flag_builder = x64::settings::builder();
+    isa_flag_builder.enable("has_cmpxchg16b").unwrap();
     isa_flag_builder.enable("has_ssse3").unwrap();
     isa_flag_builder.enable("has_sse41").unwrap();
     isa_flag_builder.enable("has_fma").unwrap();

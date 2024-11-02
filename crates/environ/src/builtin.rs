@@ -70,18 +70,18 @@ macro_rules! foreach_builtin_function {
             // once it will no longer be used again. (Note: `val` is not of type
             // `reference` because it needn't appear in any stack maps, as it
             // must not be live after this call.)
-            #[cfg(feature = "gc")]
+            #[cfg(feature = "gc-drc")]
             drop_gc_ref(vmctx: vmctx, val: i32);
 
             // Do a GC, treating the optional `root` as a GC root and returning
             // the updated `root` (so that, in the case of moving collectors,
             // callers have a valid version of `root` again).
-            #[cfg(feature = "gc")]
+            #[cfg(feature = "gc-drc")]
             gc(vmctx: vmctx, root: reference) -> reference;
 
             // Allocate a new, uninitialized GC object and return a reference to
             // it.
-            #[cfg(feature = "gc")]
+            #[cfg(feature = "gc-drc")]
             gc_alloc_raw(
                 vmctx: vmctx,
                 kind: i32,
@@ -89,6 +89,104 @@ macro_rules! foreach_builtin_function {
                 size: i32,
                 align: i32
             ) -> reference;
+
+            // Intern a `funcref` into the GC heap, returning its
+            // `FuncRefTableId`.
+            //
+            // This libcall may not GC.
+            #[cfg(feature = "gc")]
+            intern_func_ref_for_gc_heap(
+                vmctx: vmctx,
+                func_ref: pointer
+            ) -> i32;
+
+            // Get the raw `VMFuncRef` pointer associated with a
+            // `FuncRefTableId` from an earlier `intern_func_ref_for_gc_heap`
+            // call.
+            //
+            // This libcall may not GC.
+            //
+            // Passes in the `ModuleInternedTypeIndex` of the funcref's expected
+            // type, or `ModuleInternedTypeIndex::reserved_value()` if we are
+            // getting the function reference as an untyped `funcref` rather
+            // than a typed `(ref $ty)`.
+            //
+            // TODO: We will want to eventually expose the table directly to
+            // Wasm code, so that it doesn't need to make a libcall to go from
+            // id to `VMFuncRef`. That will be a little tricky: it will also
+            // require updating the pointer to the slab in the `VMContext` (or
+            // `VMRuntimeLimits` or wherever we put it) when the slab is
+            // resized.
+            #[cfg(feature = "gc")]
+            get_interned_func_ref(
+                vmctx: vmctx,
+                func_ref_id: i32,
+                module_interned_type_index: i32
+            ) -> pointer;
+
+            // Builtin implementation of the `array.new_data` instruction.
+            #[cfg(feature = "gc")]
+            array_new_data(
+                vmctx: vmctx,
+                array_interned_type_index: i32,
+                data_index: i32,
+                data_offset: i32,
+                len: i32
+            ) -> reference;
+
+            // Builtin implementation of the `array.new_elem` instruction.
+            #[cfg(feature = "gc")]
+            array_new_elem(
+                vmctx: vmctx,
+                array_interned_type_index: i32,
+                elem_index: i32,
+                elem_offset: i32,
+                len: i32
+            ) -> reference;
+
+            // Builtin implementation of the `array.copy` instruction.
+            #[cfg(feature = "gc")]
+            array_copy(
+                vmctx: vmctx,
+                dst_array: reference,
+                dst_index: i32,
+                src_array: reference,
+                src_index: i32,
+                len: i32
+            );
+
+            // Builtin implementation of the `array.init_data` instruction.
+            #[cfg(feature = "gc")]
+            array_init_data(
+                vmctx: vmctx,
+                array_interned_type_index: i32,
+                array: reference,
+                dst_index: i32,
+                data_index: i32,
+                data_offset: i32,
+                len: i32
+            );
+
+            // Builtin implementation of the `array.init_elem` instruction.
+            #[cfg(feature = "gc")]
+            array_init_elem(
+                vmctx: vmctx,
+                array_interned_type_index: i32,
+                array: reference,
+                dst: i32,
+                elem_index: i32,
+                src: i32,
+                len: i32
+            );
+
+            // Returns whether `actual_engine_type` is a subtype of
+            // `expected_engine_type`.
+            #[cfg(feature = "gc")]
+            is_subtype(
+                vmctx: vmctx,
+                actual_engine_type: i32,
+                expected_engine_type: i32
+            ) -> i32;
 
             // Returns an index for Wasm's `table.grow` instruction for GC references.
             #[cfg(feature = "gc")]

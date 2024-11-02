@@ -2,8 +2,9 @@ use crate::prelude::*;
 use core::fmt::{self, Display, Write};
 use wasmtime_environ::{
     EngineOrModuleTypeIndex, EntityType, Global, IndexType, Limits, Memory, ModuleTypes, Table,
-    TypeTrace, VMSharedTypeIndex, WasmArrayType, WasmCompositeType, WasmFieldType, WasmFuncType,
-    WasmHeapType, WasmRefType, WasmStorageType, WasmStructType, WasmSubType, WasmValType,
+    TypeTrace, VMSharedTypeIndex, WasmArrayType, WasmCompositeInnerType, WasmCompositeType,
+    WasmFieldType, WasmFuncType, WasmHeapType, WasmRefType, WasmStorageType, WasmStructType,
+    WasmSubType, WasmValType,
 };
 
 use crate::{type_registry::RegisteredType, Engine};
@@ -81,7 +82,7 @@ impl Finality {
 #[derive(Clone, Hash)]
 pub enum ValType {
     // NB: the ordering of variants here is intended to match the ordering in
-    // `wasmtime_types::WasmType` to help improve codegen when converting.
+    // `wasmtime_environ::WasmType` to help improve codegen when converting.
     //
     /// Signed 32 bit integer.
     I32,
@@ -341,19 +342,6 @@ impl ValType {
             WasmValType::Ref(r) => Self::Ref(RefType::from_wasm_type(engine, r)),
         }
     }
-
-    /// What is the size (in bytes) of this type's values when they are stored
-    /// inside the GC heap?
-    pub(crate) fn byte_size_in_gc_heap(&self) -> u32 {
-        match self {
-            ValType::I32 => 4,
-            ValType::I64 => 8,
-            ValType::F32 => 4,
-            ValType::F64 => 8,
-            ValType::V128 => 16,
-            ValType::Ref(r) => r.byte_size_in_gc_heap(),
-        }
-    }
 }
 
 /// Opaque references to data in the Wasm heap or to host data.
@@ -527,26 +515,6 @@ impl RefType {
 
     pub(crate) fn is_vmgcref_type_and_points_to_object(&self) -> bool {
         self.heap_type().is_vmgcref_type_and_points_to_object()
-    }
-
-    /// What is the size (in bytes) of this type's values when they are stored
-    /// inside the GC heap?
-    pub(crate) fn byte_size_in_gc_heap(&self) -> u32 {
-        match &self.heap_type {
-            HeapType::Extern | HeapType::NoExtern => 4,
-
-            HeapType::Func | HeapType::ConcreteFunc(_) | HeapType::NoFunc => {
-                todo!("funcrefs in the gc heap aren't supported yet")
-            }
-            HeapType::Any
-            | HeapType::Eq
-            | HeapType::I31
-            | HeapType::Array
-            | HeapType::ConcreteArray(_)
-            | HeapType::Struct
-            | HeapType::ConcreteStruct(_)
-            | HeapType::None => 4,
-        }
     }
 }
 
@@ -1308,6 +1276,13 @@ impl From<ValType> for StorageType {
     }
 }
 
+impl From<RefType> for StorageType {
+    #[inline]
+    fn from(r: RefType) -> Self {
+        StorageType::ValType(r.into())
+    }
+}
+
 impl StorageType {
     /// Is this an `i8`?
     #[inline]
@@ -1390,16 +1365,6 @@ impl StorageType {
         a.matches(b) && b.matches(a)
     }
 
-    /// What is the size (in bytes) of this type's values when they are stored
-    /// inside the GC heap?
-    pub(crate) fn byte_size_in_gc_heap(&self) -> u32 {
-        match self {
-            StorageType::I8 => 1,
-            StorageType::I16 => 2,
-            StorageType::ValType(ty) => ty.byte_size_in_gc_heap(),
-        }
-    }
-
     pub(crate) fn comes_from_same_engine(&self, engine: &Engine) -> bool {
         match self {
             StorageType::I8 | StorageType::I16 => true,
@@ -1420,6 +1385,23 @@ impl StorageType {
             Self::I8 => WasmStorageType::I8,
             Self::I16 => WasmStorageType::I16,
             Self::ValType(v) => WasmStorageType::Val(v.to_wasm_type()),
+        }
+    }
+
+    /// The byte size of this type, if it has a defined size in the spec.
+    ///
+    /// See
+    /// https://webassembly.github.io/gc/core/syntax/types.html#bitwidth-fieldtype
+    /// and
+    /// https://webassembly.github.io/gc/core/syntax/types.html#bitwidth-valtype
+    pub(crate) fn data_byte_size(&self) -> Option<u32> {
+        match self {
+            StorageType::I8 => Some(1),
+            StorageType::I16 => Some(2),
+            StorageType::ValType(ValType::I32 | ValType::F32) => Some(4),
+            StorageType::ValType(ValType::I64 | ValType::F64) => Some(8),
+            StorageType::ValType(ValType::V128) => Some(16),
+            StorageType::ValType(ValType::Ref(_)) => None,
         }
     }
 }
@@ -1636,6 +1618,7 @@ impl StructType {
         Self::from_wasm_struct_type(
             engine,
             finality.is_final(),
+            false,
             supertype.map(|ty| ty.type_index().into()),
             WasmStructType { fields },
         )
@@ -1752,6 +1735,7 @@ impl StructType {
     pub(crate) fn from_wasm_struct_type(
         engine: &Engine,
         is_final: bool,
+        is_shared: bool,
         supertype: Option<EngineOrModuleTypeIndex>,
         ty: WasmStructType,
     ) -> Result<StructType> {
@@ -1769,7 +1753,10 @@ impl StructType {
             WasmSubType {
                 is_final,
                 supertype,
-                composite_type: WasmCompositeType::Struct(ty),
+                composite_type: WasmCompositeType {
+                    shared: is_shared,
+                    inner: WasmCompositeInnerType::Struct(ty),
+                },
             },
         );
         Ok(Self {
@@ -2013,7 +2000,10 @@ impl ArrayType {
             WasmSubType {
                 is_final,
                 supertype,
-                composite_type: WasmCompositeType::Array(ty),
+                composite_type: WasmCompositeType {
+                    shared: false,
+                    inner: WasmCompositeInnerType::Array(ty),
+                },
             },
         );
         Self {
@@ -2369,7 +2359,10 @@ impl FuncType {
             WasmSubType {
                 is_final,
                 supertype,
-                composite_type: WasmCompositeType::Func(ty),
+                composite_type: WasmCompositeType {
+                    shared: false,
+                    inner: WasmCompositeInnerType::Func(ty),
+                },
             },
         );
         Self {
@@ -2564,7 +2557,7 @@ impl TableType {
 /// # fn foo() -> wasmtime::Result<()> {
 /// use wasmtime::MemoryTypeBuilder;
 ///
-/// let memory_type = MemoryTypeBuilder::default()
+/// let memory_type = MemoryTypeBuilder::new()
 ///     // Set the minimum size, in pages.
 ///     .min(4096)
 ///     // Set the maximum size, in pages.
@@ -2594,6 +2587,21 @@ impl Default for MemoryTypeBuilder {
 }
 
 impl MemoryTypeBuilder {
+    /// Create a new builder for a [`MemoryType`] with the default settings.
+    ///
+    /// By default memory types have the following properties:
+    ///
+    /// * The minimum memory size is 0 pages.
+    /// * The maximum memory size is unspecified.
+    /// * Memories use 32-bit indexes.
+    /// * The page size is 64KiB.
+    ///
+    /// Each option can be configued through the methods on the returned
+    /// builder.
+    pub fn new() -> MemoryTypeBuilder {
+        MemoryTypeBuilder::default()
+    }
+
     fn validate(&self) -> Result<()> {
         if self
             .ty
@@ -2801,6 +2809,14 @@ impl MemoryType {
             .max(Some(maximum.into()))
             .build()
             .unwrap()
+    }
+
+    /// Creates a new [`MemoryTypeBuilder`] to configure all the various knobs
+    /// of the final memory type being created.
+    ///
+    /// This is a convenience function for [`MemoryTypeBuilder::new`].
+    pub fn builder() -> MemoryTypeBuilder {
+        MemoryTypeBuilder::new()
     }
 
     /// Returns whether this is a 64-bit memory or not.

@@ -23,6 +23,10 @@ impl SpecInterpreter {
         config.threads_enabled = false;
         config.bulk_memory_enabled = false;
         config.reference_types_enabled = false;
+        config.tail_call_enabled = false;
+        config.relaxed_simd_enabled = false;
+        config.custom_page_sizes_enabled = false;
+        config.wide_arithmetic_enabled = false;
 
         Self
     }
@@ -137,10 +141,15 @@ pub fn setup_ocaml_runtime() {
     wasm_spec_interpreter::setup_ocaml_runtime();
 }
 
-#[test]
-fn smoke() {
-    if !wasm_spec_interpreter::support_compiled_in() {
-        return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        if !wasm_spec_interpreter::support_compiled_in() {
+            return;
+        }
+        crate::oracles::engine::smoke_test_engine(|_, config| Ok(SpecInterpreter::new(config)))
     }
-    crate::oracles::engine::smoke_test_engine(|_, config| Ok(SpecInterpreter::new(config)))
 }

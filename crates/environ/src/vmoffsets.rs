@@ -28,10 +28,9 @@
 
 use crate::{
     DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, FuncRefIndex,
-    GlobalIndex, MemoryIndex, Module, TableIndex,
+    GlobalIndex, MemoryIndex, Module, OwnedMemoryIndex, TableIndex,
 };
 use cranelift_entity::packed_option::ReservedValue;
-use wasmtime_types::OwnedMemoryIndex;
 
 #[cfg(target_pointer_width = "32")]
 fn cast_to_u32(sz: usize) -> u32 {
@@ -173,8 +172,8 @@ pub trait PtrSize {
         self.vmruntime_limits_last_wasm_exit_fp() + self.size()
     }
 
-    /// Return the offset of the `last_wasm_entry_sp` field of `VMRuntimeLimits`.
-    fn vmruntime_limits_last_wasm_entry_sp(&self) -> u8 {
+    /// Return the offset of the `last_wasm_entry_fp` field of `VMRuntimeLimits`.
+    fn vmruntime_limits_last_wasm_entry_fp(&self) -> u8 {
         self.vmruntime_limits_last_wasm_exit_pc() + self.size()
     }
 
@@ -339,10 +338,10 @@ impl<P: PtrSize> VMOffsets<P> {
     /// Return a new `VMOffsets` instance, for a given pointer size.
     pub fn new(ptr: P, module: &Module) -> Self {
         let num_owned_memories = module
-            .memory_plans
+            .memories
             .iter()
             .skip(module.num_imported_memories)
-            .filter(|p| !p.1.memory.shared)
+            .filter(|p| !p.1.shared)
             .count()
             .try_into()
             .unwrap();
@@ -352,10 +351,8 @@ impl<P: PtrSize> VMOffsets<P> {
             num_imported_tables: cast_to_u32(module.num_imported_tables),
             num_imported_memories: cast_to_u32(module.num_imported_memories),
             num_imported_globals: cast_to_u32(module.num_imported_globals),
-            num_defined_tables: cast_to_u32(module.table_plans.len() - module.num_imported_tables),
-            num_defined_memories: cast_to_u32(
-                module.memory_plans.len() - module.num_imported_memories,
-            ),
+            num_defined_tables: cast_to_u32(module.num_defined_tables()),
+            num_defined_memories: cast_to_u32(module.num_defined_memories()),
             num_owned_memories,
             num_defined_globals: cast_to_u32(module.globals.len() - module.num_imported_globals),
             num_escaped_funcs: cast_to_u32(module.num_escaped_funcs),

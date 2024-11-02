@@ -9,7 +9,7 @@ use anyhow::Result;
 use arbitrary::{Arbitrary, Unstructured};
 use std::sync::Arc;
 use std::time::Duration;
-use wasmtime::{Engine, Module, Store};
+use wasmtime::{Engine, Module, MpkEnabled, Store};
 
 /// Configuration for `wasmtime::Config` and generated modules for a session of
 /// fuzzing.
@@ -78,6 +78,12 @@ impl Config {
             pooling.total_memories = config.max_memories as u32;
             pooling.max_memory_size = 10 << 16;
             pooling.max_memories_per_module = config.max_memories as u32;
+            if pooling.memory_protection_keys == MpkEnabled::Auto
+                && pooling.max_memory_protection_keys > 1
+            {
+                pooling.total_memories =
+                    pooling.total_memories * (pooling.max_memory_protection_keys as u32);
+            }
 
             pooling.total_tables = config.max_tables as u32;
             pooling.table_elements = 1_000;
@@ -168,6 +174,10 @@ impl Config {
             .wasm_tail_call(self.module_config.config.tail_call_enabled)
             .wasm_custom_page_sizes(self.module_config.config.custom_page_sizes_enabled)
             .wasm_threads(self.module_config.config.threads_enabled)
+            .wasm_function_references(self.module_config.config.gc_enabled)
+            .wasm_gc(self.module_config.config.gc_enabled)
+            .wasm_custom_page_sizes(self.module_config.config.custom_page_sizes_enabled)
+            .wasm_wide_arithmetic(self.module_config.config.wide_arithmetic_enabled)
             .native_unwind_info(cfg!(target_os = "windows") || self.wasmtime.native_unwind_info)
             .cranelift_nan_canonicalization(self.wasmtime.canonicalize_nans)
             .cranelift_opt_level(self.wasmtime.opt_level.to_wasmtime())
@@ -190,6 +200,7 @@ impl Config {
         let compiler_strategy = &self.wasmtime.compiler_strategy;
         let cranelift_strategy = *compiler_strategy == CompilerStrategy::Cranelift;
         cfg.strategy(self.wasmtime.compiler_strategy.to_wasmtime());
+        cfg.collector(self.wasmtime.collector.to_wasmtime());
 
         self.wasmtime.codegen.configure(&mut cfg);
 
@@ -256,8 +267,7 @@ impl Config {
             let memory_config = if pcc {
                 MemoryConfig::Normal(NormalMemoryConfig {
                     static_memory_maximum_size: Some(4 << 30), // 4 GiB
-                    static_memory_guard_size: Some(2 << 30),   // 2 GiB
-                    dynamic_memory_guard_size: Some(0),
+                    memory_guard_size: Some(2 << 30),          // 2 GiB
                     dynamic_memory_reserved_for_growth: Some(0),
                     guard_before_linear_memory: false,
                     memory_init_cow: true,
@@ -275,9 +285,8 @@ impl Config {
                 MemoryConfig::CustomUnaligned => {
                     cfg.with_host_memory(Arc::new(UnalignedMemoryCreator))
                         .static_memory_maximum_size(0)
-                        .dynamic_memory_guard_size(0)
+                        .memory_guard_size(0)
                         .dynamic_memory_reserved_for_growth(0)
-                        .static_memory_guard_size(0)
                         .guard_before_linear_memory(false)
                         .memory_init_cow(false);
                 }
@@ -419,6 +428,7 @@ pub struct WasmtimeConfig {
     native_unwind_info: bool,
     /// Configuration for the compiler to use.
     pub compiler_strategy: CompilerStrategy,
+    collector: Collector,
     table_lazy_init: bool,
 
     /// Whether or not fuzzing should enable PCC.
@@ -476,11 +486,14 @@ impl WasmtimeConfig {
             config.gc_enabled = false;
             config.threads_enabled = false;
             config.tail_call_enabled = false;
-            config.exceptions_enabled = false;
             config.reference_types_enabled = false;
 
-            // Winch requires host trap handlers to be enabled at this time.
+            // Tuning  the following engine options is currently not supported
+            // by Winch.
             self.signals_based_traps = true;
+            self.table_lazy_init = true;
+            self.epoch_interruption = false;
+            self.debug_info = false;
         }
 
         // If using the pooling allocator, constrain the memory and module configurations
@@ -625,5 +638,20 @@ impl Arbitrary<'_> for CompilerStrategy {
         // compiler features for things such as trampolines, so it's only used
         // on fuzz targets that don't need those trampolines.
         Ok(Self::Cranelift)
+    }
+}
+
+#[derive(Arbitrary, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Collector {
+    DeferredReferenceCounting,
+    Null,
+}
+
+impl Collector {
+    fn to_wasmtime(&self) -> wasmtime::Collector {
+        match self {
+            Collector::DeferredReferenceCounting => wasmtime::Collector::DeferredReferenceCounting,
+            Collector::Null => wasmtime::Collector::Null,
+        }
     }
 }
