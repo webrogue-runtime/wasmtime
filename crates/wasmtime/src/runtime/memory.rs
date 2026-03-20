@@ -969,17 +969,19 @@ impl SharedMemory {
     /// The optional `timeout` argument is the maximum amount of time to block
     /// the current thread. If not specified the thread may sleep indefinitely.
     ///
-    /// This function returns one of three possible values:
+    /// This function returns one of four possible values:
     ///
     /// * `WaitResult::Ok` - this function, loaded the value at `addr`, found
     ///   it was equal to `expected`, and then blocked (all as one atomic
     ///   operation). The thread was then awoken with a `memory.atomic.notify`
-    ///   instruction or the [`SharedMemory::atomic_notify`] method.
+    ///   instruction or the [`SharedMemory::atomic_notify`] instruction.
     /// * `WaitResult::Mismatch` - the value at `addr` was loaded but was not
     ///   equal to `expected` so the thread did not block and immediately
     ///   returned.
     /// * `WaitResult::TimedOut` - all the steps of `Ok` happened, except this
     ///   thread was woken up due to a timeout.
+    /// * `WaitResult::Interrupted` - the thread was woken up due to an epoch
+    ///   interruption.
     ///
     /// This function will not return due to spurious wakeups.
     ///

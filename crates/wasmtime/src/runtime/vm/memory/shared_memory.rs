@@ -22,11 +22,17 @@ use wasmtime_environ::Trap;
 #[derive(Clone)]
 pub struct SharedMemory(Arc<SharedMemoryInner>);
 
-struct SharedMemoryInner {
+pub(crate) struct SharedMemoryInner {
     memory: RwLock<LocalMemory>,
     spot: ParkingSpot,
     ty: wasmtime_environ::Memory,
     def: LongTermVMMemoryDefinition,
+}
+
+impl SharedMemoryInner {
+    pub fn interrupt_all_waits(&self) {
+        self.spot.notify_all_interrupted();
+    }
 }
 
 impl SharedMemory {
@@ -58,12 +64,14 @@ impl SharedMemory {
         if !ty.shared {
             bail!("shared memory must have a `shared` memory type");
         }
-        Ok(Self(Arc::new(SharedMemoryInner {
+        let inner = Arc::new(SharedMemoryInner {
             ty: *ty,
             spot: ParkingSpot::default(),
             def: LongTermVMMemoryDefinition(memory.vmmemory()),
             memory: RwLock::new(memory),
-        })))
+        });
+        engine.register_shared_memory(&inner);
+        Ok(Self(inner))
     }
 
     /// Return the memory type for this [`SharedMemory`].
@@ -122,6 +130,11 @@ impl SharedMemory {
         log::trace!("memory.atomic.notify(addr={addr_index:#x}, count={count})");
         let ptr = unsafe { &*ptr };
         Ok(self.0.spot.notify(ptr, count))
+    }
+
+    /// Notify all threads that are blocked on the given address, with interrupted result.
+    pub fn interrupt_all_waits(&self) {
+        self.0.interrupt_all_waits();
     }
 
     /// Implementation of `memory.atomic.wait32` for this shared memory.

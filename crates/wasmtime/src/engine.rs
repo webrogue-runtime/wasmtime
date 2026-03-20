@@ -64,6 +64,10 @@ struct EngineInner {
     #[cfg(all(feature = "runtime", target_has_atomic = "64"))]
     epoch: AtomicU64,
 
+    #[cfg(all(feature = "runtime", feature = "threads"))]
+    shared_memories:
+        crate::sync::Mutex<Vec<alloc::sync::Weak<crate::runtime::vm::SharedMemoryInner>>>,
+
     /// One-time check of whether the compiler's settings, if present, are
     /// compatible with the native host.
     compatible_with_native_host: crate::sync::OnceLock<Result<(), String>>,
@@ -158,6 +162,8 @@ impl Engine {
                 signatures: TypeRegistry::new(),
                 #[cfg(all(feature = "runtime", target_has_atomic = "64"))]
                 epoch: AtomicU64::new(0),
+                #[cfg(all(feature = "runtime", feature = "threads"))]
+                shared_memories: crate::sync::Mutex::new(Vec::new()),
                 compatible_with_native_host: Default::default(),
                 config,
                 tunables,
@@ -846,9 +852,39 @@ impl Engine {
     /// This method is signal-safe: it does not make any syscalls, and
     /// performs only an atomic increment to the epoch value in
     /// memory.
+    ///
+    /// Note that if both the `runtime` and `threads` features are enabled
+    /// then this method is no longer signal-safe because it will acquire
+    /// a lock to notify all shared memories that the epoch has changed.
     #[cfg(target_has_atomic = "64")]
     pub fn increment_epoch(&self) {
         self.inner.epoch.fetch_add(1, Ordering::Relaxed);
+        #[cfg(all(feature = "runtime", feature = "threads"))]
+        self.interrupt_all_waits();
+    }
+
+    #[cfg(all(feature = "runtime", feature = "threads"))]
+    pub(crate) fn register_shared_memory(
+        &self,
+        memory: &Arc<crate::runtime::vm::SharedMemoryInner>,
+    ) {
+        self.inner
+            .shared_memories
+            .lock()
+            .push(Arc::downgrade(memory));
+    }
+
+    #[cfg(all(feature = "runtime", feature = "threads"))]
+    pub(crate) fn interrupt_all_waits(&self) {
+        let mut memories = self.inner.shared_memories.lock();
+        memories.retain(|m| {
+            if let Some(m) = m.upgrade() {
+                m.interrupt_all_waits();
+                true
+            } else {
+                false
+            }
+        });
     }
 
     /// Returns a [`std::hash::Hash`] that can be used to check precompiled WebAssembly compatibility.

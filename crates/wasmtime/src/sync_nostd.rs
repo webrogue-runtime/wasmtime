@@ -221,6 +221,64 @@ impl<T> Drop for RwLockWriteGuard<'_, T> {
     }
 }
 
+#[derive(Debug)]
+pub struct Mutex<T> {
+    val: UnsafeCell<T>,
+    lock: raw::Mutex,
+}
+
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send + Sync> Sync for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    pub const fn new(val: T) -> Mutex<T> {
+        Mutex {
+            val: UnsafeCell::new(val),
+            lock: raw::Mutex::new(),
+        }
+    }
+
+    pub fn lock(&self) -> impl DerefMut<Target = T> + '_ {
+        self.lock.lock();
+        MutexGuard { lock: self }
+    }
+}
+
+impl<T: Default> Default for Mutex<T> {
+    fn default() -> Mutex<T> {
+        Mutex::new(T::default())
+    }
+}
+
+struct MutexGuard<'a, T> {
+    lock: &'a Mutex<T>,
+}
+
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: We hold the lock
+        unsafe { &*self.lock.val.get() }
+    }
+}
+
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: We hold the lock
+        unsafe { &mut *self.lock.val.get() }
+    }
+}
+
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: We hold the lock
+        unsafe {
+            self.lock.lock.unlock();
+        }
+    }
+}
+
 #[cfg(not(has_custom_sync))]
 use panic_on_contention as raw;
 #[cfg(not(has_custom_sync))]

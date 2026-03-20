@@ -56,3 +56,19 @@ impl<T> RwLock<T> {
         self.0.write().unwrap()
     }
 }
+
+/// Small wrapper around `std::sync::Mutex` which undoes poisoning.
+#[derive(Debug, Default)]
+pub struct Mutex<T>(std::sync::Mutex<T>);
+
+impl<T> Mutex<T> {
+    #[inline]
+    pub const fn new(val: T) -> Mutex<T> {
+        Mutex(std::sync::Mutex::new(val))
+    }
+
+    #[inline]
+    pub fn lock(&self) -> impl DerefMut<Target = T> + '_ {
+        self.0.lock().unwrap()
+    }
+}

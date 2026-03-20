@@ -68,7 +68,7 @@ use crate::runtime::vm::{
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
-use core::time::Duration;
+use std::time::{Duration, Instant};
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
     DataIndex, DefinedMemoryIndex, DefinedTableIndex, ElemIndex, FuncIndex, MemoryIndex,
@@ -1251,13 +1251,23 @@ fn memory_atomic_wait32(
     addr_index: u64,
     expected: u32,
     timeout: u64,
-) -> Result<u32, Trap> {
-    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
+) -> Result<u32> {
+    let timeout_duration = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
+    let deadline = timeout_duration.map(|d| Instant::now() + d);
     let memory = DefinedMemoryIndex::from_u32(memory_index);
-    Ok(store
-        .instance_mut(instance)
-        .get_defined_memory_mut(memory)
-        .atomic_wait32(addr_index, expected, timeout)? as u32)
+    loop {
+        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let result = store
+            .instance_mut(instance)
+            .get_defined_memory_mut(memory)
+            .atomic_wait32(addr_index, expected, timeout)?;
+        if result == vm::WaitResult::Interrupted {
+            #[cfg(target_has_atomic = "64")]
+            new_epoch(store, instance)?;
+            continue;
+        }
+        return Ok(result as u32);
+    }
 }
 
 // Implementation of `memory.atomic.wait64` for locally defined memories.
@@ -1269,13 +1279,23 @@ fn memory_atomic_wait64(
     addr_index: u64,
     expected: u64,
     timeout: u64,
-) -> Result<u32, Trap> {
-    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
+) -> Result<u32> {
+    let timeout_duration = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
+    let deadline = timeout_duration.map(|d| Instant::now() + d);
     let memory = DefinedMemoryIndex::from_u32(memory_index);
-    Ok(store
-        .instance_mut(instance)
-        .get_defined_memory_mut(memory)
-        .atomic_wait64(addr_index, expected, timeout)? as u32)
+    loop {
+        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        let result = store
+            .instance_mut(instance)
+            .get_defined_memory_mut(memory)
+            .atomic_wait64(addr_index, expected, timeout)?;
+        if result == vm::WaitResult::Interrupted {
+            #[cfg(target_has_atomic = "64")]
+            new_epoch(store, instance)?;
+            continue;
+        }
+        return Ok(result as u32);
+    }
 }
 
 // Hook for when an instance runs out of fuel.

@@ -105,6 +105,8 @@ use self::static_::StaticMemory;
 mod shared_memory;
 #[cfg(feature = "threads")]
 pub use shared_memory::SharedMemory;
+#[cfg(feature = "threads")]
+pub(crate) use shared_memory::SharedMemoryInner;
 
 #[cfg(not(feature = "threads"))]
 mod shared_memory_disabled;
