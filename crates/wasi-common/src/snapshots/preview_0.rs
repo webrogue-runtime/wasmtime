@@ -6,8 +6,11 @@ use crate::sched::{
 use crate::snapshots::preview_1::types as snapshot1_types;
 use crate::snapshots::preview_1::wasi_snapshot_preview1::WasiSnapshotPreview1 as Snapshot1;
 use crate::{EnvError, ErrorExt, WasiCtx};
+#[cfg(feature = "use_cap_std")]
 use cap_std::time::Duration;
 use std::collections::HashSet;
+#[cfg(not(feature = "use_cap_std"))]
+use std::time::Duration;
 use wiggle::{GuestMemory, GuestPtr};
 
 wiggle::from_witx!({

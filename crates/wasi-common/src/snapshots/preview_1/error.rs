@@ -64,6 +64,11 @@ impl ErrorExt for Error {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn from_raw_os_error(err: Option<i32>) -> Option<Error> {
+    None
+}
+
 #[cfg(unix)]
 fn from_raw_os_error(err: Option<i32>) -> Option<Error> {
     use rustix::io::Errno as RustixErrno;

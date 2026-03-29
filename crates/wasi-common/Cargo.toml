@@ -19,7 +19,7 @@ workspace = true
 thiserror = { workspace = true }
 wiggle = { workspace = true }
 tracing = { workspace = true }
-cap-std = { workspace = true }
+cap-std = { workspace = true, optional = true }
 cap-rand = { workspace = true }
 bitflags = { workspace = true }
 log = { workspace = true }
@@ -85,13 +85,16 @@ sync = [
     "dep:fs-set-times",
     "dep:system-interface",
     "dep:io-lifetimes",
+    "use_cap_std",
 ]
 tokio = [
     "sync",
     "wasmtime/async",
     "wiggle/wasmtime_async",
     "dep:tokio",
+    "use_cap_std",
 ]
+use_cap_std = ["dep:cap-std"]
 exit = [ "wasmtime", "dep:libc" ]
 
 [package.metadata.docs.rs]

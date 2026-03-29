@@ -2,7 +2,10 @@ use crate::Error;
 use crate::clocks::WasiMonotonicClock;
 use crate::file::WasiFile;
 use bitflags::bitflags;
+#[cfg(feature = "use_cap_std")]
 use cap_std::time::{Duration, Instant};
+#[cfg(not(feature = "use_cap_std"))]
+use std::time::{Duration, Instant};
 
 bitflags! {
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
