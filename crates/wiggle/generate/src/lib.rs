@@ -6,6 +6,7 @@ mod module_trait;
 pub mod names;
 mod types;
 pub mod wasmtime;
+pub mod web;
 
 use heck::ToShoutySnakeCase;
 use lifetimes::anon_lifetime;

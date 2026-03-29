@@ -213,3 +213,24 @@ pub fn wasmtime_integration(args: TokenStream) -> TokenStream {
     });
     quote!( #(#modules)* ).into()
 }
+
+#[proc_macro]
+pub fn web_integration(args: TokenStream) -> TokenStream {
+    let config = parse_macro_input!(args as wiggle_generate::WasmtimeConfig);
+    let doc = config.c.load_document();
+
+    let settings = wiggle_generate::CodegenSettings::new(
+        &config.c.errors,
+        &config.c.async_,
+        &doc,
+        false,
+        &config.c.tracing,
+        config.c.mutable,
+    )
+    .expect("validating codegen settings");
+
+    let modules = doc
+        .modules()
+        .map(|module| wiggle_generate::web::link_module(&module, Some(&config.target), &settings));
+    quote!( #(#modules)* ).into()
+}
