@@ -10,6 +10,7 @@ pub use wiggle_macro::from_witx;
 
 pub use wasmtime_environ::error;
 pub use wiggle_macro::wasmtime_integration;
+pub use wiggle_macro::web_integration;
 
 pub use bitflags;
 
@@ -43,6 +44,13 @@ pub mod wasmtime_crate {
 pub enum GuestMemory<'a> {
     Unshared(&'a mut [u8]),
     Shared(&'a [UnsafeCell<u8>]),
+    Dynamic(Box<dyn DynamicGuestMemory>),
+}
+
+pub trait DynamicGuestMemory {
+    fn size(&self) -> usize;
+    fn write(&mut self, offset: u32, data: &[u8]);
+    fn read(&self, offset: u32, data: &mut [u8]);
 }
 
 // manual impls are needed because of the `UnsafeCell` in the `Shared` branch
@@ -100,6 +108,7 @@ impl<'a> GuestMemory<'a> {
                 None => unreachable!(),
             },
             GuestMemory::Shared(_) => Ok(Cow::Owned(self.to_vec(ptr)?)),
+            GuestMemory::Dynamic(_) => Ok(Cow::Owned(self.to_vec(ptr)?)),
         }
     }
 
@@ -133,6 +142,7 @@ impl<'a> GuestMemory<'a> {
         match self {
             GuestMemory::Unshared(slice) => Ok(Some(&slice[range])),
             GuestMemory::Shared(_) => Ok(None),
+            GuestMemory::Dynamic(_) => Ok(None),
         }
     }
 
@@ -154,6 +164,7 @@ impl<'a> GuestMemory<'a> {
         match self {
             GuestMemory::Unshared(slice) => Ok(Some(&mut slice[range])),
             GuestMemory::Shared(_) => Ok(None),
+            GuestMemory::Dynamic(_) => Ok(None),
         }
     }
 
@@ -165,6 +176,15 @@ impl<'a> GuestMemory<'a> {
     where
         T: GuestTypeTransparent + Copy,
     {
+        if let GuestMemory::Dynamic(d) = self {
+            let mut host = Vec::<T>::with_capacity(ptr.pointer.1 as usize);
+            let byte_len = ptr.pointer.1 as usize * std::mem::size_of::<T>();
+            unsafe { host.set_len(ptr.pointer.1 as usize) };
+            d.read(ptr.pointer.0, unsafe {
+                std::slice::from_raw_parts_mut(host.as_mut_ptr().cast::<u8>(), byte_len)
+            });
+            return Ok(host);
+        };
         let guest = self.validate_size_align::<T>(ptr.pointer.0, ptr.pointer.1)?;
         let mut host = Vec::with_capacity(guest.len());
 
@@ -205,6 +225,16 @@ impl<'a> GuestMemory<'a> {
             return Err(GuestError::SliceLengthsDiffer);
         }
         if slice.is_empty() {
+            return Ok(());
+        }
+        if let GuestMemory::Dynamic(d) = self {
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts(
+                    slice.as_ptr() as *const u8,
+                    slice.len() * std::mem::size_of::<T>(),
+                )
+            };
+            d.write(ptr.offset().0, byte_slice);
             return Ok(());
         }
 
@@ -251,6 +281,7 @@ impl<'a> GuestMemory<'a> {
                 unsafe { &*(s as *const [u8] as *const [UnsafeCell<u8>]) }
             }
             GuestMemory::Shared(s) => s,
+            GuestMemory::Dynamic(_) => todo!(),
         };
         let memory = &cells[range.clone()];
 
@@ -289,6 +320,7 @@ impl<'a> GuestMemory<'a> {
         let oob = match self {
             GuestMemory::Unshared(b) => b.get(range.clone()).is_none(),
             GuestMemory::Shared(b) => b.get(range.clone()).is_none(),
+            GuestMemory::Dynamic(d) => (offset + len as usize) >= d.size(), // TODO check
         };
         if oob {
             Err(GuestError::PtrOutOfBounds(region))
@@ -302,6 +334,7 @@ impl<'a> GuestMemory<'a> {
         match self {
             GuestMemory::Shared(_) => true,
             GuestMemory::Unshared(_) => false,
+            GuestMemory::Dynamic(_) => true, // ?
         }
     }
 }

@@ -74,6 +74,11 @@ macro_rules! integer_primitives {
                 // indicating that the memory is valid, and next safety checks
                 // are required to access it.
                 let offset = ptr.offset();
+                if let GuestMemory::Dynamic(d) = mem {
+                    let mut bytes = [0u8; std::mem::size_of::<$ty>()];
+                    d.read(ptr.offset(), &mut bytes);
+                    return Ok($ty::from_le_bytes(bytes));
+                }
                 let host_ptr = mem.validate_size_align::<Self>(offset, 1)?;
 
                 // If the accessed memory is shared, we need to load the bytes
@@ -97,6 +102,12 @@ macro_rules! integer_primitives {
                 // See `read` above for various checks here.
                 let val = val.to_le();
                 let offset = ptr.offset();
+                if let GuestMemory::Dynamic(d) = mem {
+                    // let range = mem.validate_range::<Self>(offset, 1)?;
+                    let bytes = val.to_le_bytes();
+                    d.write(offset, &bytes);
+                    return Ok(())
+                }
                 let host_ptr = mem.validate_size_align::<Self>(offset, 1)?;
                 let host_ptr = &host_ptr[0];
                 let atomic_value_ref: &$ty_atomic =
