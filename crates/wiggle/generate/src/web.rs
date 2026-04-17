@@ -124,8 +124,8 @@ fn generate_func(
 
     match asyncness {
         Asyncness::Async => {
-            let arg_decls = quote! { ( #(#arg_names,)* ) : ( #(#arg_tys,)* ) };
             todo!();
+            // let arg_decls = quote! { ( #(#arg_names,)* ) : ( #(#arg_tys,)* ) };
             // quote! {
             //     linker.func_wrap_async(
             //         #module_str,
