@@ -7,15 +7,14 @@ use crate::component::types;
 use crate::component::{
     Component, ComponentNamedList, Instance, InstancePre, Lift, Lower, ResourceType, Val,
 };
-use crate::hash_map::HashMap;
 use crate::prelude::*;
 use crate::{AsContextMut, Engine, Module, StoreContextMut};
 use alloc::sync::Arc;
 use core::marker;
 #[cfg(feature = "component-model-async")]
 use core::pin::Pin;
-use wasmtime_environ::PrimaryMap;
-use wasmtime_environ::component::{NameMap, NameMapIntern};
+use wasmtime_environ::component::NameMap;
+use wasmtime_environ::{Atom, PrimaryMap, StringPool};
 
 /// A type used to instantiate [`Component`]s.
 ///
@@ -60,9 +59,9 @@ use wasmtime_environ::component::{NameMap, NameMapIntern};
 /// be instantiated.
 pub struct Linker<T: 'static> {
     engine: Engine,
-    strings: Strings,
-    map: NameMap<usize, Definition>,
-    path: Vec<usize>,
+    strings: StringPool,
+    map: NameMap<Atom, Definition>,
+    path: Vec<Atom>,
     allow_shadowing: bool,
     _marker: marker::PhantomData<fn() -> T>,
 }
@@ -71,19 +70,13 @@ impl<T: 'static> Clone for Linker<T> {
     fn clone(&self) -> Linker<T> {
         Linker {
             engine: self.engine.clone(),
-            strings: self.strings.clone(),
-            map: self.map.clone(),
+            strings: self.strings.clone_panic_on_oom(),
+            map: self.map.clone_panic_on_oom(),
             path: self.path.clone(),
             allow_shadowing: self.allow_shadowing,
             _marker: self._marker,
         }
     }
-}
-
-#[derive(Clone, Default)]
-pub struct Strings {
-    string2idx: HashMap<Arc<str>, usize>,
-    strings: Vec<Arc<str>>,
 }
 
 /// Structure representing an "instance" being defined within a linker.
@@ -93,20 +86,31 @@ pub struct Strings {
 /// internally.
 pub struct LinkerInstance<'a, T: 'static> {
     engine: &'a Engine,
-    path: &'a mut Vec<usize>,
+    path: &'a mut Vec<Atom>,
     path_len: usize,
-    strings: &'a mut Strings,
-    map: &'a mut NameMap<usize, Definition>,
+    strings: &'a mut StringPool,
+    map: &'a mut NameMap<Atom, Definition>,
     allow_shadowing: bool,
     _marker: marker::PhantomData<fn() -> T>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum Definition {
-    Instance(NameMap<usize, Definition>),
+    Instance(NameMap<Atom, Definition>),
     Func(Arc<HostFunc>),
     Module(Module),
     Resource(ResourceType, Arc<crate::func::HostFunc>),
+}
+
+impl TryClone for Definition {
+    fn try_clone(&self) -> Result<Self, OutOfMemory> {
+        Ok(match self {
+            Self::Instance(i) => Self::Instance(i.try_clone()?),
+            Self::Func(f) => Self::Func(f.try_clone()?),
+            Self::Module(m) => Self::Module(m.clone()),
+            Self::Resource(r, f) => Self::Resource(*r, f.try_clone()?),
+        })
+    }
 }
 
 impl<T: 'static> Linker<T> {
@@ -115,7 +119,7 @@ impl<T: 'static> Linker<T> {
     pub fn new(engine: &Engine) -> Linker<T> {
         Linker {
             engine: engine.clone(),
-            strings: Strings::default(),
+            strings: StringPool::default(),
             map: NameMap::default(),
             allow_shadowing: false,
             path: Vec::new(),
@@ -165,7 +169,7 @@ impl<T: 'static> Linker<T> {
             engine: &self.engine,
             types: component.types(),
             strings: &self.strings,
-            imported_resources: Default::default(),
+            imported_resources: try_new::<Arc<_>>(TryPrimaryMap::new())?,
         };
 
         // Walk over the component's list of import names and use that to lookup
@@ -188,7 +192,7 @@ impl<T: 'static> Linker<T> {
             component.ty(),
             &InstanceType {
                 types: cx.types,
-                resources: &cx.imported_resources,
+                resources: Some(&cx.imported_resources),
             },
         ))
     }
@@ -255,7 +259,11 @@ impl<T: 'static> Linker<T> {
             assert_eq!(i, idx);
         }
         Ok(unsafe {
-            InstancePre::new_unchecked(component.clone(), Arc::new(imports), imported_resources)
+            InstancePre::new_unchecked(
+                component.clone(),
+                try_new::<Arc<_>>(imports)?,
+                imported_resources,
+            )
         })
     }
 
@@ -329,9 +337,20 @@ impl<T: 'static> Linker<T> {
 
             match item_def {
                 TypeDef::ComponentFunc(_) => {
-                    let fully_qualified_name = parent_instance
-                        .map(|parent| format!("{parent}#{item_name}"))
-                        .unwrap_or_else(|| item_name.to_owned());
+                    let fully_qualified_name = match parent_instance {
+                        Some(parent) => {
+                            let mut s = TryString::new();
+                            s.push_str(parent)?;
+                            s.push('#')?;
+                            s.push_str(item_name)?;
+                            s
+                        }
+                        None => {
+                            let mut s = TryString::new();
+                            s.push_str(item_name)?;
+                            s
+                        }
+                    };
                     linker.func_new(&item_name, move |_, _, _, _| {
                         bail!("unknown import: `{fully_qualified_name}` has not been defined")
                     })?;
@@ -422,7 +441,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
         Params: ComponentNamedList + Lift + 'static,
         Return: ComponentNamedList + Lower + 'static,
     {
-        self.insert(name, Definition::Func(HostFunc::func_wrap(func)))?;
+        self.insert(name, Definition::Func(HostFunc::func_wrap(func)?))?;
         Ok(())
     }
 
@@ -469,7 +488,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
         Params: ComponentNamedList + Lift + 'static,
         Return: ComponentNamedList + Lower + 'static,
     {
-        self.insert(name, Definition::Func(HostFunc::func_wrap_async(f)))?;
+        self.insert(name, Definition::Func(HostFunc::func_wrap_async(f)?))?;
         Ok(())
     }
 
@@ -534,7 +553,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
         if !self.engine.tunables().concurrency_support {
             bail!("concurrent host functions require `Config::concurrency_support`");
         }
-        self.insert(name, Definition::Func(HostFunc::func_wrap_concurrent(f)))?;
+        self.insert(name, Definition::Func(HostFunc::func_wrap_concurrent(f)?))?;
         Ok(())
     }
 
@@ -645,7 +664,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
         + Sync
         + 'static,
     ) -> Result<()> {
-        self.insert(name, Definition::Func(HostFunc::func_new(func)))?;
+        self.insert(name, Definition::Func(HostFunc::func_new(func)?))?;
         Ok(())
     }
 
@@ -668,7 +687,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
             + Sync
             + 'static,
     {
-        self.insert(name, Definition::Func(HostFunc::func_new_async(func)))?;
+        self.insert(name, Definition::Func(HostFunc::func_new_async(func)?))?;
         Ok(())
     }
 
@@ -696,7 +715,7 @@ impl<T: 'static> LinkerInstance<'_, T> {
         if !self.engine.tunables().concurrency_support {
             bail!("concurrent host functions require `Config::concurrency_support`");
         }
-        self.insert(name, Definition::Func(HostFunc::func_new_concurrent(f)))?;
+        self.insert(name, Definition::Func(HostFunc::func_new_concurrent(f)?))?;
         Ok(())
     }
 
@@ -738,10 +757,10 @@ impl<T: 'static> LinkerInstance<'_, T> {
         ty: ResourceType,
         dtor: impl Fn(StoreContextMut<'_, T>, u32) -> Result<()> + Send + Sync + 'static,
     ) -> Result<()> {
-        let dtor = Arc::new(crate::func::HostFunc::wrap(
+        let dtor = try_new::<Arc<_>>(crate::func::HostFunc::wrap(
             &self.engine,
             move |mut cx: crate::Caller<'_, T>, (param,): (u32,)| dtor(cx.as_context_mut(), param),
-        )?);
+        )?)?;
         self.insert(name, Definition::Resource(ty, dtor))?;
         Ok(())
     }
@@ -756,10 +775,10 @@ impl<T: 'static> LinkerInstance<'_, T> {
             + Sync
             + 'static,
     {
-        let dtor = Arc::new(crate::func::HostFunc::wrap_async(
+        let dtor = try_new::<Arc<_>>(crate::func::HostFunc::wrap_async(
             &self.engine,
             move |cx: crate::Caller<'_, T>, (param,): (u32,)| dtor(cx.into(), param),
-        )?);
+        )?)?;
         self.insert(name, Definition::Resource(ty, dtor))?;
         Ok(())
     }
@@ -825,31 +844,12 @@ impl<T: 'static> LinkerInstance<'_, T> {
         Ok(self)
     }
 
-    fn insert(&mut self, name: &str, item: Definition) -> Result<usize> {
+    fn insert(&mut self, name: &str, item: Definition) -> Result<Atom> {
         self.map
             .insert(name, self.strings, self.allow_shadowing, item)
     }
 
     fn get(&self, name: &str) -> Option<&Definition> {
         self.map.get(name, self.strings)
-    }
-}
-
-impl NameMapIntern for Strings {
-    type Key = usize;
-
-    fn intern(&mut self, string: &str) -> usize {
-        if let Some(idx) = self.string2idx.get(string) {
-            return *idx;
-        }
-        let string: Arc<str> = string.into();
-        let idx = self.strings.len();
-        self.strings.push(string.clone());
-        self.string2idx.insert(string, idx);
-        idx
-    }
-
-    fn lookup(&self, string: &str) -> Option<usize> {
-        self.string2idx.get(string).cloned()
     }
 }

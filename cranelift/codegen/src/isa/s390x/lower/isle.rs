@@ -106,7 +106,7 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
     }
 
     // Adjust the stack before performing a tail call.  The actual stack
-    // adjustment is defered to the call instruction itself, but we create
+    // adjustment is deferred to the call instruction itself, but we create
     // a temporary backchain copy in the proper place here, if necessary
     // for unwinding.
     fn abi_emit_return_call_adjust_stack(&mut self, abi: Sig) -> Unit {
@@ -545,6 +545,12 @@ impl generated_code::Context for IsleContext<'_, '_, MInst, S390xBackend> {
     fn uimm16shifted_from_value(&mut self, val: Value) -> Option<UImm16Shifted> {
         let constant = self.u64_from_value(val)?;
         UImm16Shifted::maybe_from_u64(constant)
+    }
+
+    #[inline]
+    fn simm20_from_value(&mut self, val: Value) -> Option<SImm20> {
+        let constant = self.u64_from_signed_value(val)? as i64;
+        SImm20::maybe_from_i64(constant)
     }
 
     #[inline]

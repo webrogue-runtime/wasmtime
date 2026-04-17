@@ -30,8 +30,6 @@ use wasmtime_wasi_keyvalue::{WasiKeyValue, WasiKeyValueCtx, WasiKeyValueCtxBuild
 use wasmtime_wasi_nn::wit::WasiNnView;
 #[cfg(feature = "wasi-threads")]
 use wasmtime_wasi_threads::WasiThreadsCtx;
-#[cfg(feature = "wasi-tls")]
-use wasmtime_wasi_tls::{WasiTls, WasiTlsCtx};
 
 fn parse_preloads(s: &str) -> Result<(String, PathBuf)> {
     let parts: Vec<&str> = s.splitn(2, '=').collect();
@@ -65,6 +63,14 @@ pub struct RunCommand {
     #[arg(long)]
     pub argv0: Option<String>,
 
+    /// Override the module bytes loaded from disk. When set, the
+    /// first positional argument is ignored for loading purposes and
+    /// these bytes are used instead. This is not a CLI option; it is
+    /// used internally to inject pre-built bytes (e.g. for an
+    /// included debug adapter).
+    #[arg(skip)]
+    pub module_bytes: Option<&'static [u8]>,
+
     /// The WebAssembly module to run and arguments to pass to it.
     ///
     /// Arguments passed to the wasm module will be configured as WASI CLI
@@ -82,7 +88,7 @@ impl RunCommand {
     /// the debugger component environment.
     ///
     /// This also adjusts the guest options as needed to enable
-    /// debugging (e.g., implictly set `-D guest-debug=y`).
+    /// debugging (e.g., implicitly set `-D guest-debug=y`).
     #[cfg(feature = "debug")]
     pub(crate) fn debugger_run(&mut self) -> Result<Option<RunCommand>> {
         fn set_implicit_option(
@@ -100,6 +106,31 @@ impl RunCommand {
             *setting = Some(value);
             Ok(())
         }
+
+        // When -g is specified, set up the debugger path and args from
+        // the built-in gdbstub component.
+        #[cfg(feature = "gdbstub")]
+        let override_bytes = if let Some(addr) = self.run.gdbstub.as_deref() {
+            if self.run.common.debug.debugger.is_some() {
+                bail!("-g/--gdb cannot be combined with -Ddebugger=");
+            }
+            // Accept either a bare port number or a full address:port.
+            let addr = if addr.parse::<u16>().is_ok() {
+                format!("127.0.0.1:{addr}")
+            } else {
+                use std::net::SocketAddr;
+                addr.parse::<SocketAddr>()
+                    .with_context(|| format!("invalid gdbstub address: `{addr}`"))?;
+                addr.to_string()
+            };
+            self.run.common.debug.debugger = Some("<built-in gdbstub>".into());
+            self.run.common.debug.arg.push(addr);
+            Some(gdbstub_component_artifact::GDBSTUB_COMPONENT)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "gdbstub"))]
+        let override_bytes = None;
 
         if let Some(debugger_component_path) = self.run.common.debug.debugger.as_ref() {
             set_implicit_option(
@@ -120,6 +151,7 @@ impl RunCommand {
                     .into_iter()
                     .chain(self.run.common.debug.arg.iter().map(OsString::from)),
             )?;
+            debugger_run.module_bytes = override_bytes;
 
             // Explicitly permit TCP sockets for the debugger-main
             // environment, if not already set.
@@ -208,17 +240,21 @@ impl RunCommand {
             let debug_run = self.debugger_run()?;
 
             let engine = self.new_engine()?;
-            let main = self
-                .run
-                .load_module(&engine, self.module_and_args[0].as_ref())?;
+            let main = self.run.load_module(
+                &engine,
+                self.module_and_args[0].as_ref(),
+                self.module_bytes.as_ref().map(|v| &v[..]),
+            )?;
             let (mut store, mut linker) = self.new_store_and_linker(&engine, &main)?;
 
             #[cfg(feature = "debug")]
             if let Some(mut debug_run) = debug_run {
                 let debug_engine = debug_run.new_engine()?;
-                let debug_main = debug_run
-                    .run
-                    .load_module(&debug_engine, debug_run.module_and_args[0].as_ref())?;
+                let debug_main = debug_run.run.load_module(
+                    &debug_engine,
+                    debug_run.module_and_args[0].as_ref(),
+                    debug_run.module_bytes.as_ref().map(|v| &v[..]),
+                )?;
                 let (mut debug_store, debug_linker) =
                     debug_run.new_store_and_linker(&debug_engine, &debug_main)?;
 
@@ -233,6 +269,20 @@ impl RunCommand {
                     CliLinker::Component(l) => l,
                 };
                 debug_run.add_debugger_api(&mut debug_linker)?;
+
+                // Pre-register the main module on the debuggee store
+                // so that `debug_all_modules()` returns it before any
+                // Wasm executes. This lets the debugger see modules
+                // and set breakpoints at the initial stop.
+                match &main {
+                    RunTarget::Core(m) => {
+                        store.debug_register_module(m)?;
+                    }
+                    #[cfg(feature = "component-model")]
+                    RunTarget::Component(c) => {
+                        store.debug_register_component(c)?;
+                    }
+                }
 
                 debug_run
                     .invoke_debugger(
@@ -346,7 +396,10 @@ impl RunCommand {
     }
 
     #[cfg(feature = "debug")]
-    fn add_debugger_api(&mut self, linker: &mut wasmtime::component::Linker<Host>) -> Result<()> {
+    pub(crate) fn add_debugger_api(
+        &mut self,
+        linker: &mut wasmtime::component::Linker<Host>,
+    ) -> Result<()> {
         wasmtime_debugger::add_to_linker(linker, |x| x.ctx().table)?;
         Ok(())
     }
@@ -378,7 +431,7 @@ impl RunCommand {
             // Load the preload wasm modules.
             for (name, path) in self.preloads.modules.iter() {
                 // Read the wasm module binary either as `*.wat` or a raw binary
-                let preload_target = self.run.load_module(&engine, path)?;
+                let preload_target = self.run.load_module(&engine, path, None)?;
                 let preload_module = match preload_target {
                     RunTarget::Core(m) => m,
                     #[cfg(feature = "component-model")]
@@ -460,7 +513,7 @@ impl RunCommand {
         Ok(instance)
     }
 
-    fn compute_argv(&self) -> Result<Vec<String>> {
+    pub(crate) fn compute_argv(&self) -> Result<Vec<String>> {
         let mut result = Vec::new();
 
         for (i, arg) in self.module_and_args.iter().enumerate() {
@@ -848,10 +901,15 @@ impl RunCommand {
         }
     }
 
+    /// Invoke a debugger component with a debuggee.
+    ///
+    /// The debugger runs in `store` (using run's `Host`), while the
+    /// debuggee wraps an arbitrary store type `T` and body closure.
     #[cfg(feature = "debug")]
-    async fn invoke_debugger<
+    pub(crate) async fn invoke_debugger<
+        T: Send + 'static,
         F: for<'a> FnOnce(
-                &'a mut Store<Host>,
+                &'a mut Store<T>,
             ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>
             + Send
             + 'static,
@@ -860,7 +918,7 @@ impl RunCommand {
         store: &mut Store<Host>,
         component: &wasmtime::component::Component,
         linker: &mut wasmtime::component::Linker<Host>,
-        debuggee_host: Store<Host>,
+        debuggee_host: Store<T>,
         body: F,
     ) -> Result<()> {
         let instance = linker.instantiate_async(&mut *store, component).await?;
@@ -1265,16 +1323,14 @@ impl RunCommand {
                         bail!("Cannot enable wasi-tls for core wasm modules");
                     }
                     CliLinker::Component(linker) => {
-                        let mut opts = wasmtime_wasi_tls::LinkOptions::default();
+                        let mut opts = wasmtime_wasi_tls::p2::LinkOptions::default();
                         opts.tls(true);
-                        wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h| {
-                            let ctx = h.wasip1_ctx.as_mut().expect("wasi is not configured");
-                            let ctx = Arc::get_mut(ctx).unwrap().get_mut().unwrap();
-                            WasiTls::new(
-                                Arc::get_mut(h.wasi_tls.as_mut().unwrap()).unwrap(),
-                                ctx.ctx().table,
-                            )
-                        })?;
+                        wasmtime_wasi_tls::p2::add_to_linker(linker, &opts)?;
+
+                        #[cfg(feature = "component-model-async")]
+                        if self.run.common.wasi.p3.unwrap_or(crate::common::P3_DEFAULT) {
+                            wasmtime_wasi_tls::p3::add_to_linker(linker)?;
+                        }
 
                         let ctx = wasmtime_wasi_tls::WasiTlsCtxBuilder::new().build();
                         store.data_mut().wasi_tls = Some(Arc::new(ctx));
@@ -1445,7 +1501,7 @@ pub struct Host {
     #[cfg(feature = "wasi-keyvalue")]
     wasi_keyvalue: Option<Arc<WasiKeyValueCtx>>,
     #[cfg(feature = "wasi-tls")]
-    wasi_tls: Option<Arc<WasiTlsCtx>>,
+    wasi_tls: Option<Arc<wasmtime_wasi_tls::WasiTlsCtx>>,
 }
 
 impl Host {
@@ -1490,6 +1546,16 @@ impl wasmtime_wasi_http::p3::WasiHttpView for Host {
             table: WasiView::ctx(unwrap_singlethread_context(&mut self.wasip1_ctx)).table,
             ctx,
             hooks: &mut self.wasi_http_hooks,
+        }
+    }
+}
+
+#[cfg(all(feature = "wasi-tls"))]
+impl wasmtime_wasi_tls::WasiTlsView for Host {
+    fn tls(&mut self) -> wasmtime_wasi_tls::WasiTlsCtxView<'_> {
+        wasmtime_wasi_tls::WasiTlsCtxView {
+            table: WasiView::ctx(unwrap_singlethread_context(&mut self.wasip1_ctx)).table,
+            ctx: Arc::get_mut(self.wasi_tls.as_mut().unwrap()).unwrap(),
         }
     }
 }

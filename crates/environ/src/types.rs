@@ -1,6 +1,6 @@
 use crate::{
-    PanicOnOom as _, Tunables, WasmResult, collections::TryCow, error::OutOfMemory, prelude::*,
-    wasm_unsupported,
+    MemoryTunables, PanicOnOom as _, Tunables, WasmResult, collections::TryCow, error::OutOfMemory,
+    prelude::*, wasm_unsupported,
 };
 use alloc::boxed::Box;
 use core::{fmt, ops::Range};
@@ -1692,10 +1692,18 @@ impl Default for VMSharedTypeIndex {
 pub struct DataIndex(u32);
 entity_impl_with_try_clone!(DataIndex);
 
-/// Index type of a passive element segment inside the WebAssembly module.
+/// Index type of an element segment inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct ElemIndex(u32);
 entity_impl_with_try_clone!(ElemIndex);
+
+/// Dense index space of the subset of element segments that are passive.
+///
+/// Not a spec-level concept, just used to get dense index spaces for passive
+/// element segments inside of Wasmtime.
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct PassiveElemIndex(u32);
+entity_impl_with_try_clone!(PassiveElemIndex);
 
 /// Index type of a defined tag inside the WebAssembly module.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
@@ -2258,26 +2266,30 @@ impl Memory {
     /// Returns whether this memory is a candidate for bounds check elision
     /// given the configuration and host page size.
     ///
-    /// This function determines whether the given compilation configuration and
-    /// hos enables possible bounds check elision for this memory. Bounds checks
+    /// This function determines whether the given compilation configuration
+    /// enables possible bounds check elision for this memory. Bounds checks
     /// can only be elided if [`Memory::can_use_virtual_memory`] returns `true`
     /// for example but there are additionally requirements on the index size of
-    /// this memory and the memory reservation in `tunables`.
+    /// this memory and the memory reservation in the tunables.
     ///
     /// Currently the only case that supports bounds check elision is when all
     /// of these apply:
     ///
     /// * When [`Memory::can_use_virtual_memory`] returns `true`.
     /// * This is a 32-bit linear memory (e.g. not 64-bit)
-    /// * `tunables.memory_reservation` is in excess of 4GiB
+    /// * The reservation + guard size is in excess of 4GiB
     ///
     /// In this situation all computable addresses fall within the reserved
     /// space (modulo static offsets factoring in guard pages) so bounds checks
     /// may be elidable.
-    pub fn can_elide_bounds_check(&self, tunables: &Tunables, host_page_size_log2: u8) -> bool {
-        self.can_use_virtual_memory(tunables, host_page_size_log2)
+    pub fn can_elide_bounds_check(
+        &self,
+        memory_tunables: &MemoryTunables<'_>,
+        host_page_size_log2: u8,
+    ) -> bool {
+        self.can_use_virtual_memory(memory_tunables.tunables(), host_page_size_log2)
             && self.idx_type == IndexType::I32
-            && tunables.memory_reservation + tunables.memory_guard_size >= (1 << 32)
+            && memory_tunables.reservation() + memory_tunables.guard_size() >= (1 << 32)
     }
 
     /// Returns the static size of this heap in bytes at runtime, if available.
@@ -2295,7 +2307,7 @@ impl Memory {
     /// When this function returns `false` then it means that after the initial
     /// allocation the base pointer is constant for the entire lifetime of a
     /// memory. This can enable compiler optimizations, for example.
-    pub fn memory_may_move(&self, tunables: &Tunables) -> bool {
+    pub fn memory_may_move(&self, memory_tunables: &MemoryTunables<'_>) -> bool {
         // Shared memories cannot ever relocate their base pointer so the
         // settings configured in the engine must be appropriate for them ahead
         // of time.
@@ -2305,7 +2317,7 @@ impl Memory {
 
         // If movement is disallowed in engine configuration, then the answer is
         // "no".
-        if !tunables.memory_may_move {
+        if !memory_tunables.may_move() {
             return false;
         }
 
@@ -2318,7 +2330,37 @@ impl Memory {
         // If the maximum size of this memory is above the threshold of the
         // initial memory reservation then the memory may move.
         let max = self.maximum_byte_size().unwrap_or(u64::MAX);
-        max > tunables.memory_reservation
+        max > memory_tunables.reservation()
+    }
+
+    /// Tests whether this memory type is allowed to grow up to `size` bytes.
+    ///
+    /// This is only applicable to custom-page-size memories which have a page
+    /// size of a single byte. In that situation growth beyond `-1i32 as u32`
+    /// bytes is not allowed because at that point memory growth succeeding and
+    /// failing would be indistinguishable in the return value of `memory.grow`,
+    /// for example. To handle this 32-bit memories are only allowed to grow to
+    /// `-2i32 as u32`, for example, and 64-bit memories with a page size of 1
+    /// are allowed to grow up to the maximum size.
+    pub fn allow_growth_to(&self, size: usize) -> bool {
+        if self.page_size_log2 != 0 {
+            return true;
+        }
+        match self.idx_type {
+            // For a 32-bit memory using 1-byte pages the last 2 bytes of the
+            // 32-bit address space are addressable but disallowed for now.  A
+            // memory that is 4GiB in size cannot report its size via
+            // `memory.size`, and a memory that is 4GiB-1 bytes in size cannot
+            // be distinguished when 1 byte is added from an allocation
+            // failure.  To handle this the memory is capped at 4GiB-2 which
+            // means that all memory-related instructions and such will have
+            // unambiguous return codes.
+            IndexType::I32 => size < 0xffff_ffff,
+
+            // Assume that for a 64-bit memory using 1-byte pages it's going to
+            // exhaust system resources before a limit is actually reached.
+            IndexType::I64 => true,
+        }
     }
 }
 

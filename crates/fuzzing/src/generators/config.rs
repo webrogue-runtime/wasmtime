@@ -3,6 +3,7 @@
 use super::{AsyncConfig, CodegenSettings, InstanceAllocationStrategy, MemoryConfig, ModuleConfig};
 use crate::oracles::{StoreLimits, Timeout};
 use arbitrary::{Arbitrary, Unstructured};
+use std::num::NonZeroU32;
 use std::time::Duration;
 use wasmtime::Result;
 use wasmtime::{Enabled, Engine, Module, Store};
@@ -122,6 +123,7 @@ impl Config {
     /// to execute all tests.
     pub fn make_wast_test_compliant(&mut self, test: &WastTest) -> WastConfig {
         let wasmtime_test_util::wast::TestConfig {
+            bulk_memory,
             memory64,
             custom_page_sizes,
             multi_memory,
@@ -150,7 +152,7 @@ impl Config {
             hogs_memory: _,
             nan_canonicalization: _,
             gc_types: _,
-            stack_switching: _,
+            stack_switching,
             spec_test: _,
         } = test.config;
 
@@ -170,11 +172,12 @@ impl Config {
         self.module_config.component_model_map = component_model_map.unwrap_or(false);
         self.module_config.component_model_fixed_length_lists =
             component_model_fixed_length_lists.unwrap_or(false);
+        self.module_config.stack_switching = stack_switching.unwrap_or(false);
 
         // Enable/disable proposals that wasm-smith has knobs for which will be
         // read when creating `wasmtime::Config`.
         let config = &mut self.module_config.config;
-        config.bulk_memory_enabled = true;
+        config.bulk_memory_enabled = bulk_memory.unwrap_or(false);
         config.multi_value_enabled = true;
         config.wide_arithmetic_enabled = wide_arithmetic.unwrap_or(false);
         config.memory64_enabled = memory64.unwrap_or(false);
@@ -239,6 +242,11 @@ impl Config {
             pooling.total_stacks = pooling.total_stacks.max(limits::TOTAL_STACKS);
         }
 
+        // Re-enforce internal consistency after all the adjustments above
+        // (e.g. memory_reservation may have been bumped without a
+        // corresponding bump to gc_heap_reservation).
+        self.wasmtime.make_internally_consistent();
+
         // Return the test configuration that this fuzz configuration represents
         // which is used afterwards to test if the `test` here is expected to
         // fail or not.
@@ -284,8 +292,12 @@ impl Config {
             16 << 20,
             self.wasmtime.memory_guaranteed_dense_image_size,
         ));
+        cfg.opts.gc_zeal_alloc_counter = self
+            .wasmtime
+            .gc_zeal_alloc_counter
+            .map(|c| c.clamp(NonZeroU32::new(1).unwrap(), NonZeroU32::new(1024).unwrap()));
         cfg.wasm.async_stack_zeroing = Some(self.wasmtime.async_stack_zeroing);
-        cfg.wasm.bulk_memory = Some(true);
+        cfg.wasm.bulk_memory = Some(self.module_config.config.bulk_memory_enabled);
         cfg.wasm.component_model_async = Some(self.module_config.component_model_async);
         cfg.wasm.component_model_async_builtins =
             Some(self.module_config.component_model_async_builtins);
@@ -316,6 +328,7 @@ impl Config {
             Some(self.module_config.config.shared_everything_threads_enabled);
         cfg.wasm.wide_arithmetic = Some(self.module_config.config.wide_arithmetic_enabled);
         cfg.wasm.exceptions = Some(self.module_config.config.exceptions_enabled);
+        cfg.wasm.stack_switching = Some(self.module_config.stack_switching);
         cfg.wasm.shared_memory = Some(self.module_config.shared_memory);
         if !self.module_config.config.simd_enabled {
             cfg.wasm.relaxed_simd = Some(false);
@@ -331,14 +344,12 @@ impl Config {
 
         self.wasmtime.codegen.configure(&mut cfg);
 
-        // Determine whether we will actually enable PCC -- this is
-        // disabled if the module requires memory64, which is not yet
-        // compatible (due to the need for dynamic checks).
-        let pcc = cfg!(feature = "fuzz-pcc")
-            && self.wasmtime.pcc
-            && !self.module_config.config.memory64_enabled;
-
         cfg.codegen.inlining = self.wasmtime.inlining;
+
+        // If the wasm-smith-generated module use nan canonicalization then we
+        // don't need to enable it, but if it doesn't enable it already then we
+        // enable this codegen option.
+        cfg.wasm.nan_canonicalization = Some(!self.module_config.config.canonicalize_nans);
 
         // Only set cranelift specific flags when the Cranelift strategy is
         // chosen.
@@ -364,11 +375,6 @@ impl Config {
                 ));
             }
 
-            // If the wasm-smith-generated module use nan canonicalization then we
-            // don't need to enable it, but if it doesn't enable it already then we
-            // enable this codegen option.
-            cfg.wasm.nan_canonicalization = Some(!self.module_config.config.canonicalize_nans);
-
             // Enabling the verifier will at-least-double compilation time, which
             // with a 20-30x slowdown in fuzzing can cause issues related to
             // timeouts. If generated modules can have more than a small handful of
@@ -392,8 +398,6 @@ impl Config {
                 ));
             }
 
-            cfg.codegen.pcc = Some(pcc);
-
             // Eager init is currently only supported on Cranelift, not Winch.
             cfg.opts.table_lazy_init = Some(self.wasmtime.table_lazy_init);
         }
@@ -411,42 +415,41 @@ impl Config {
         //   `CustomUnaligned` variant isn't actually safe to use with a shared
         //   memory.
         if !self.module_config.config.threads_enabled {
-            // If PCC is enabled, force other options to be compatible: PCC is currently only
-            // supported when bounds checks are elided.
-            let memory_config = if pcc {
-                MemoryConfig {
-                    memory_reservation: Some(4 << 30), // 4 GiB
-                    memory_guard_size: Some(2 << 30),  // 2 GiB
-                    memory_reservation_for_growth: Some(0),
-                    guard_before_linear_memory: false,
-                    memory_init_cow: true,
-                    // Doesn't matter, only using virtual memory.
-                    cranelift_enable_heap_access_spectre_mitigations: None,
-                }
-            } else {
-                self.wasmtime.memory_config.clone()
-            };
-
+            let memory_config = self.wasmtime.memory_config.clone();
             memory_config.configure(&mut cfg);
         };
 
-        // If malloc-based memory is going to be used, which requires these four
-        // options set to specific values (and Pulley auto-sets two of them)
-        // then be sure to cap `memory_reservation_for_growth` at a smaller
-        // value than the default. For malloc-based memory reservation beyond
-        // the end of memory isn't captured by `StoreLimiter` so we need to be
-        // sure it's small enough to not blow OOM limits while fuzzing.
-        if ((cfg.opts.signals_based_traps == Some(true) && cfg.opts.memory_guard_size == Some(0))
-            || self.wasmtime.compiler_strategy == CompilerStrategy::CraneliftPulley)
-            && cfg.opts.memory_reservation == Some(0)
-            && cfg.opts.memory_init_cow == Some(false)
-        {
-            let growth = &mut cfg.opts.memory_reservation_for_growth;
-            let max = 1 << 20;
-            *growth = match *growth {
-                Some(n) => Some(n.min(max)),
-                None => Some(max),
-            };
+        // If malloc-based memory is going to be used, which requires these
+        // options set to specific values (and Pulley auto-sets some of them)
+        // then be sure to cap `memory_reservation_for_growth` and
+        // `gc_heap_reservation_for_growth` at a smaller value than the
+        // default. For malloc-based memory/heaps, reservation beyond the end
+        // isn't captured by `StoreLimiter` so we need to be sure it's small
+        // enough to not blow OOM limits while fuzzing.
+        let is_pulley = self.wasmtime.compiler_strategy == CompilerStrategy::CraneliftPulley;
+        let signals_traps = cfg.opts.signals_based_traps == Some(true);
+        if signals_traps || is_pulley {
+            if ((signals_traps && cfg.opts.memory_guard_size == Some(0)) || is_pulley)
+                && cfg.opts.memory_reservation == Some(0)
+                && cfg.opts.memory_init_cow == Some(false)
+            {
+                let growth = &mut cfg.opts.memory_reservation_for_growth;
+                let max = 1 << 20;
+                *growth = match *growth {
+                    Some(n) => Some(n.min(max)),
+                    None => Some(max),
+                };
+            }
+            if ((signals_traps && cfg.opts.gc_heap_guard_size == Some(0)) || is_pulley)
+                && cfg.opts.gc_heap_reservation == Some(0)
+            {
+                let growth = &mut cfg.opts.gc_heap_reservation_for_growth;
+                let max = 1 << 20;
+                *growth = match *growth {
+                    Some(n) => Some(n.min(max)),
+                    None => Some(max),
+                };
+            }
         }
 
         log::debug!("creating wasmtime config with CLI options:\n{cfg}");
@@ -618,10 +621,8 @@ pub struct WasmtimeConfig {
     /// Configuration for the compiler to use.
     pub compiler_strategy: CompilerStrategy,
     collector: Collector,
+    gc_zeal_alloc_counter: Option<NonZeroU32>,
     table_lazy_init: bool,
-
-    /// Whether or not fuzzing should enable PCC.
-    pcc: bool,
 
     /// Configuration for whether wasm is invoked in an async fashion and how
     /// it's cooperatively time-sliced.
@@ -691,6 +692,7 @@ impl WasmtimeConfig {
                 config.config.reference_types_enabled = false;
                 config.config.exceptions_enabled = false;
                 config.function_references_enabled = false;
+                config.stack_switching = false;
 
                 // Winch's SIMD implementations require AVX and AVX2.
                 if self
@@ -822,7 +824,19 @@ impl WasmtimeConfig {
     /// be considered a "TODO" to go implement more stuff in Wasmtime to accept
     /// these sorts of configurations. For now though it's intended to reflect
     /// the current state of the engine's development.
-    fn make_internally_consistent(&mut self) {
+    pub(crate) fn make_internally_consistent(&mut self) {
+        // When using the pooling allocator, GC heap tunables must match memory
+        // tunables.
+        if let InstanceAllocationStrategy::Pooling(_) = &self.strategy {
+            self.memory_config.gc_heap_reservation = self.memory_config.memory_reservation;
+            self.memory_config.gc_heap_guard_size = self.memory_config.memory_guard_size;
+            self.memory_config.gc_heap_reservation_for_growth =
+                self.memory_config.memory_reservation_for_growth;
+            // memory_may_move is not in MemoryConfig, but gc_heap_may_move
+            // must not conflict. Set it to None so the default matches.
+            self.memory_config.gc_heap_may_move = None;
+        }
+
         if !self.signals_based_traps {
             let cfg = &mut self.memory_config;
             // Spectre-based heap mitigations require signal handlers so
@@ -831,8 +845,8 @@ impl WasmtimeConfig {
             cfg.cranelift_enable_heap_access_spectre_mitigations = None;
 
             // With configuration settings that match the use of malloc for
-            // linear memories cap the `memory_reservation_for_growth` value
-            // to something reasonable to avoid OOM in fuzzing.
+            // linear memories and GC heaps, cap the reservation-for-growth
+            // values to something reasonable to avoid OOM in fuzzing.
             if !cfg.memory_init_cow
                 && cfg.memory_guard_size == Some(0)
                 && cfg.memory_reservation == Some(0)
@@ -842,6 +856,17 @@ impl WasmtimeConfig {
                     *val = (*val).min(min);
                 } else {
                     cfg.memory_reservation_for_growth = Some(min);
+                }
+            }
+
+            // Similarly cap gc_heap_reservation_for_growth when signals-based
+            // traps are disabled and the GC heap uses malloc-style allocation.
+            if cfg.gc_heap_guard_size == Some(0) && cfg.gc_heap_reservation == Some(0) {
+                let min = 10 << 20; // 10 MiB
+                if let Some(val) = &mut cfg.gc_heap_reservation_for_growth {
+                    *val = (*val).min(min);
+                } else {
+                    cfg.gc_heap_reservation_for_growth = Some(min);
                 }
             }
         }

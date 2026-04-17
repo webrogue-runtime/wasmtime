@@ -19,10 +19,10 @@ workspace = true
 thiserror = { workspace = true }
 wiggle = { workspace = true }
 tracing = { workspace = true }
-cap-std = { workspace = true, optional = true }
-cap-rand = { workspace = true }
+cap-std = { workspace = true, optional = true  }
 bitflags = { workspace = true }
 log = { workspace = true }
+rand = { workspace = true, features = ['std_rng', 'thread_rng'] }
 async-trait = { workspace = true }
 wasmtime-environ = { workspace = true }
 

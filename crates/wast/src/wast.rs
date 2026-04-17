@@ -19,7 +19,7 @@ pub struct WastContext {
     /// recently defined.
     current: Option<InstanceKind>,
     core_linker: Linker<()>,
-    modules: HashMap<String, ModuleKind>,
+    modules: HashMap<Option<String>, ModuleKind>,
     #[cfg(feature = "component-model")]
     component_linker: component::Linker<()>,
 
@@ -171,7 +171,7 @@ impl WastContext {
             return Ok(Export::Core(
                 self.core_linker
                     .get(&mut self.core_store, module, name)
-                    .ok_or_else(|| format_err!("no item named `{module}::{name}` found"))?,
+                    .with_context(|| format_err!("no item named `{module}::{name}` found"))?,
             ));
         }
 
@@ -233,6 +233,32 @@ impl WastContext {
         link_spectest(&mut self.core_linker, &mut self.core_store, config)?;
         #[cfg(feature = "component-model")]
         link_component_spectest(&mut self.component_linker)?;
+        Ok(())
+    }
+
+    /// Register the "wasmtime" module, which provides utilities that our misc
+    /// tests use.
+    pub fn register_wasmtime(&mut self) -> Result<()> {
+        self.core_linker
+            .func_wrap("wasmtime", "gc", |mut caller: Caller<_>| {
+                caller.gc(None)?;
+                Ok(())
+            })?;
+        #[cfg(feature = "component-model")]
+        {
+            let mut i = self.component_linker.instance("wasmtime")?;
+            i.func_wrap(
+                "set-max-table-capacity",
+                |mut store, (capacity,): (u32,)| {
+                    store
+                        .as_context_mut()
+                        .concurrent_resource_table()
+                        .expect("table must be present")
+                        .set_max_capacity(capacity.try_into().unwrap());
+                    Ok(())
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -634,18 +660,16 @@ impl WastContext {
                 line: _,
             } => {
                 let module = self.module_definition(&file)?;
-                if let Some(name) = name {
-                    self.modules.insert(name.to_string(), module);
-                }
+                self.modules.insert(name.map(|s| s.to_string()), module);
             }
             ModuleInstance {
                 instance,
                 module,
                 line: _,
             } => {
-                let module = module
-                    .as_deref()
-                    .and_then(|n| self.modules.get(n))
+                let module = self
+                    .modules
+                    .get(&module.as_ref().map(|s| s.to_string()))
                     .cloned()
                     .ok_or_else(|| format_err!("no module named {module:?}"))?;
                 self.module(instance.as_deref(), &module)?;

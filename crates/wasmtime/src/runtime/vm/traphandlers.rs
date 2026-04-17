@@ -447,11 +447,11 @@ where
             coredump_stack,
         }) => Err(crate::trap::from_runtime_box(
             store.0,
-            Box::new(Trap {
+            try_new::<Box<_>>(Trap {
                 reason,
                 backtrace,
                 coredumpstack: coredump_stack,
-            }),
+            })?,
         )),
         #[cfg(all(feature = "std", panic = "unwind"))]
         Err(UnwindState::UnwindToHost {
@@ -740,7 +740,7 @@ impl CallThreadState {
     /// called using, for example, the `unwind` function below.
     ///
     /// Note that this is a relatively low-level function and will panic if
-    /// mis-used.
+    /// misused.
     ///
     /// # Panics
     ///

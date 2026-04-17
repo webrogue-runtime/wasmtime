@@ -48,18 +48,46 @@ pub struct GcStore {
 
     /// The function-references table for this GC heap.
     pub func_ref_table: FuncRefTable,
+
+    /// The total allocated bytes recorded after the last GC collection.
+    /// `None` if no collection has been performed yet. Used by the
+    /// grow-or-collect heuristic.
+    pub last_post_gc_allocated_bytes: Option<usize>,
+
+    /// An allocation counter that triggers GC when it reaches zero.
+    ///
+    /// Decremented on every allocation and when it hits zero, a GC is
+    /// forced and the counter is reset.
+    #[cfg(gc_zeal)]
+    gc_zeal_alloc_counter: Option<NonZeroU32>,
+
+    /// The initial value to reset the counter to after it triggers.
+    #[cfg(gc_zeal)]
+    gc_zeal_alloc_counter_init: Option<NonZeroU32>,
 }
 
 impl GcStore {
     /// Create a new `GcStore`.
-    pub fn new(allocation_index: GcHeapAllocationIndex, gc_heap: Box<dyn GcHeap>) -> Self {
+    pub fn new(
+        allocation_index: GcHeapAllocationIndex,
+        gc_heap: Box<dyn GcHeap>,
+        gc_zeal_alloc_counter: Option<NonZeroU32>,
+    ) -> Self {
         let host_data_table = ExternRefHostDataTable::default();
         let func_ref_table = FuncRefTable::default();
+
+        let _ = &gc_zeal_alloc_counter;
+
         Self {
             allocation_index,
             gc_heap,
             host_data_table,
             func_ref_table,
+            last_post_gc_allocated_bytes: None,
+            #[cfg(gc_zeal)]
+            gc_zeal_alloc_counter,
+            #[cfg(gc_zeal)]
+            gc_zeal_alloc_counter_init: gc_zeal_alloc_counter,
         }
     }
 
@@ -68,10 +96,25 @@ impl GcStore {
         self.gc_heap.vmmemory()
     }
 
+    /// Get the current capacity (in bytes) of this GC heap.
+    pub fn gc_heap_capacity(&self) -> usize {
+        self.gc_heap.heap_slice().len()
+    }
+
     /// Asynchronously perform garbage collection within this heap.
-    pub async fn gc(&mut self, asyncness: Asyncness, roots: GcRootsIter<'_>) {
+    pub async fn gc(
+        &mut self,
+        asyncness: Asyncness,
+        roots: GcRootsIter<'_>,
+        yield_fn: impl AsyncFn(),
+    ) {
         let collection = self.gc_heap.gc(roots, &mut self.host_data_table);
-        collect_async(collection, asyncness).await;
+        collect_async(collection, asyncness, yield_fn).await;
+        self.last_post_gc_allocated_bytes = Some({
+            let size = self.gc_heap.allocated_bytes();
+            log::trace!("After collection, GC heap size = {size} bytes");
+            size
+        });
     }
 
     /// Get the kind of the given GC reference.
@@ -231,6 +274,20 @@ impl GcStore {
         header: VMGcHeader,
         layout: Layout,
     ) -> Result<Result<VMGcRef, u64>> {
+        // When gc_zeal is enabled with an allocation counter, decrement it and
+        // force a GC cycle when it reaches zero by returning a fake OOM.
+        #[cfg(gc_zeal)]
+        if let Some(counter) = self.gc_zeal_alloc_counter.take() {
+            match NonZeroU32::new(counter.get() - 1) {
+                Some(c) => self.gc_zeal_alloc_counter = Some(c),
+                None => {
+                    log::trace!("gc_zeal: allocation counter reached zero, forcing GC");
+                    self.gc_zeal_alloc_counter = self.gc_zeal_alloc_counter_init;
+                    return Ok(Err(0));
+                }
+            }
+        }
+
         self.gc_heap.alloc_raw(header, layout)
     }
 

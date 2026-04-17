@@ -55,6 +55,8 @@ use crate::runtime::vm::{
     mpk::{self, ProtectionKey, ProtectionMask},
     sys::vm::PageMap,
 };
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::AtomicUsize;
 use std::borrow::Cow;
 use std::fmt::Display;
@@ -381,7 +383,7 @@ impl PoolingInstanceAllocator {
             tables: TablePool::new(config)?,
             live_tables: AtomicUsize::new(0),
             #[cfg(feature = "gc")]
-            gc_heaps: GcHeapPool::new(config)?,
+            gc_heaps: GcHeapPool::new(config, tunables)?,
             #[cfg(feature = "gc")]
             live_gc_heaps: AtomicUsize::new(0),
             #[cfg(feature = "async")]
@@ -553,7 +555,6 @@ impl PoolingInstanceAllocator {
     }
 }
 
-#[async_trait::async_trait]
 unsafe impl InstanceAllocator for PoolingInstanceAllocator {
     #[cfg(feature = "component-model")]
     fn validate_component<'a>(
@@ -678,34 +679,36 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
         self.live_core_instances.fetch_sub(1, Ordering::AcqRel);
     }
 
-    async fn allocate_memory(
-        &self,
-        request: &mut InstanceAllocationRequest<'_, '_>,
-        ty: &wasmtime_environ::Memory,
+    fn allocate_memory<'a, 'b: 'a, 'c: 'a>(
+        &'a self,
+        request: &'a mut InstanceAllocationRequest<'b, 'c>,
+        ty: &'a wasmtime_environ::Memory,
         memory_index: Option<DefinedMemoryIndex>,
-    ) -> Result<(MemoryAllocationIndex, Memory)> {
-        async {
-            // FIXME(rust-lang/rust#145127) this should ideally use a version of
-            // `with_flush_and_retry` but adapted for async closures instead of only
-            // sync closures. Right now that won't compile though so this is the
-            // manually expanded version of the method.
-            let e = match self.memories.allocate(request, ty, memory_index).await {
-                Ok(result) => return Ok(result),
-                Err(e) => e,
-            };
+    ) -> Pin<Box<dyn Future<Output = Result<(MemoryAllocationIndex, Memory)>> + Send + 'a>> {
+        crate::runtime::box_future(async move {
+            async {
+                // FIXME(rust-lang/rust#145127) this should ideally use a version of
+                // `with_flush_and_retry` but adapted for async closures instead of only
+                // sync closures. Right now that won't compile though so this is the
+                // manually expanded version of the method.
+                let e = match self.memories.allocate(request, ty, memory_index).await {
+                    Ok(result) => return Ok(result),
+                    Err(e) => e,
+                };
 
-            if e.is::<PoolConcurrencyLimitError>() {
-                let queue = self.decommit_queue.lock().unwrap();
-                if self.flush_decommit_queue(queue) {
-                    return self.memories.allocate(request, ty, memory_index).await;
+                if e.is::<PoolConcurrencyLimitError>() {
+                    let queue = self.decommit_queue.lock().unwrap();
+                    if self.flush_decommit_queue(queue) {
+                        return self.memories.allocate(request, ty, memory_index).await;
+                    }
                 }
-            }
 
-            Err(e)
-        }
-        .await
-        .inspect(|_| {
-            self.live_memories.fetch_add(1, Ordering::Relaxed);
+                Err(e)
+            }
+            .await
+            .inspect(|_| {
+                self.live_memories.fetch_add(1, Ordering::Relaxed);
+            })
         })
     }
 
@@ -718,61 +721,83 @@ unsafe impl InstanceAllocator for PoolingInstanceAllocator {
         let prev = self.live_memories.fetch_sub(1, Ordering::Relaxed);
         debug_assert!(prev > 0);
 
-        // Reset the image slot. If there is any error clearing the
-        // image, just drop it here, and let the drop handler for the
-        // slot unmap in a way that retains the address space
-        // reservation.
+        // Reset the image slot. Depending on whether this is successful or not
+        // the `image` is preserved for future use. On success it's queued up to
+        // get deallocated later, and on failure the slot is deallocated
+        // immediately without preserving the image.
         let mut image = memory.unwrap_static_image();
         let mut queue = DecommitQueue::default();
-        let bytes_resident = image
-            .clear_and_remain_ready(
-                self.pagemap.as_ref(),
-                self.memories.keep_resident,
-                |ptr, len| {
-                    // SAFETY: the memory in `image` won't be used until this
-                    // decommit queue is flushed, and by definition the memory is
-                    // not in use when calling this function.
-                    unsafe {
-                        queue.push_raw(ptr, len);
-                    }
-                },
-            )
-            .expect("failed to reset memory image");
+        let bytes_resident = image.clear_and_remain_ready(
+            self.pagemap.as_ref(),
+            self.memories.keep_resident,
+            |ptr, len| {
+                // SAFETY: the memory in `image` won't be used until this
+                // decommit queue is flushed, and by definition the memory is
+                // not in use when calling this function.
+                unsafe {
+                    queue.push_raw(ptr, len);
+                }
+            },
+        );
 
-        // SAFETY: this image is not in use and its memory regions were enqueued
-        // with `push_raw` above.
-        unsafe {
-            queue.push_memory(allocation_index, image, bytes_resident);
-        }
-        self.merge_or_flush(queue);
-    }
-
-    async fn allocate_table(
-        &self,
-        request: &mut InstanceAllocationRequest<'_, '_>,
-        ty: &wasmtime_environ::Table,
-        _table_index: DefinedTableIndex,
-    ) -> Result<(super::TableAllocationIndex, Table)> {
-        async {
-            // FIXME: see `allocate_memory` above for comments about duplication
-            // with `with_flush_and_retry`.
-            let e = match self.tables.allocate(request, ty).await {
-                Ok(result) => return Ok(result),
-                Err(e) => e,
-            };
-
-            if e.is::<PoolConcurrencyLimitError>() {
-                let queue = self.decommit_queue.lock().unwrap();
-                if self.flush_decommit_queue(queue) {
-                    return self.tables.allocate(request, ty).await;
+        match bytes_resident {
+            Ok(bytes_resident) => {
+                // SAFETY: this image is not in use and its memory regions were enqueued
+                // with `push_raw` above.
+                unsafe {
+                    queue.push_memory(allocation_index, image, bytes_resident);
+                }
+                self.merge_or_flush(queue);
+            }
+            Err(e) => {
+                log::warn!("ignoring clear_and_remain_ready error {e}");
+                // SAFETY: `allocation_index` comes from this pool, as an unsafe
+                // contract of this function itself, and it's guaranteed to be no
+                // longer in use so safe to deallocate. The slot couldn't be
+                // preserved so it's dropped here.
+                //
+                // Note that at this point it's not clear how many bytes are
+                // resident in memory, so it's inevitably going to leave statistics
+                // a little off. Also note though that non-Linux platforms don't
+                // keep track of resident bytes anyway, and this path is only
+                // reachable on non-Linux platforms because Linux can't return an
+                // error.
+                unsafe {
+                    self.memories.deallocate(allocation_index, None, 0);
                 }
             }
-
-            Err(e)
         }
-        .await
-        .inspect(|_| {
-            self.live_tables.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn allocate_table<'a, 'b: 'a, 'c: 'a>(
+        &'a self,
+        request: &'a mut InstanceAllocationRequest<'b, 'c>,
+        ty: &'a wasmtime_environ::Table,
+        _table_index: DefinedTableIndex,
+    ) -> Pin<Box<dyn Future<Output = Result<(super::TableAllocationIndex, Table)>> + Send + 'a>>
+    {
+        crate::runtime::box_future(async move {
+            async {
+                // FIXME: see `allocate_memory` above for comments about duplication
+                // with `with_flush_and_retry`.
+                let e = match self.tables.allocate(request, ty).await {
+                    Ok(result) => return Ok(result),
+                    Err(e) => e,
+                };
+
+                if e.is::<PoolConcurrencyLimitError>() {
+                    let queue = self.decommit_queue.lock().unwrap();
+                    if self.flush_decommit_queue(queue) {
+                        return self.tables.allocate(request, ty).await;
+                    }
+                }
+
+                Err(e)
+            }
+            .await
+            .inspect(|_| {
+                self.live_tables.fetch_add(1, Ordering::Relaxed);
+            })
         })
     }
 

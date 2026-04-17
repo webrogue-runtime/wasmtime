@@ -49,7 +49,8 @@ impl GcOps {
     /// fuel. It also is not guaranteed to avoid traps: it may access
     /// out-of-bounds of the table.
     pub fn to_wasm_binary(&mut self) -> Vec<u8> {
-        self.fixup();
+        let mut encoding_order_grouped = Vec::with_capacity(self.types.rec_groups.len());
+        self.fixup(&mut encoding_order_grouped);
 
         let mut module = Module::new();
 
@@ -69,7 +70,9 @@ impl GcOps {
         );
 
         // 1: "run"
-        let mut params: Vec<ValType> = Vec::with_capacity(self.limits.num_params as usize);
+        let mut params: Vec<ValType> = Vec::with_capacity(
+            usize::try_from(self.limits.num_params).expect("num_params is too large"),
+        );
         for _i in 0..self.limits.num_params {
             params.push(ValType::EXTERNREF);
         }
@@ -104,24 +107,24 @@ impl GcOps {
 
         let struct_type_base: u32 = types.len();
 
-        let mut rec_groups: BTreeMap<RecGroupId, Vec<TypeId>> = self
-            .types
-            .rec_groups
-            .iter()
-            .copied()
-            .map(|id| (id, Vec::new()))
-            .collect();
-
-        for (id, ty) in self.types.type_defs.iter() {
-            rec_groups.entry(ty.rec_group).or_default().push(*id);
+        // Build the type-id-to-wasm-index map from the pre-computed
+        // encoding order (rec groups in topo order, members sorted by
+        // supertype-first within each group).
+        let mut type_ids_to_index: BTreeMap<TypeId, u32> = BTreeMap::new();
+        let mut next_idx = struct_type_base;
+        for (_, members) in &encoding_order_grouped {
+            for &tid in members {
+                type_ids_to_index.insert(tid, next_idx);
+                next_idx += 1;
+            }
         }
 
         let encode_ty_id = |ty_id: &TypeId| -> wasm_encoder::SubType {
             let def = &self.types.type_defs[ty_id];
             match &def.composite_type {
                 CompositeType::Struct(StructType {}) => wasm_encoder::SubType {
-                    is_final: true,
-                    supertype_idx: None,
+                    is_final: def.is_final,
+                    supertype_idx: def.supertype.map(|st| type_ids_to_index[&st]),
                     composite_type: wasm_encoder::CompositeType {
                         inner: wasm_encoder::CompositeInnerType::Struct(wasm_encoder::StructType {
                             fields: Box::new([]),
@@ -136,10 +139,12 @@ impl GcOps {
 
         let mut struct_count = 0;
 
-        for type_ids in rec_groups.values() {
-            let members: Vec<wasm_encoder::SubType> = type_ids.iter().map(encode_ty_id).collect();
+        // Emit rec groups in the pre-computed order.
+        for (_, group_members) in &encoding_order_grouped {
+            let members: Vec<wasm_encoder::SubType> =
+                group_members.iter().map(encode_ty_id).collect();
             types.ty().rec(members);
-            struct_count += type_ids.len() as u32;
+            struct_count += u32::try_from(group_members.len()).unwrap();
         }
 
         let typed_fn_type_base: u32 = struct_type_base + struct_count;
@@ -346,9 +351,13 @@ impl GcOps {
     /// pre-mutation test cases are even valid! Therefore, we always call this
     /// method before translating this "AST"-style representation into a raw
     /// Wasm binary.
-    pub fn fixup(&mut self) {
+    pub fn fixup(&mut self, encoding_order_grouped: &mut Vec<(RecGroupId, Vec<TypeId>)>) {
         self.limits.fixup();
-        self.types.fixup(&self.limits);
+        self.types.fixup(&self.limits, encoding_order_grouped);
+        let encoding_order: Vec<TypeId> = encoding_order_grouped
+            .iter()
+            .flat_map(|(_, members)| members.iter().copied())
+            .collect();
 
         let mut new_ops = Vec::with_capacity(self.ops.len());
         let mut stack: Vec<StackType> = Vec::new();
@@ -359,11 +368,19 @@ impl GcOps {
             let Some(op) = op.fixup(&self.limits, num_types) else {
                 continue;
             };
+            let op = StackType::fixup_cast(op, &self.types, &encoding_order);
 
             debug_assert!(operand_types.is_empty());
             op.operand_types(&mut operand_types);
             for ty in operand_types.drain(..) {
-                StackType::fixup(ty, &mut stack, &mut new_ops, num_types);
+                StackType::fixup(
+                    ty,
+                    &mut stack,
+                    &mut new_ops,
+                    num_types,
+                    &self.types,
+                    &encoding_order,
+                );
             }
 
             // Finally, emit the op itself (updates stack abstractly)
@@ -568,6 +585,22 @@ macro_rules! for_each_gc_op {
                 type_index = type_index.checked_rem(num_types)?;
             })]
             NullTypedStruct { type_index: u32 },
+
+            #[operands([Some(Struct(Some(sub_type_index)))])]
+            #[results([Struct(Some(super_type_index))])]
+            #[fixup(|_limits, num_types| {
+                sub_type_index = sub_type_index.checked_rem(num_types)?;
+                super_type_index = super_type_index.checked_rem(num_types)?;
+            })]
+            RefCastUpward { sub_type_index: u32, super_type_index: u32 },
+
+            #[operands([Some(Struct(Some(super_type_index)))])]
+            #[results([Struct(Some(sub_type_index))])]
+            #[fixup(|_limits, num_types| {
+                sub_type_index = sub_type_index.checked_rem(num_types)?;
+                super_type_index = super_type_index.checked_rem(num_types)?;
+            })]
+            RefCastDownward { sub_type_index: u32, super_type_index: u32 },
         }
     };
 }
@@ -873,6 +906,66 @@ impl GcOp {
                 func.instruction(&Instruction::TableSet(
                     encoding_bases.typed_table_base + type_index,
                 ));
+            }
+            Self::RefCastUpward {
+                sub_type_index: _,
+                super_type_index,
+            } => {
+                // The value on the stack is already the subtype, so this
+                // cast always succeeds.
+                let heap_type = wasm_encoder::HeapType::Concrete(
+                    encoding_bases.struct_type_base + super_type_index,
+                );
+                func.instruction(&Instruction::RefCastNullable(heap_type));
+            }
+            Self::RefCastDownward {
+                sub_type_index,
+                super_type_index,
+            } => {
+                // Fallible downcast that never traps:
+                //
+                //   local.tee $my_temp
+                //   ;; Test if the downcast will succeed.
+                //   ref.test ...
+                //   if (result (ref null $my_sub))
+                //     ;; The downcast will succeed, do a downcast-or-trap
+                //     ;; operation which we know will not trap.
+                //     local.get $my_temp
+                //     ref.cast ...
+                //   else
+                //     ;; The downcast would fail, so just create a null
+                //     ;; reference instead.
+                //     ref.null ...
+                //   end
+                let sub_wasm_type = encoding_bases.struct_type_base + sub_type_index;
+                let sub_heap_type = wasm_encoder::HeapType::Concrete(sub_wasm_type);
+                let temp_local = encoding_bases.typed_local_base + super_type_index;
+
+                // Tee the supertype value into a temp local (saves and
+                // leaves the value on the stack for ref.test).
+                func.instruction(&Instruction::LocalTee(temp_local));
+
+                // Test if the downcast will succeed.
+                func.instruction(&Instruction::RefTestNullable(sub_heap_type));
+
+                // if (result (ref null $sub_type))
+                func.instruction(&Instruction::If(wasm_encoder::BlockType::Result(
+                    ValType::Ref(RefType {
+                        nullable: true,
+                        heap_type: sub_heap_type,
+                    }),
+                )));
+
+                // The downcast will succeed; do the cast.
+                func.instruction(&Instruction::LocalGet(temp_local));
+                func.instruction(&Instruction::RefCastNullable(sub_heap_type));
+
+                func.instruction(&Instruction::Else);
+
+                // The downcast would fail; produce null instead.
+                func.instruction(&Instruction::RefNull(sub_heap_type));
+
+                func.instruction(&Instruction::End);
             }
         }
     }

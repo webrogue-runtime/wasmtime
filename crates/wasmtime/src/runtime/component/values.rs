@@ -124,16 +124,11 @@ impl Val {
                 &[*next(src), *next(src)],
             )?),
             InterfaceType::List(i) => {
-                // FIXME(#4311): needs memory64 treatment
-                let ptr = u32::linear_lift_from_flat(cx, InterfaceType::U32, next(src))? as usize;
-                let len = u32::linear_lift_from_flat(cx, InterfaceType::U32, next(src))? as usize;
+                let (ptr, len) = lift_flat_pointer_pair(cx, src)?;
                 load_list(cx, i, ptr, len)?
             }
             InterfaceType::Map(i) => {
-                // FIXME(#4311): needs memory64 treatment
-                // Maps are represented as list<tuple<k, v>> in canonical ABI
-                let ptr = u32::linear_lift_from_flat(cx, InterfaceType::U32, next(src))? as usize;
-                let len = u32::linear_lift_from_flat(cx, InterfaceType::U32, next(src))? as usize;
+                let (ptr, len) = lift_flat_pointer_pair(cx, src)?;
                 load_map(cx, i, ptr, len)?
             }
             InterfaceType::Record(i) => Val::Record(
@@ -249,15 +244,11 @@ impl Val {
                 Val::Resource(ResourceAny::linear_lift_from_memory(cx, ty, bytes)?)
             }
             InterfaceType::List(i) => {
-                // FIXME(#4311): needs memory64 treatment
-                let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-                let len = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
+                let (ptr, len) = load_flat_pointer_pair(bytes);
                 load_list(cx, i, ptr, len)?
             }
             InterfaceType::Map(i) => {
-                // FIXME(#4311): needs memory64 treatment
-                let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
-                let len = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
+                let (ptr, len) = load_flat_pointer_pair(bytes);
                 load_map(cx, i, ptr, len)?
             }
 
@@ -945,6 +936,22 @@ impl GenericVariant<'_> {
     }
 }
 
+fn lift_flat_pointer_pair(
+    cx: &mut LiftContext<'_>,
+    src: &mut Iter<'_, ValRaw>,
+) -> Result<(usize, usize)> {
+    // FIXME(#4311): needs memory64 treatment
+    let ptr = u32::linear_lift_from_flat(cx, InterfaceType::U32, next(src))? as usize;
+    let len = u32::linear_lift_from_flat(cx, InterfaceType::U32, next(src))? as usize;
+    Ok((ptr, len))
+}
+
+fn load_flat_pointer_pair(bytes: &[u8]) -> (usize, usize) {
+    let ptr = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(bytes[4..].try_into().unwrap()) as usize;
+    (ptr, len)
+}
+
 fn load_list(cx: &mut LiftContext<'_>, ty: TypeListIndex, ptr: usize, len: usize) -> Result<Val> {
     let elem = cx.types[ty].element;
     let abi = cx.types.canonical_abi(&elem);
@@ -994,7 +1001,7 @@ fn load_map(cx: &mut LiftContext<'_>, ty: TypeMapIndex, ptr: usize, len: usize) 
         .checked_mul(tuple_size)
         .and_then(|len| ptr.checked_add(len))
     {
-        Some(n) if n <= cx.memory().len() => {}
+        Some(n) if n <= cx.memory().len() => cx.consume_fuel_array(len, size_of::<(Val, Val)>())?,
         _ => bail!("map pointer/length out of bounds of memory"),
     }
     if ptr % usize::try_from(tuple_alignment)? != 0 {
@@ -1038,13 +1045,10 @@ fn load_variant(
             u32::linear_lift_from_memory(cx, InterfaceType::U32, &bytes[..4])?
         }
     };
-    let case_ty = types.nth(discriminant as usize).ok_or_else(|| {
-        format_err!(
-            "discriminant {} out of range [0..{})",
-            discriminant,
-            types.len()
-        )
-    })?;
+    let len = types.len();
+    let case_ty = types
+        .nth(discriminant as usize)
+        .ok_or_else(|| format_err!("discriminant {discriminant} out of range [0..{len})"))?;
     let value = match case_ty {
         Some(case_ty) => {
             let payload_offset = usize::try_from(info.payload_offset32).unwrap();
@@ -1138,7 +1142,7 @@ fn lower_map<T>(
 }
 
 fn push_flags(ty: &TypeFlags, flags: &mut Vec<String>, mut offset: u32, mut bits: u32) {
-    while bits > 0 {
+    while bits > 0 && usize::try_from(offset).unwrap() < ty.names.len() {
         if bits & 1 != 0 {
             flags.push(ty.names[offset as usize].clone());
         }

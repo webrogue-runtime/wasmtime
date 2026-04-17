@@ -135,6 +135,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             dest,
             uses,
             key,
+            sign_return_address_all: self.backend.isa_flags.sign_return_address_all(),
             new_stack_arg_size,
         })
     }
@@ -157,6 +158,7 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             dest,
             uses,
             key,
+            sign_return_address_all: self.backend.isa_flags.sign_return_address_all(),
             new_stack_arg_size,
         })
     }
@@ -179,6 +181,10 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
 
     fn use_fp16(&mut self) -> bool {
         self.backend.isa_flags.has_fp16()
+    }
+
+    fn use_csdb(&mut self) -> bool {
+        self.backend.isa_flags.use_csdb()
     }
 
     fn move_wide_const_from_u64(&mut self, ty: Type, n: u64) -> Option<MoveWideConst> {
@@ -381,10 +387,6 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
             },
             size,
         });
-        if self.backend.flags.enable_pcc() {
-            self.lower_ctx
-                .add_range_fact(rd.to_reg(), 64, running_value, running_value);
-        }
 
         // Emit a `movk` instruction for each remaining slice of the desired
         // constant that does not match the initial value constructed above.
@@ -400,10 +402,6 @@ impl Context for IsleContext<'_, '_, MInst, AArch64Backend> {
                     size,
                 });
                 running_value = replace(running_value, bits, shift);
-                if self.backend.flags.enable_pcc() {
-                    self.lower_ctx
-                        .add_range_fact(rd.to_reg(), 64, running_value, running_value);
-                }
             }
         }
 

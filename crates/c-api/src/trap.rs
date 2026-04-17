@@ -51,6 +51,9 @@ const _: () = {
     assert!(Trap::BackpressureOverflow as u8 == 42);
     assert!(Trap::UnsupportedCallbackCode as u8 == 43);
     assert!(Trap::CannotResumeThread as u8 == 44);
+    assert!(Trap::ConcurrentFutureStreamOp as u8 == 45);
+    assert!(Trap::ReferenceCountOverflow as u8 == 46);
+    assert!(Trap::StreamOpTooBig as u8 == 47);
 };
 
 #[repr(C)]

@@ -342,6 +342,12 @@ pub unsafe trait GcHeap: 'static + Send + Sync {
     ////////////////////////////////////////////////////////////////////////////
     // Garbage Collection Methods
 
+    /// Get the total number of bytes currently allocated (live or
+    /// dead-but-not-collected) in this heap.
+    ///
+    /// This is distinct from the heap capacity.
+    fn allocated_bytes(&self) -> usize;
+
     /// Start a new garbage collection process.
     ///
     /// The given `roots` are GC roots and should not be collected (nor anything
@@ -749,13 +755,19 @@ pub enum GcProgress {
 pub async fn collect_async<'a>(
     mut collection: Box<dyn GarbageCollection<'a> + 'a>,
     asyncness: Asyncness,
+    yield_fn: impl AsyncFn(),
 ) {
+    #[cfg(not(feature = "async"))]
+    {
+        _ = yield_fn;
+    }
+
     loop {
         match collection.collect_increment() {
             GcProgress::Continue => {
                 if asyncness != Asyncness::No {
                     #[cfg(feature = "async")]
-                    crate::runtime::vm::Yield::new().await
+                    yield_fn().await
                 }
             }
             GcProgress::Complete => return,
@@ -772,7 +784,7 @@ mod collect_async_tests {
         fn _assert_send_sync<T: Send + Sync>(_: T) {}
 
         fn _foo<'a>(collection: Box<dyn GarbageCollection<'a>>) {
-            _assert_send_sync(collect_async(collection, Asyncness::Yes));
+            _assert_send_sync(collect_async(collection, Asyncness::Yes, async || ()));
         }
     }
 }

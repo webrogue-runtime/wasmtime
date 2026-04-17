@@ -15,12 +15,29 @@ pub mod drc;
 #[cfg(feature = "gc-null")]
 pub mod null;
 
+#[cfg(feature = "gc-copying")]
+pub mod copying;
+
 use crate::{
     WasmArrayType, WasmCompositeInnerType, WasmCompositeType, WasmExnType, WasmStorageType,
     WasmStructType, WasmValType, error::OutOfMemory, prelude::*,
 };
 use alloc::sync::Arc;
 use core::alloc::Layout;
+
+/// Poison byte written over unallocated GC heap memory when `cfg(gc_zeal)` is
+/// enabled.
+pub const POISON: u8 = 0b00001111;
+
+/// Assert a condition, but only when `gc_zeal` is enabled.
+#[macro_export]
+macro_rules! gc_assert {
+    ($($arg:tt)*) => {
+        if cfg!(gc_zeal) {
+            assert!($($arg)*);
+        }
+    };
+}
 
 /// Discriminant to check whether GC reference is an `i31ref` or not.
 pub const I31_DISCRIMINANT: u32 = 1;
@@ -53,7 +70,7 @@ pub fn byte_size_of_wasm_ty_in_gc_heap(ty: &WasmStorageType) -> u32 {
 
 /// Align `offset` up to `bytes`, updating `max_align` if `align` is the
 /// new maximum alignment, and returning the aligned offset.
-#[cfg(any(feature = "gc-drc", feature = "gc-null"))]
+#[cfg(any(feature = "gc-drc", feature = "gc-null", feature = "gc-copying"))]
 fn align_up(offset: &mut u32, max_align: &mut u32, align: u32) -> u32 {
     debug_assert!(max_align.is_power_of_two());
     debug_assert!(align.is_power_of_two());
@@ -65,7 +82,7 @@ fn align_up(offset: &mut u32, max_align: &mut u32, align: u32) -> u32 {
 /// Define a new field of size and alignment `bytes`, updating the object's
 /// total `size` and `align` as necessary. The offset of the new field is
 /// returned.
-#[cfg(any(feature = "gc-drc", feature = "gc-null"))]
+#[cfg(any(feature = "gc-drc", feature = "gc-null", feature = "gc-copying"))]
 fn field(size: &mut u32, align: &mut u32, bytes: u32) -> u32 {
     let offset = align_up(size, align, bytes);
     *size += bytes;
@@ -74,7 +91,7 @@ fn field(size: &mut u32, align: &mut u32, bytes: u32) -> u32 {
 
 /// Common code to define a GC array's layout, given the size and alignment of
 /// the collector's GC header and its expected offset of the array length field.
-#[cfg(any(feature = "gc-drc", feature = "gc-null"))]
+#[cfg(any(feature = "gc-drc", feature = "gc-null", feature = "gc-copying"))]
 fn common_array_layout(
     ty: &WasmArrayType,
     header_size: u32,
@@ -117,7 +134,7 @@ fn common_array_layout(
 /// Shared layout code for structs and exception objects, which are
 /// identical except for the tag field (present in
 /// exceptions). Returns `(size, align, fields)`.
-#[cfg(any(feature = "gc-null", feature = "gc-drc"))]
+#[cfg(any(feature = "gc-null", feature = "gc-drc", feature = "gc-copying"))]
 fn common_struct_or_exn_layout(
     fields: &[crate::WasmFieldType],
     header_size: u32,
@@ -158,7 +175,7 @@ fn common_struct_or_exn_layout(
 
 /// Common code to define a GC struct's layout, given the size and alignment of
 /// the collector's GC header and its expected offset of the array length field.
-#[cfg(any(feature = "gc-null", feature = "gc-drc"))]
+#[cfg(any(feature = "gc-null", feature = "gc-drc", feature = "gc-copying"))]
 fn common_struct_layout(
     ty: &WasmStructType,
     header_size: u32,
@@ -180,7 +197,7 @@ fn common_struct_layout(
 /// Common code to define a GC exception object's layout, given the
 /// size and alignment of the collector's GC header and its expected
 /// offset of the array length field.
-#[cfg(any(feature = "gc-null", feature = "gc-drc"))]
+#[cfg(any(feature = "gc-null", feature = "gc-drc", feature = "gc-copying"))]
 fn common_exn_layout(ty: &WasmExnType, header_size: u32, header_align: u32) -> GcStructLayout {
     assert!(header_size >= crate::VM_GC_HEADER_SIZE);
     assert!(header_align >= crate::VM_GC_HEADER_ALIGN);
@@ -485,15 +502,16 @@ impl VMGcKind {
     #[inline]
     pub fn from_high_bits_of_u32(val: u32) -> VMGcKind {
         let masked = val & Self::MASK;
-        match masked {
-            x if x == Self::ExternRef.as_u32() => Self::ExternRef,
-            x if x == Self::AnyRef.as_u32() => Self::AnyRef,
-            x if x == Self::EqRef.as_u32() => Self::EqRef,
-            x if x == Self::ArrayRef.as_u32() => Self::ArrayRef,
-            x if x == Self::StructRef.as_u32() => Self::StructRef,
-            x if x == Self::ExnRef.as_u32() => Self::ExnRef,
-            _ => panic!("invalid `VMGcKind`: {masked:#032b}"),
-        }
+        let result = Self::try_from_u32(masked)
+            .unwrap_or_else(|| panic!("invalid `VMGcKind`: {masked:#032b}"));
+
+        let poison_kind = u32::from_le_bytes([POISON, POISON, POISON, POISON]) & VMGcKind::MASK;
+        debug_assert_ne!(
+            masked, poison_kind,
+            "No valid `VMGcKind` should overlap with the poison pattern"
+        );
+
+        result
     }
 
     /// Does this kind match the other kind?
@@ -508,6 +526,22 @@ impl VMGcKind {
     #[inline]
     pub fn as_u32(self) -> u32 {
         self as u32
+    }
+
+    /// Try to convert a `u32` into a `VMGcKind`.
+    ///
+    /// Returns `None` if the value doesn't match any known kind.
+    #[inline]
+    pub fn try_from_u32(x: u32) -> Option<VMGcKind> {
+        match x {
+            _ if x == Self::ExternRef.as_u32() => Some(Self::ExternRef),
+            _ if x == Self::AnyRef.as_u32() => Some(Self::AnyRef),
+            _ if x == Self::EqRef.as_u32() => Some(Self::EqRef),
+            _ if x == Self::ArrayRef.as_u32() => Some(Self::ArrayRef),
+            _ if x == Self::StructRef.as_u32() => Some(Self::StructRef),
+            _ if x == Self::ExnRef.as_u32() => Some(Self::ExnRef),
+            _ => None,
+        }
     }
 }
 

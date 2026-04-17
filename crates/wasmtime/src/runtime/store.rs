@@ -106,13 +106,17 @@ use crate::{ExnRef, Rooted};
 use crate::{Global, Instance, Table};
 use core::convert::Infallible;
 use core::fmt;
+#[cfg(any(feature = "async", feature = "gc"))]
+use core::future;
 use core::marker;
 use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::num::NonZeroU64;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 use core::ptr::NonNull;
-use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, PrimaryMap, TripleExt};
+#[cfg(any(feature = "async", feature = "gc"))]
+use core::task::Poll;
+use wasmtime_environ::{DefinedGlobalIndex, DefinedTableIndex, EntityRef, TripleExt};
 
 mod context;
 pub use self::context::*;
@@ -478,7 +482,7 @@ pub struct StoreOpaque {
     signal_handler: Option<SignalHandler>,
     modules: ModuleRegistry,
     func_refs: FuncRefs,
-    host_globals: PrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
+    host_globals: TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>>,
     // GC-related fields.
     gc_store: Option<GcStore>,
     gc_roots: RootSet,
@@ -527,7 +531,7 @@ pub struct StoreOpaque {
     hostcall_val_storage: Vec<Val>,
     /// Same as `hostcall_val_storage`, but for the direction of the host
     /// calling wasm.
-    wasm_val_raw_storage: Vec<ValRaw>,
+    wasm_val_raw_storage: TryVec<ValRaw>,
 
     /// Keep track of what protection key is being used during allocation so
     /// that the right memory pages can be enabled when entering WebAssembly
@@ -756,7 +760,7 @@ impl<T> Store<T> {
             pending_exception: None,
             modules: ModuleRegistry::default(),
             func_refs: FuncRefs::default(),
-            host_globals: PrimaryMap::new(),
+            host_globals: TryPrimaryMap::new(),
             instance_count: 0,
             instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
             memory_count: 0,
@@ -771,7 +775,7 @@ impl<T> Store<T> {
             traitobj: StorePtr(None),
             default_caller_vmctx: SendSyncPtr::new(NonNull::dangling()),
             hostcall_val_storage: Vec::new(),
-            wasm_val_raw_storage: Vec::new(),
+            wasm_val_raw_storage: TryVec::new(),
             pkey,
             executor: Executor::new(engine)?,
             #[cfg(feature = "debug")]
@@ -1014,6 +1018,13 @@ impl<T> Store<T> {
     #[cfg(feature = "gc")]
     pub fn gc(&mut self, why: Option<&crate::GcHeapOutOfMemory<()>>) -> Result<()> {
         StoreContextMut(&mut self.inner).gc(why)
+    }
+
+    /// Returns the current capacity of the GC heap in bytes, or 0 if the GC
+    /// heap has not been initialized yet.
+    #[cfg(feature = "gc")]
+    pub fn gc_heap_capacity(&self) -> usize {
+        self.inner.gc_heap_capacity()
     }
 
     /// Returns the amount fuel in this [`Store`]. When fuel is enabled, it must
@@ -1306,6 +1317,35 @@ impl<T> Store<T> {
     pub fn clear_debug_handler(&mut self) {
         self.inner.debug_handler = None;
     }
+
+    /// Register a [`Module`] with this store's module registry for
+    /// debugging, without instantiating it.
+    ///
+    /// This makes the module visible to debuggers (via
+    /// `debug_all_modules`) before the module is actually
+    /// instantiated. This is useful for guest-debug workflows where
+    /// the debugger needs to see modules to set breakpoints before
+    /// the first Wasm instruction executes.
+    #[cfg(feature = "debug")]
+    pub fn debug_register_module(&mut self, module: &crate::Module) -> crate::Result<()> {
+        let (modules, engine, breakpoints) = self.inner.modules_and_engine_and_breakpoints_mut();
+        modules.register_module(module, engine, breakpoints)?;
+        Ok(())
+    }
+
+    /// Register all inner modules of a [`Component`](crate::component::Component)
+    /// with this store's module registry for debugging, without instantiating
+    /// the component.
+    #[cfg(all(feature = "debug", feature = "component-model"))]
+    pub fn debug_register_component(
+        &mut self,
+        component: &crate::component::Component,
+    ) -> crate::Result<()> {
+        for module in component.static_modules() {
+            self.debug_register_module(module)?;
+        }
+        Ok(())
+    }
 }
 
 impl<'a, T> StoreContext<'a, T> {
@@ -1536,7 +1576,7 @@ impl<T> StoreInner<T> {
         // noop shim so code can assume this always exists.
     }
 
-    /// Splits this `StoreInner<T>` into a `limiter`/`StoerOpaque` borrow while
+    /// Splits this `StoreInner<T>` into a `limiter`/`StoreOpaque` borrow while
     /// validating that an async limiter is not configured.
     ///
     /// This is used for sync entrypoints which need to fail if an async limiter
@@ -1687,13 +1727,13 @@ impl StoreOpaque {
 
     pub(crate) fn host_globals(
         &self,
-    ) -> &PrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>> {
+    ) -> &TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>> {
         &self.host_globals
     }
 
     pub(crate) fn host_globals_mut(
         &mut self,
-    ) -> &mut PrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>> {
+    ) -> &mut TryPrimaryMap<DefinedGlobalIndex, StoreBox<VMHostGlobalContext>> {
         &mut self.host_globals
     }
 
@@ -1942,7 +1982,11 @@ impl StoreOpaque {
                     .allocator()
                     .allocate_gc_heap(engine, &**gc_runtime, mem_alloc_index, mem)?;
 
-            Ok(GcStore::new(index, heap))
+            Ok(GcStore::new(
+                index,
+                heap,
+                engine.tunables().gc_zeal_alloc_counter,
+            ))
         }
 
         #[cfg(not(feature = "gc"))]
@@ -2003,6 +2047,16 @@ impl StoreOpaque {
         }
     }
 
+    /// Returns the current capacity of the GC heap in bytes, or 0 if the GC
+    /// heap has not been initialized yet.
+    #[cfg(feature = "gc")]
+    pub(crate) fn gc_heap_capacity(&self) -> usize {
+        match self.gc_store.as_ref() {
+            Some(gc_store) => gc_store.gc_heap_capacity(),
+            None => 0,
+        }
+    }
+
     /// Helper to assert that a GC store was previously allocated and is
     /// present.
     ///
@@ -2026,6 +2080,13 @@ impl StoreOpaque {
         self.gc_store
             .as_mut()
             .expect("attempted to access the store's GC heap before it has been allocated")
+    }
+
+    /// Returns a mutable reference to the GC store if it has been allocated.
+    #[inline]
+    #[cfg(feature = "gc-drc")]
+    pub(crate) fn try_gc_store_mut(&mut self) -> Option<&mut GcStore> {
+        self.gc_store.as_mut()
     }
 
     #[inline]
@@ -2059,7 +2120,15 @@ impl StoreOpaque {
 
         self.trace_roots(&mut roots, asyncness).await;
         self.unwrap_gc_store_mut()
-            .gc(asyncness, unsafe { roots.iter() })
+            .gc(
+                asyncness,
+                unsafe { roots.iter() },
+                // TODO: Once `Config` has an optional `AsyncFn` field for
+                // yielding to the current async runtime
+                // (e.g. `tokio::task::yield_now`), use that if set; otherwise
+                // fall back to the runtime-agnostic code.
+                yield_now,
+            )
             .await;
 
         // Restore the GC roots for the next GC.
@@ -2078,20 +2147,32 @@ impl StoreOpaque {
 
         self.trace_wasm_stack_roots(gc_roots_list);
         if asyncness != Asyncness::No {
-            vm::Yield::new().await;
+            self.yield_now().await;
         }
+
         #[cfg(feature = "stack-switching")]
         {
             self.trace_wasm_continuation_roots(gc_roots_list);
             if asyncness != Asyncness::No {
-                vm::Yield::new().await;
+                self.yield_now().await;
             }
         }
+
         self.trace_vmctx_roots(gc_roots_list);
         if asyncness != Asyncness::No {
-            vm::Yield::new().await;
+            self.yield_now().await;
         }
+
+        self.trace_instance_roots(gc_roots_list);
+        if asyncness != Asyncness::No {
+            self.yield_now().await;
+        }
+
         self.trace_user_roots(gc_roots_list);
+        if asyncness != Asyncness::No {
+            self.yield_now().await;
+        }
+
         self.trace_pending_exception_roots(gc_roots_list);
 
         log::trace!("End trace GC roots")
@@ -2219,6 +2300,22 @@ impl StoreOpaque {
         self.for_each_global(|store, global| global.trace_root(store, gc_roots_list));
         self.for_each_table(|store, table| table.trace_roots(store, gc_roots_list));
         log::trace!("End trace GC roots :: vmctx");
+    }
+
+    #[cfg(feature = "gc")]
+    fn trace_instance_roots(&mut self, gc_roots_list: &mut GcRootsList) {
+        log::trace!("Begin trace GC roots :: instance");
+        for (_id, instance) in &mut self.instances {
+            // SAFETY: the instance's GC roots will remain valid for the
+            // duration of this GC cycle.
+            unsafe {
+                instance
+                    .handle
+                    .get_mut()
+                    .trace_element_segment_roots(gc_roots_list);
+            }
+        }
+        log::trace!("End trace GC roots :: instance");
     }
 
     #[cfg(feature = "gc")]
@@ -2377,14 +2474,14 @@ impl StoreOpaque {
     /// Same as `take_hostcall_val_storage`, but for the direction of the host
     /// calling wasm.
     #[inline]
-    pub fn take_wasm_val_raw_storage(&mut self) -> Vec<ValRaw> {
+    pub fn take_wasm_val_raw_storage(&mut self) -> TryVec<ValRaw> {
         mem::take(&mut self.wasm_val_raw_storage)
     }
 
     /// Same as `save_hostcall_val_storage`, but for the direction of the host
     /// calling wasm.
     #[inline]
-    pub fn save_wasm_val_raw_storage(&mut self, storage: Vec<ValRaw>) {
+    pub fn save_wasm_val_raw_storage(&mut self, storage: TryVec<ValRaw>) {
         if storage.capacity() > self.wasm_val_raw_storage.capacity() {
             self.wasm_val_raw_storage = storage;
         }
@@ -2725,6 +2822,29 @@ at https://bytecodealliance.org/security.
             Asyncness::No => {}
         }
     }
+
+    #[cfg(any(feature = "async", feature = "gc"))]
+    pub(crate) async fn yield_now(&self) {
+        // TODO: Once `Config` has an optional `AsyncFn` field for yielding to the
+        // current async runtime (e.g. `tokio::task::yield_now`), use that if set;
+        // otherwise fall back to the runtime-agnostic code.
+        yield_now().await
+    }
+}
+
+#[cfg(any(feature = "async", feature = "gc"))]
+async fn yield_now() {
+    let mut yielded = false;
+    future::poll_fn(move |cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// Helper parameter to [`StoreOpaque::allocate_instance`].

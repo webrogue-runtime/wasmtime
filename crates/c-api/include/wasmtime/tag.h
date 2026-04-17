@@ -1,91 +1,72 @@
 /**
  * \file wasmtime/tag.h
  *
- * \brief Wasmtime APIs for WebAssembly exception tag types.
+ * \brief Wasmtime APIs for interacting with WebAssembly tags.
  *
- * This header defines the C API for `wasmtime_tagtype_t`, the type descriptor
- * for WebAssembly exception tags (wasm exception-handling proposal).  Because
- * `wasm.h` is vendored from the upstream wasm-c-api repository and does not
- * yet include tag-type support, the declarations live here instead.
+ * Tags are used to create and identify exception objects. A tag describes
+ * the signature (payload types) of exceptions created with it.
  */
 
 #ifndef WASMTIME_TAG_H
 #define WASMTIME_TAG_H
 
-#include <stddef.h>
 #include <wasm.h>
+#include <wasmtime/error.h>
+#include <wasmtime/store.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/**
- * \brief Opaque type representing a WebAssembly exception tag type.
- *
- * A tag type is described by a function type whose parameters are the exception
- * payload types and whose results are the tag's result types (currently always
- * empty, but reserved for the stack-switching proposal).
- */
-typedef struct wasmtime_tagtype_t wasmtime_tagtype_t;
+/// \brief Representation of a tag in Wasmtime.
+///
+/// Tags in Wasmtime are represented as an index into a store and don't
+/// have any data or destructor associated with the #wasmtime_tag_t value.
+/// Tags cannot interoperate between #wasmtime_store_t instances and if the
+/// wrong tag is passed to the wrong store then it may trigger an assertion
+/// to abort the process.
+typedef struct wasmtime_tag {
+  struct {
+    /// Internal identifier of what store this belongs to, never zero.
+    uint64_t store_id;
+    /// Private field for Wasmtime.
+    uint32_t __private1;
+  };
+  /// Private field for Wasmtime.
+  uint32_t __private2;
+} wasmtime_tag_t;
+
+/// \brief Value of #wasmtime_extern_kind_t meaning that #wasmtime_extern_t is a
+/// tag
+#define WASMTIME_EXTERN_TAG 5
 
 /**
- * \brief Value returned by #wasm_externtype_kind for exception tags.
+ * \brief Creates a new host-defined tag.
  *
- * This constant extends the `WASM_EXTERN_*` range from `wasm.h` (0–3) with
- * tag support.  It is distinct from #WASMTIME_EXTERN_SHAREDMEMORY (which is
- * a discriminant for the runtime #wasmtime_extern_t union in
- * `wasmtime/extern.h`).
+ * \param store the store in which to create the tag
+ * \param tt the tag type that describes the tag's exception payload
+ * \param ret on success, filled with the new tag
+ *
+ * \return NULL on success, otherwise an error describing the failure.
  */
-#define WASMTIME_EXTERNTYPE_TAG 4
+WASM_API_EXTERN wasmtime_error_t *wasmtime_tag_new(wasmtime_context_t *store,
+                                                   const wasm_tagtype_t *tt,
+                                                   wasmtime_tag_t *ret);
 
 /**
- * \brief Creates a new tag type from the given function type.
+ * \brief Returns the type of the given tag.
  *
- * The function type describes the exception payload: its parameters are the
- * tag's exception payload types and its results are the tag's result types.
- * `engine` is used to resolve `functype` if it has not yet been interned.
- *
- * Returns an owned #wasmtime_tagtype_t that must be freed with
- * #wasmtime_tagtype_delete.
+ * The returned #wasm_tagtype_t is owned by the caller.
  */
-WASM_API_EXTERN wasmtime_tagtype_t *
-wasmtime_tagtype_new(wasm_engine_t *engine, const wasm_functype_t *functype);
-
-/// \brief Deletes a #wasmtime_tagtype_t.
-WASM_API_EXTERN void wasmtime_tagtype_delete(wasmtime_tagtype_t *);
-
-/// \brief Returns a copy of the given #wasmtime_tagtype_t (caller owns the
-/// result).
-WASM_API_EXTERN wasmtime_tagtype_t *
-wasmtime_tagtype_copy(const wasmtime_tagtype_t *);
+WASM_API_EXTERN wasm_tagtype_t *
+wasmtime_tag_type(const wasmtime_context_t *store, const wasmtime_tag_t *tag);
 
 /**
- * \brief Returns the function type describing this tag's exception payload.
- *
- * The caller owns the returned #wasm_functype_t and must free it with
- * #wasm_functype_delete.
+ * \brief Tests whether two tags are identical (same definition).
  */
-WASM_API_EXTERN wasm_functype_t *
-wasmtime_tagtype_functype(const wasmtime_tagtype_t *);
-
-/// \brief Converts a #wasmtime_tagtype_t to a #wasm_externtype_t (borrowed).
-WASM_API_EXTERN wasm_externtype_t *
-wasmtime_tagtype_as_externtype(wasmtime_tagtype_t *);
-
-/// \brief Converts a const #wasmtime_tagtype_t to a const #wasm_externtype_t
-/// (borrowed).
-WASM_API_EXTERN const wasm_externtype_t *
-wasmtime_tagtype_as_externtype_const(const wasmtime_tagtype_t *);
-
-/// \brief Converts a #wasm_externtype_t to a #wasmtime_tagtype_t, or NULL if
-/// not a tag.
-WASM_API_EXTERN wasmtime_tagtype_t *
-wasmtime_externtype_as_tagtype(wasm_externtype_t *);
-
-/// \brief Converts a const #wasm_externtype_t to a const #wasmtime_tagtype_t,
-/// or NULL if not a tag.
-WASM_API_EXTERN const wasmtime_tagtype_t *
-wasmtime_externtype_as_tagtype_const(const wasm_externtype_t *);
+WASM_API_EXTERN bool wasmtime_tag_eq(const wasmtime_context_t *store,
+                                     const wasmtime_tag_t *a,
+                                     const wasmtime_tag_t *b);
 
 #ifdef __cplusplus
 } // extern "C"
