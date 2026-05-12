@@ -2,13 +2,14 @@
 
 use clap::Parser;
 use serde::Deserialize;
+use std::num::NonZeroUsize;
 use std::{
     fmt, fs,
     num::NonZeroU32,
     path::{Path, PathBuf},
     time::Duration,
 };
-use wasmtime::{Config, Result, bail, error::Context as _};
+use wasmtime::{Config, Result, WasmBacktraceDetails, bail, error::Context as _};
 
 pub mod opt;
 
@@ -261,7 +262,9 @@ wasmtime_option_group! {
         pub native_unwind_info: Option<bool>,
 
         /// Whether to perform function inlining during compilation.
-        pub inlining: Option<bool>,
+        #[serde(default)]
+        #[serde(deserialize_with = "crate::opt::cli_parse_wrapper")]
+        pub inlining: Option<wasmtime::Inlining>,
 
         #[prefixed = "cranelift"]
         #[serde(default)]
@@ -307,6 +310,8 @@ wasmtime_option_group! {
         /// Allow the debugger component to inherit stderr. Off by
         /// default.
         pub inherit_stderr: Option<bool>,
+        /// Maximum number of frames to capture in backtraces.
+        pub max_backtrace: Option<usize>,
     }
 
     enum Debug {
@@ -414,7 +419,7 @@ wasmtime_option_group! {
         pub component_model_async: Option<bool>,
         /// Component model support for async lifting/lowering: this corresponds
         /// to the 🚝 emoji in the component model specification.
-        pub component_model_async_builtins: Option<bool>,
+        pub component_model_more_async_builtins: Option<bool>,
         /// Component model support for async lifting/lowering: this corresponds
         /// to the 🚟 emoji in the component model specification.
         pub component_model_async_stackful: Option<bool>,
@@ -945,6 +950,16 @@ impl CommonOptions {
         if let Some(enable) = self.debug.address_map {
             config.generate_address_map(enable);
         }
+        if let Some(frames) = self.debug.max_backtrace {
+            match NonZeroUsize::new(frames) {
+                None => {
+                    config.wasm_backtrace_details(WasmBacktraceDetails::Disable);
+                }
+                Some(amt) => {
+                    config.wasm_backtrace_max_frames(Some(amt));
+                }
+            }
+        }
         if let Some(enable) = self.opts.memory_init_cow {
             config.memory_init_cow(enable);
         }
@@ -1189,7 +1204,7 @@ impl CommonOptions {
         handle_conditionally_compiled! {
             ("component-model", component_model, wasm_component_model)
             ("component-model-async", component_model_async, wasm_component_model_async)
-            ("component-model-async", component_model_async_builtins, wasm_component_model_async_builtins)
+            ("component-model-async", component_model_more_async_builtins, wasm_component_model_more_async_builtins)
             ("component-model-async", component_model_async_stackful, wasm_component_model_async_stackful)
             ("component-model-async", component_model_threading, wasm_component_model_threading)
             ("component-model", component_model_error_context, wasm_component_model_error_context)

@@ -127,7 +127,7 @@ wasmtime_environ::foreach_builtin_function!(declare_function_signatures);
 /// The `FuncEnvironment` implementation for use by the `ModuleEnvironment`.
 pub struct FuncEnvironment<'module_environment> {
     compiler: &'module_environment Compiler,
-    isa: &'module_environment (dyn TargetIsa + 'module_environment),
+    isa: &'module_environment (dyn TargetIsa + 'static),
     key: FuncKey,
     pub(crate) module: &'module_environment Module,
     types: &'module_environment ModuleTypesBuilder,
@@ -1848,11 +1848,22 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
             // direct call to that function (presumably it will eventually be
             // inlined).
             #[cfg(feature = "component-model")]
-            Some(FuncKey::UnsafeIntrinsic(..)) => {
+            Some(FuncKey::UnsafeIntrinsic(abi, intrinsic)) => {
                 let callee = self
                     .env
                     .get_or_create_imported_func_ref(self.builder.func, callee_index);
-                Ok(self.direct_call_inst(callee, &real_call_args))
+                if self.can_directly_inline_unsafe_intrinsic(*abi) {
+                    let result = super::compiler::component::UnsafeIntrinsicCompiler {
+                        cursor: self.builder.cursor(),
+                        isa: self.env.isa,
+                        ptr: &self.env.offsets.ptr,
+                    }
+                    .translate(*intrinsic, &real_call_args)
+                    .unwrap();
+                    Ok(result.into_iter().collect())
+                } else {
+                    Ok(self.direct_call_inst(callee, &real_call_args))
+                }
             }
 
             // The import is always satisfied with the given defined Wasm
@@ -1879,6 +1890,21 @@ impl<'a, 'func, 'module_env> Call<'a, 'func, 'module_env> {
                 Ok(self.indirect_call_inst(sig_ref, func_addr, &real_call_args))
             }
         }
+    }
+
+    /// Determines if a direct inline-during-translation is possible for a call
+    /// made to an `UnsafeIntrinsic`.
+    ///
+    /// This only happens in "normal" circumstances where it's considered safe
+    /// to bypass the otherwise off-by-default Cranelift inliner that Wasmtime
+    /// has. This is a performance optimization to avoid needing to turn on all
+    /// of inlining to get the performance benefit of inlining unsafe
+    /// intrinsics. The fallback of issuing a `call` to the intrinsic is always
+    /// suitable to do and is used in situations where the call instruction may
+    /// have extra context.
+    #[cfg(feature = "component-model")]
+    fn can_directly_inline_unsafe_intrinsic(&self, abi: wasmtime_environ::Abi) -> bool {
+        abi == wasmtime_environ::Abi::Wasm && !self.tail && !self.env.tunables.debug_guest
     }
 
     /// Do a Wasm-level indirect call through the given funcref table.
@@ -2776,7 +2802,7 @@ impl FuncEnvironment<'_> {
     pub fn translate_array_copy(
         &mut self,
         builder: &mut FunctionBuilder,
-        _dst_array_type_index: TypeIndex,
+        dst_array_type_index: TypeIndex,
         dst_array: ir::Value,
         dst_index: ir::Value,
         _src_array_type_index: TypeIndex,
@@ -2784,12 +2810,38 @@ impl FuncEnvironment<'_> {
         src_index: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
-        let libcall = gc::builtins::array_copy(self, builder.func)?;
+        let interned_type_index =
+            self.module.types[dst_array_type_index].unwrap_module_type_index();
+        let array_ty = self.types.unwrap_array(interned_type_index)?;
+        let elem_ty = array_ty.0.element_type;
+
         let vmctx = self.vmctx_val(&mut builder.cursor());
-        builder.ins().call(
-            libcall,
-            &[vmctx, dst_array, dst_index, src_array, src_index, len],
-        );
+
+        if elem_ty.is_vmgcref_type_and_not_i31() {
+            let libcall = gc::builtins::array_copy_gc_ref_elems(self, builder.func)?;
+            builder.ins().call(
+                libcall,
+                &[vmctx, dst_array, dst_index, src_array, src_index, len],
+            );
+        } else {
+            let libcall = gc::builtins::array_copy_non_gc_ref_elems(self, builder.func)?;
+            let interned_type_index = builder
+                .ins()
+                .iconst(I32, i64::from(interned_type_index.as_u32()));
+            builder.ins().call(
+                libcall,
+                &[
+                    vmctx,
+                    interned_type_index,
+                    dst_array,
+                    dst_index,
+                    src_array,
+                    src_index,
+                    len,
+                ],
+            );
+        }
+
         Ok(())
     }
 

@@ -154,6 +154,9 @@ audit-as-crates-io = true
 [policy.wasmtime-internal-fiber]
 audit-as-crates-io = true
 
+[policy.wasmtime-internal-gdbstub-component-artifact]
+audit-as-crates-io = true
+
 [policy.wasmtime-internal-jit-debug]
 audit-as-crates-io = true
 
@@ -377,11 +380,11 @@ version = "1.12.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl]]
-version = "0.10.73"
+version = "0.10.78"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl-sys]]
-version = "0.9.109"
+version = "0.9.114"
 criteria = "safe-to-deploy"
 
 [[exemptions.openvino-finder]]

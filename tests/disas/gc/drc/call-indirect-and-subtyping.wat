@@ -21,19 +21,19 @@
 ;;     gv1 = load.i64 notrap aligned readonly gv0+8
 ;;     gv2 = load.i64 notrap aligned gv1+24
 ;;     gv3 = vmctx
-;;     gv4 = load.i64 notrap aligned readonly can_move gv3+96
+;;     gv4 = load.i64 notrap aligned readonly can_move gv3+112
 ;;     sig0 = (i64 vmctx, i64) tail
 ;;     sig1 = (i64 vmctx, i32, i64) -> i64 tail
 ;;     sig2 = (i64 vmctx, i32, i32) -> i32 tail
 ;;     fn0 = colocated u805306368:9 sig1
-;;     fn1 = colocated u805306368:35 sig2
+;;     fn1 = colocated u805306368:36 sig2
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32):
 ;; @005c                               v3 = iconst.i32 2
 ;; @005c                               v4 = icmp uge v2, v3  ; v3 = 2
 ;; @005c                               v9 = iconst.i64 0
-;; @005c                               v6 = load.i64 notrap aligned readonly can_move v0+96
+;; @005c                               v6 = load.i64 notrap aligned readonly can_move v0+112
 ;; @005c                               v5 = uextend.i64 v2
 ;;                                     v30 = iconst.i64 3
 ;; @005c                               v7 = ishl v5, v30  ; v30 = 3

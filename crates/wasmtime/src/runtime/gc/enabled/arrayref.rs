@@ -76,6 +76,14 @@ impl ArrayRefPre {
 
     pub(crate) fn _new(store: &mut StoreOpaque, ty: ArrayType) -> Self {
         store.insert_gc_host_alloc_type(ty.registered_type().clone());
+
+        // If a GC heap is already allocated, eagerly register trace info
+        // now. Otherwise, trace info will be registered when the GC heap
+        // is allocated in `StoreOpaque::allocate_gc_store`.
+        if let Some(gc_store) = store.optional_gc_store_mut() {
+            gc_store.ensure_trace_info(ty.registered_type().index());
+        }
+
         let store_id = store.id();
         ArrayRefPre { store_id, ty }
     }
@@ -393,21 +401,20 @@ impl ArrayRef {
             "attempted to use a `ArrayRefPre` with the wrong store"
         );
 
-        // Type check the elements against the element type.
-        for elem in elems.clone() {
-            elem.ensure_matches_ty(store, allocator.ty.element_type().unpack())
-                .context("element type mismatch")?;
-        }
-
         let len = u32::try_from(elems.len()).unwrap();
 
-        // Allocate the array and write each field value into the appropriate
-        // offset.
+        // Allocate the array.
         let arrayref = store
             .require_gc_store_mut()?
             .alloc_uninit_array(allocator.type_index(), len, allocator.layout())
             .context("unrecoverable error when allocating new `arrayref`")?
             .map_err(|n| GcHeapOutOfMemory::new((), n))?;
+
+        // Type check the elements against the element type.
+        for elem in elems.clone() {
+            elem.ensure_matches_ty(store, allocator.ty.element_type().unpack())
+                .context("element type mismatch")?;
+        }
 
         // From this point on, if we get any errors, then the array is not
         // fully initialized, so we need to eagerly deallocate it before the

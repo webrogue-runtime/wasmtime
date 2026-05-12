@@ -4,7 +4,6 @@ use crate::component::Instance;
 #[cfg(feature = "component-model-async")]
 use crate::component::concurrent::WaitResult;
 use crate::prelude::*;
-use crate::runtime::component::RuntimeInstance;
 #[cfg(feature = "component-model-async")]
 use crate::runtime::component::concurrent::{ResourcePair, SuspensionTarget};
 use crate::runtime::vm::component::{ComponentInstance, VMComponentContext};
@@ -681,15 +680,9 @@ fn enter_sync_call(
     callee_instance: u32,
 ) -> Result<()> {
     store.enter_guest_sync_call(
-        Some(RuntimeInstance {
-            instance: instance.id().instance(),
-            index: RuntimeComponentInstanceIndex::from_u32(caller_instance),
-        }),
+        Some(instance.runtime_instance(RuntimeComponentInstanceIndex::from_u32(caller_instance))),
         callee_async != 0,
-        RuntimeInstance {
-            instance: instance.id().instance(),
-            index: RuntimeComponentInstanceIndex::from_u32(callee_instance),
-        },
+        instance.runtime_instance(RuntimeComponentInstanceIndex::from_u32(callee_instance)),
     )
 }
 
@@ -708,10 +701,7 @@ fn backpressure_modify(
     increment: u8,
 ) -> Result<()> {
     store.backpressure_modify(
-        RuntimeInstance {
-            instance: instance.id().instance(),
-            index: RuntimeComponentInstanceIndex::from_u32(caller_instance),
-        },
+        instance.runtime_instance(RuntimeComponentInstanceIndex::from_u32(caller_instance)),
         |old| {
             if increment != 0 {
                 old.checked_add(1)
@@ -1324,27 +1314,6 @@ fn error_context_drop(
         TypeComponentLocalErrorContextTableIndex::from_u32(ty),
         err_ctx_handle,
     )
-}
-
-#[cfg(feature = "component-model-async")]
-fn context_get(
-    store: &mut dyn VMStore,
-    instance: Instance,
-    _caller_instance: u32,
-    slot: u32,
-) -> Result<u32> {
-    instance.context_get(store, slot)
-}
-
-#[cfg(feature = "component-model-async")]
-fn context_set(
-    store: &mut dyn VMStore,
-    instance: Instance,
-    _caller_instance: u32,
-    slot: u32,
-    val: u32,
-) -> Result<()> {
-    instance.context_set(store, slot, val)
 }
 
 #[cfg(feature = "component-model-async")]

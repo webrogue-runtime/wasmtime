@@ -18,6 +18,7 @@ use wasmtime_environ::prelude::*;
 pub mod limits {
     pub const MEMORY_SIZE: usize = 805 << 16;
     pub const MEMORIES: u32 = 450;
+    pub const GC_HEAP_SIZE: usize = 1 << 16;
     pub const TABLES: u32 = 200;
     pub const MEMORIES_PER_MODULE: u32 = 9;
     pub const TABLES_PER_MODULE: u32 = 5;
@@ -25,7 +26,7 @@ pub mod limits {
     pub const CORE_INSTANCES: u32 = 900;
     pub const TABLE_ELEMENTS: usize = 1000;
     pub const CORE_INSTANCE_SIZE: usize = 64 * 1024;
-    pub const TOTAL_STACKS: u32 = 10;
+    pub const TOTAL_STACKS: u32 = 20;
 }
 
 /// Local all `*.wast` tests under `root` which should be the path to the root
@@ -202,7 +203,7 @@ fn component_test_config(test: &Path) -> TestConfig {
         {
             ret.component_model_async = Some(true);
             ret.component_model_async_stackful = Some(true);
-            ret.component_model_async_builtins = Some(true);
+            ret.component_model_more_async_builtins = Some(true);
             ret.component_model_threading = Some(true);
         }
         if parent.ends_with("wasm-tools") {
@@ -275,7 +276,7 @@ macro_rules! foreach_config_option {
             hogs_memory
             nan_canonicalization
             component_model_async
-            component_model_async_builtins
+            component_model_more_async_builtins
             component_model_async_stackful
             component_model_threading
             component_model_error_context
@@ -410,9 +411,7 @@ impl Compiler {
                 }
 
                 if cfg!(target_arch = "aarch64") {
-                    return config.wide_arithmetic()
-                        || (config.simd() && !config.spec_test())
-                        || config.threads();
+                    return (config.simd() && !config.spec_test()) || config.threads();
                 }
 
                 !cfg!(target_arch = "x86_64")
@@ -467,10 +466,10 @@ impl WastTest {
             return true;
         }
 
-        // These tests in the `component-model` submodule have not yet been
-        // updated to account for the recent threading-related intrinsic
-        // changes
         let unsupported = [
+            // These tests in the `component-model` submodule have not yet been
+            // updated to account for the recent threading-related intrinsic
+            // changes
             "test/async/same-component-stream-future.wast",
             "test/async/trap-if-block-and-sync.wast",
         ];

@@ -545,6 +545,15 @@ macro_rules! isle_common_prelude_methods {
         }
 
         #[inline]
+        fn ty_int_vec128(&mut self, ty: Type) -> Option<Type> {
+            if ty.is_int() || (ty.is_vector() && ty.bits() == 128 && ty.lane_type().is_int()) {
+                Some(ty)
+            } else {
+                None
+            }
+        }
+
+        #[inline]
         fn ty_scalar(&mut self, ty: Type) -> Option<Type> {
             if ty.lane_count() == 1 { Some(ty) } else { None }
         }
@@ -840,6 +849,22 @@ macro_rules! isle_common_prelude_methods {
                 | IntCC::SignedGreaterThan
                 | IntCC::SignedLessThanOrEqual
                 | IntCC::SignedLessThan => Some(*cc),
+            }
+        }
+
+        #[inline]
+        fn unsigned_cond_code(&mut self, cc: &IntCC) -> Option<IntCC> {
+            match cc {
+                IntCC::Equal
+                | IntCC::UnsignedGreaterThanOrEqual
+                | IntCC::UnsignedGreaterThan
+                | IntCC::UnsignedLessThanOrEqual
+                | IntCC::UnsignedLessThan
+                | IntCC::NotEqual => Some(*cc),
+                IntCC::SignedGreaterThanOrEqual
+                | IntCC::SignedGreaterThan
+                | IntCC::SignedLessThanOrEqual
+                | IntCC::SignedLessThan => None,
             }
         }
 

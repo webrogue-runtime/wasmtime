@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wasmtime::{
     AsContextMut, Caller, Config, DebugEvent, DebugHandler, Engine, Extern, FrameHandle, Func,
-    Global, GlobalType, Instance, Module, ModulePC, Mutability, Store, StoreContextMut, Val,
-    ValType,
+    Global, GlobalType, Inlining, Instance, Module, ModulePC, Mutability, Result, Store,
+    StoreContextMut, Val, ValType,
 };
 
 use crate::async_functions::PollOnce;
@@ -74,7 +74,7 @@ fn test_stack_values<
 fn stack_values_two_frames() -> wasmtime::Result<()> {
     let _ = env_logger::try_init();
 
-    for inlining in [false, true] {
+    for inlining in [Inlining::No, Inlining::Yes] {
         test_stack_values(
             r#"
     (module
@@ -92,11 +92,6 @@ fn stack_values_two_frames() -> wasmtime::Result<()> {
     "#,
             |config| {
                 config.compiler_inlining(inlining);
-                if inlining {
-                    unsafe {
-                        config.cranelift_flag_set("wasmtime_inlining_intra_module", "true");
-                    }
-                }
             },
             |mut caller: Caller<'_, ()>| {
                 let stack = caller.debug_exit_frames().next().unwrap();
@@ -623,7 +618,7 @@ async fn uncaught_exception_events() -> wasmtime::Result<()> {
     debug_event_checker!(
         D, store,
         { 0 ;
-          wasmtime::DebugEvent::UncaughtExceptionThrown(e) => {
+          wasmtime::DebugEvent::Exception(e) => {
               assert_eq!(e.field(&mut store, 0).unwrap().unwrap_i32(), 42);
               let stack = store.debug_exit_frames().next().unwrap();
               assert_eq!(stack.num_locals(&mut store).unwrap(), 1);
@@ -676,7 +671,7 @@ async fn caught_exception_events() -> wasmtime::Result<()> {
     debug_event_checker!(
         D, store,
         { 0 ;
-          wasmtime::DebugEvent::CaughtExceptionThrown(e) => {
+          wasmtime::DebugEvent::Exception(e) => {
               assert_eq!(e.field(&mut store, 0).unwrap().unwrap_i32(), 42);
               let stack = store.debug_exit_frames().next().unwrap();
               assert_eq!(stack.num_locals(&mut store).unwrap(), 1);
@@ -932,10 +927,7 @@ async fn breakpoints_in_inlined_code() -> wasmtime::Result<()> {
     let (module, mut store) = get_module_and_store(
         |config| {
             config.wasm_exceptions(true);
-            config.compiler_inlining(true);
-            unsafe {
-                config.cranelift_flag_set("wasmtime_inlining_intra_module", "true");
-            }
+            config.compiler_inlining(Inlining::Yes);
         },
         r#"
     (module
@@ -1624,4 +1616,52 @@ async fn component_module_relative_breakpoint_pcs() -> wasmtime::Result<()> {
     assert_eq!(pcs[1], (0, 0x26));
 
     Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(miri, ignore)]
+async fn take_exception_in_debug_handler() -> Result<()> {
+    let mut config = Config::new();
+    config.wasm_exceptions(true);
+    config.guest_debug(true);
+    let engine = Engine::new(&config)?;
+    let mut store = Store::new(&engine, ());
+    store.set_debug_handler(TakeExceptionHandler);
+
+    let module = Module::new(
+        &engine,
+        r#"
+            (module
+              (tag $t)
+              (func (export "run")
+                (block $h (try_table (catch_all $h) (throw $t)))
+              )
+            )
+        "#,
+    )?;
+    let instance = Instance::new_async(&mut store, &module, &[]).await?;
+    let run = instance.get_typed_func::<(), ()>(&mut store, "run")?;
+    let err = run.call_async(&mut store, ()).await.unwrap_err();
+    assert!(err.is::<wasmtime::ThrownException>());
+    return Ok(());
+
+    #[derive(Clone)]
+    struct TakeExceptionHandler;
+
+    impl DebugHandler for TakeExceptionHandler {
+        type Data = ();
+
+        fn handle(
+            &self,
+            mut store: StoreContextMut<'_, ()>,
+            event: DebugEvent<'_>,
+        ) -> impl Future<Output = ()> + Send {
+            let did_take = matches!(event, DebugEvent::Exception(_));
+            // Eat the pending exception that compute_handler put back.
+            if did_take {
+                let _ = store.take_pending_exception();
+            }
+            async move {}
+        }
+    }
 }

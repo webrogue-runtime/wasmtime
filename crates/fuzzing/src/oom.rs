@@ -4,6 +4,7 @@
 //! https://firefox-source-docs.mozilla.org/js/hacking_tips.html#how-to-debug-oomtest-failures
 
 use backtrace::Backtrace;
+use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::{
     alloc::GlobalAlloc,
     cell::Cell,
@@ -31,6 +32,9 @@ enum OomState {
     /// We are in code that is not part of an OOM test.
     #[default]
     OutsideOomTest,
+
+    /// We are inside an OOM test's dry run, counting total allocations.
+    Counting { count: u32 },
 
     /// We are inside an OOM test and should inject an OOM when the counter
     /// reaches zero.
@@ -112,6 +116,11 @@ unsafe impl GlobalAlloc for OomTestAllocator {
 
             match old_state {
                 OomState::OutsideOomTest => unreachable!("handled above"),
+
+                OomState::Counting { count } => {
+                    new_state = OomState::Counting { count: count + 1 };
+                    ptr = unsafe { std::alloc::System.alloc(layout) };
+                }
 
                 OomState::OomOnAlloc {
                     counter: 0,
@@ -259,9 +268,11 @@ impl OomTest {
 
     /// The same as `test` but `async`.
     pub async fn test_async(&self, test_func: impl AsyncFn() -> Result<()>) -> Result<()> {
+        let total_allocs = Self::count_allocations(&test_func).await?;
+
         let start = time::Instant::now();
 
-        for i in 0.. {
+        for i in 0..total_allocs {
             if self.max_iters.is_some_and(|n| i >= n)
                 || self.max_duration.is_some_and(|d| start.elapsed() >= d)
             {
@@ -269,48 +280,120 @@ impl OomTest {
             }
 
             log::trace!("=== Injecting OOM after {i} allocations ===");
+            Self::run_one_oom_injection(&test_func, i, self.allow_alloc_after_oom).await?;
+        }
 
-            let future = std::pin::pin!(test_func());
-            let (result, oom_state) = OomTestFuture::new(
-                future,
-                OomState::OomOnAlloc {
-                    counter: i,
-                    allow_alloc_after: self.allow_alloc_after_oom,
-                },
-            )
-            .await;
+        Ok(())
+    }
 
-            match (result, oom_state) {
-                (_, OomState::OutsideOomTest) => unreachable!(),
+    /// Similar to `test` but instead of exhaustively injecting OOMs on every
+    /// allocation, randomly chooses which allocation to OOM each iteration.
+    ///
+    /// Requires `max_iters` to be set.
+    pub fn fuzz(&self, test_func: impl Fn() -> Result<()>) -> Result<()> {
+        let future = self.fuzz_async(|| async { test_func() });
+        crate::block_on(future)
+    }
 
-                // The test function completed successfully before we ran out of
-                // allocation fuel, so we're done.
-                (Ok(()), OomState::OomOnAlloc { .. }) => break,
+    /// The same as `fuzz` but `async`.
+    pub async fn fuzz_async(&self, test_func: impl AsyncFn() -> Result<()>) -> Result<()> {
+        let max_iters = match self.max_iters {
+            Some(n) => n,
+            None => bail!("OomTest::fuzz requires max_iters to be set"),
+        };
 
-                // We injected an OOM and the test function handled it
-                // correctly; continue to the next iteration.
-                (Err(e), OomState::DidOom { .. }) if e.is::<OutOfMemory>() => {}
+        let total_allocs = Self::count_allocations(&test_func).await?;
 
-                // Missed OOMs.
-                (Ok(()), OomState::DidOom { .. }) => {
-                    bail!("OOM test function missed an OOM: returned Ok(())");
-                }
-                (Err(e), OomState::DidOom { .. }) => {
-                    return Err(
-                        e.context("OOM test function missed an OOM: returned non-OOM error")
-                    );
-                }
+        if total_allocs == 0 {
+            return Ok(());
+        }
 
-                // Unexpected error.
-                (Err(e), OomState::OomOnAlloc { .. }) => {
-                    return Err(
-                        e.context("OOM test function returned an error when there was no OOM")
-                    );
-                }
+        let mut rng = SmallRng::seed_from_u64(0);
+
+        for _ in 0..max_iters {
+            let i = rng.random_range(0..total_allocs);
+            log::trace!("=== Injecting OOM after {i} allocations (fuzz) ===");
+            Self::run_one_oom_injection(&test_func, i, self.allow_alloc_after_oom).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Run the test function once, injecting OOM on the `i`th allocation, and
+    /// check that the result correctly reflects whether an OOM was hit.
+    async fn run_one_oom_injection(
+        test_func: &impl AsyncFn() -> Result<()>,
+        i: u32,
+        allow_alloc_after_oom: bool,
+    ) -> Result<()> {
+        let future = std::pin::pin!(test_func());
+        let (result, oom_state) = OomTestFuture::new(
+            future,
+            OomState::OomOnAlloc {
+                counter: i,
+                allow_alloc_after: allow_alloc_after_oom,
+            },
+        )
+        .await;
+
+        match (result, oom_state) {
+            (_, OomState::OutsideOomTest | OomState::Counting { .. }) => unreachable!(),
+
+            // The test function completed successfully before we reached
+            // this allocation point (allocation count may differ slightly
+            // between the counting run and OOM injection runs).
+            (Ok(()), OomState::OomOnAlloc { .. }) => {}
+
+            // We injected an OOM and the test function handled it correctly.
+            (Err(e), OomState::DidOom { .. }) if e.is::<OutOfMemory>() => {}
+
+            // Missed OOMs.
+            (Ok(()), OomState::DidOom { .. }) => {
+                bail!("OOM test function missed an OOM: returned Ok(())");
+            }
+            (Err(e), OomState::DidOom { .. }) => {
+                return Err(e.context("OOM test function missed an OOM: returned non-OOM error"));
+            }
+
+            // Unexpected error.
+            (Err(e), OomState::OomOnAlloc { .. }) => {
+                return Err(e.context("OOM test function returned an error when there was no OOM"));
             }
         }
 
         Ok(())
+    }
+
+    /// Run the test function without injecting OOMs, counting allocations.
+    ///
+    /// Repeats until the count stabilizes across two consecutive runs,
+    /// since the first run may change internal state (e.g. grow hash map
+    /// capacities) that subsequent runs reuse.
+    async fn count_allocations(test_func: &impl AsyncFn() -> Result<()>) -> Result<u32> {
+        const MAX_DRY_RUN_ITERS: usize = 10;
+
+        let mut total_allocs = u32::MAX;
+        for i in 0..MAX_DRY_RUN_ITERS {
+            log::trace!("=== Counting allocations (dry run {i}) ===");
+            let future = std::pin::pin!(test_func());
+            let (result, oom_state) =
+                OomTestFuture::new(future, OomState::Counting { count: 0 }).await;
+            result?;
+            let count = match oom_state {
+                OomState::Counting { count } => count,
+                _ => unreachable!(),
+            };
+            log::trace!("=== Counted {count} allocations ===");
+            if count == total_allocs {
+                return Ok(total_allocs);
+            }
+            total_allocs = count;
+        }
+
+        bail!(
+            "allocation count did not stabilize after {MAX_DRY_RUN_ITERS} \
+             dry-run iterations (last count: {total_allocs})"
+        )
     }
 }
 

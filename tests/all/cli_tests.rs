@@ -1044,7 +1044,10 @@ fn preview2_stdin() -> Result<()> {
     // helper thread depends on how much the OS buffers for us. For now give
     // some some slop and assume that OSes are unlikely to buffer more than
     // that.
-    let slop = 256 * 1024;
+    //
+    // Note that 256 * 1024 is _one_ byte too small on Asahi Linux (possibly
+    // related to 16K page sizes?), hence the `+ 1` here:
+    let slop = 256 * 1024 + 1;
     for amt in [0, 100, 100_000] {
         let written = count_up_to(amt)?;
         assert!(written < slop + amt, "wrote too much {written}");
@@ -2876,6 +2879,32 @@ start a print 1234
         println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
         assert!(output.status.success());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn p3_cli_serve_post_return() -> Result<()> {
+        let server = WasmtimeServe::new(P3_CLI_SERVE_POST_RETURN_COMPONENT, move |cmd| {
+            cmd.arg("-Wcomponent-model-async");
+            cmd.arg("-Sp3,cli");
+            cmd.arg("--max-instance-reuse-count=1");
+        })?;
+        let resp = server
+            .send_request(
+                hyper::Request::builder()
+                    .uri("http://localhost/")
+                    .body(String::new())
+                    .context("failed to make request")?,
+            )
+            .await?;
+        assert!(resp.status().is_success());
+        assert!(resp.body().is_empty());
+
+        let (stdout, stderr) = server.finish()?;
+        println!("stdout: {stdout}");
+        println!("stderr: {stderr}");
+
+        assert!(stdout.contains("please see me"));
         Ok(())
     }
 }

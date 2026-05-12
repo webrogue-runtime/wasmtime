@@ -31,6 +31,7 @@ pub use crate::runtime::code_memory::CustomCodeMemory;
 pub use wasmtime_cache::{Cache, CacheConfig};
 #[cfg(all(feature = "incremental-cache", feature = "cranelift"))]
 pub use wasmtime_environ::CacheStore;
+pub use wasmtime_environ::Inlining;
 
 pub(crate) const DEFAULT_WASM_BACKTRACE_MAX_FRAMES: NonZeroUsize = NonZeroUsize::new(20).unwrap();
 
@@ -1236,8 +1237,8 @@ impl Config {
     /// [proposal]:
     ///     https://github.com/WebAssembly/component-model/blob/main/design/mvp/Concurrency.md
     #[cfg(feature = "component-model-async")]
-    pub fn wasm_component_model_async_builtins(&mut self, enable: bool) -> &mut Self {
-        self.wasm_features(WasmFeatures::CM_ASYNC_BUILTINS, enable);
+    pub fn wasm_component_model_more_async_builtins(&mut self, enable: bool) -> &mut Self {
+        self.wasm_features(WasmFeatures::CM_MORE_ASYNC_BUILTINS, enable);
         self
     }
 
@@ -2262,9 +2263,8 @@ impl Config {
     /// when using a compilation strategy that does not support inlining, like
     /// Winch.
     ///
-    /// Note that inlining is still somewhat experimental at the moment (as of
-    /// the Wasmtime version 36).
-    pub fn compiler_inlining(&mut self, inlining: bool) -> &mut Self {
+    /// The default value for this is `Inlining::No`.
+    pub fn compiler_inlining(&mut self, inlining: Inlining) -> &mut Self {
         self.tunables.inlining = Some(inlining);
         self
     }
@@ -2321,7 +2321,7 @@ impl Config {
             | WasmFeatures::WIDE_ARITHMETIC
             | WasmFeatures::CM_ASYNC
             | WasmFeatures::CM_ASYNC_STACKFUL
-            | WasmFeatures::CM_ASYNC_BUILTINS
+            | WasmFeatures::CM_MORE_ASYNC_BUILTINS
             | WasmFeatures::CM_THREADING
             | WasmFeatures::CM_ERROR_CONTEXT
             | WasmFeatures::CM_GC
@@ -2376,7 +2376,6 @@ impl Config {
                 match self.compiler_target().architecture {
                     target_lexicon::Architecture::Aarch64(_) => {
                         unsupported |= WasmFeatures::THREADS;
-                        unsupported |= WasmFeatures::WIDE_ARITHMETIC;
                     }
 
                     // Winch doesn't support other non-x64 architectures at this
@@ -2564,6 +2563,17 @@ impl Config {
             tunables.signals_based_traps = false;
         }
 
+        // Inlining currently falls over with the `stack_switch` instruction.
+        #[cfg(any(feature = "cranelift", feature = "winch"))]
+        if features.contains(WasmFeatures::STACK_SWITCHING) {
+            if let Some(inlining) = self.tunables.inlining
+                && inlining != Inlining::No
+            {
+                bail!("cannot enable compiler inlining when stack switching is enabled");
+            }
+            tunables.inlining = Inlining::No;
+        }
+
         self.tunables.configure(&mut tunables);
 
         // If no GC heap tunables are explicitly configured, copy the memory
@@ -2615,7 +2625,7 @@ impl Config {
 
         // Concurrency support is required for some component model features.
         let requires_concurrency = WasmFeatures::CM_ASYNC
-            | WasmFeatures::CM_ASYNC_BUILTINS
+            | WasmFeatures::CM_MORE_ASYNC_BUILTINS
             | WasmFeatures::CM_ASYNC_STACKFUL
             | WasmFeatures::CM_THREADING
             | WasmFeatures::CM_ERROR_CONTEXT;

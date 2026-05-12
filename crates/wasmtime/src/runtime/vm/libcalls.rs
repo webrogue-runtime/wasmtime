@@ -63,7 +63,7 @@ use crate::runtime::vm::VMGcRef;
 use crate::runtime::vm::table::TableElementType;
 use crate::runtime::vm::vmcontext::VMFuncRef;
 use crate::runtime::vm::{
-    self, HostResultHasUnwindSentinel, SendSyncPtr, TrapReason, VMStore, f32x4, f64x2, i8x16,
+    self, HostResultHasUnwindSentinel, SendSyncPtr, VMStore, f32x4, f64x2, i8x16,
 };
 use core::convert::Infallible;
 use core::ptr::NonNull;
@@ -528,7 +528,8 @@ fn table_init(
 // Implementation of `elem.drop`.
 fn elem_drop(store: &mut dyn VMStore, instance: InstanceId, elem_index: u32) -> Result<()> {
     let elem_index = ElemIndex::from_u32(elem_index);
-    store.instance_mut(instance).elem_drop(elem_index)?;
+    let (gc_store, instance) = store.optional_gc_store_and_instance_mut(instance);
+    instance.elem_drop(gc_store, elem_index)?;
     Ok(())
 }
 
@@ -642,10 +643,12 @@ fn grow_gc_heap(store: &mut dyn VMStore, _instance: InstanceId, bytes_needed: u6
     .unwrap();
 
     let (mut limiter, store) = store.resource_limiter_and_store_opaque();
-    block_on!(store, async |store, _asyncness| {
+    block_on!(store, async |store, asyncness| {
         // We error below if there's still not enough space; swallow
         // any growth failures here.
-        let _ = store.grow_gc_heap(limiter.as_mut(), bytes_needed).await;
+        let _ = store
+            .grow_gc_heap(limiter.as_mut(), bytes_needed, asyncness)
+            .await;
     })?;
 
     // JIT code relies on the memory having grown by `bytes_needed` bytes if
@@ -671,7 +674,7 @@ fn grow_gc_heap(store: &mut dyn VMStore, _instance: InstanceId, bytes_needed: u6
 /// Allocate a raw, unininitialized GC object for Wasm code.
 ///
 /// The Wasm code is responsible for initializing the object.
-#[cfg(feature = "gc-drc")]
+#[cfg(any(feature = "gc-drc", feature = "gc-copying"))]
 fn gc_alloc_raw(
     store: &mut dyn VMStore,
     _instance: InstanceId,
@@ -1100,12 +1103,8 @@ fn array_init_elem(
     Ok(())
 }
 
-// TODO: Specialize this libcall for only non-GC array elements, so we never
-// have to do GC barriers and their associated indirect calls through the `dyn
-// GcHeap`. Instead, implement those copies inline in Wasm code. Then, use bulk
-// `memcpy`-style APIs to do the actual copies here.
 #[cfg(feature = "gc")]
-fn array_copy(
+fn array_copy_gc_ref_elems(
     store: &mut dyn VMStore,
     _instance: InstanceId,
     dst_array: u32,
@@ -1130,6 +1129,8 @@ fn array_copy(
     let src_array = VMGcRef::from_raw_u32(src_array).ok_or_else(|| Trap::NullReference)?;
     let src_array = store.unwrap_gc_store_mut().clone_gc_ref(&src_array);
     let src_array = ArrayRef::from_cloned_gc_ref(&mut store, src_array);
+
+    debug_assert!(dst_array.layout(&store).unwrap().elems_are_gc_refs);
 
     // Bounds check the destination array's elements.
     let dst_array_len = dst_array._len(&store)?;
@@ -1162,6 +1163,91 @@ fn array_copy(
             dst_array._set(&mut store, dst_i, src_elem)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "gc")]
+fn array_copy_non_gc_ref_elems(
+    store: &mut dyn VMStore,
+    instance_id: InstanceId,
+    array_type_index: u32,
+    dst_array: u32,
+    dst: u32,
+    src_array: u32,
+    src: u32,
+    len: u32,
+) -> Result<()> {
+    use wasmtime_environ::ModuleInternedTypeIndex;
+
+    log::trace!(
+        "array.copy non-gc-refs(dst_array={dst_array:#x}, dst_index={dst}, src_array={src_array:#x}, src_index={src}, len={len})",
+    );
+
+    let array_type_index = ModuleInternedTypeIndex::from_u32(array_type_index);
+
+    let same_array = dst_array == src_array;
+
+    // Null checks and conversion to `VMArrayRef`.
+    let dst_gc_ref = VMGcRef::from_raw_u32(dst_array).ok_or_else(|| Trap::NullReference)?;
+    let dst_arr = dst_gc_ref
+        .into_arrayref(&*store.unwrap_gc_store().gc_heap)
+        .expect("gc ref should be an array");
+    let src_gc_ref = VMGcRef::from_raw_u32(src_array).ok_or_else(|| Trap::NullReference)?;
+    let src_arr = src_gc_ref
+        .into_arrayref(&*store.unwrap_gc_store().gc_heap)
+        .expect("gc ref should be an array");
+
+    // Bounds check the destination array's elements.
+    let dst_len = dst_arr.len(store.store_opaque());
+    let dst_end = dst.checked_add(len).ok_or_else(|| Trap::ArrayOutOfBounds)?;
+    if dst_end > dst_len {
+        return Err(Trap::ArrayOutOfBounds.into());
+    }
+
+    // Bounds check the source array's elements.
+    let src_len = src_arr.len(store.store_opaque());
+    let src_end = src.checked_add(len).ok_or_else(|| Trap::ArrayOutOfBounds)?;
+    if src_end > src_len {
+        return Err(Trap::ArrayOutOfBounds.into());
+    }
+
+    // Get the array layout to compute byte offsets.
+    let instance = store.instance(instance_id);
+    let shared_ty = instance.engine_type_index(array_type_index);
+    let gc_layout = store
+        .engine()
+        .signatures()
+        .layout(shared_ty)
+        .expect("array types have GC layouts");
+    let array_layout = gc_layout.unwrap_array();
+    debug_assert!(!array_layout.elems_are_gc_refs);
+
+    let byte_len = len
+        .checked_mul(array_layout.elem_size)
+        .expect("already checked bounds");
+
+    let src_byte_start = array_layout.elem_offset(src).unwrap();
+    let dst_byte_start = array_layout.elem_offset(dst).unwrap();
+
+    // Use `core::ptr::copy` to do a bulk copy of the element data.
+    let gc_store = store.unwrap_gc_store_mut();
+    if same_array {
+        // Same array: potentially overlapping.
+        let src_byte_end = src_byte_start
+            .checked_add(byte_len)
+            .expect("already checked bounds");
+        gc_store
+            .gc_object_data(dst_arr.as_gc_ref())
+            .copy_within(src_byte_start..src_byte_end, dst_byte_start);
+    } else {
+        // Different arrays: non-overlapping.
+        let (src_data, dst_data) =
+            gc_store.gc_object_data_pair(src_arr.as_gc_ref(), dst_arr.as_gc_ref());
+        let src_slice = src_data.slice(src_byte_start, byte_len);
+        let dst_slice = dst_data.slice_mut(dst_byte_start, byte_len);
+        dst_slice.copy_from_slice(src_slice);
+    }
+
     Ok(())
 }
 
@@ -1677,14 +1763,8 @@ fn fma_f64x2(
 /// The `Infallible` "ok" type here means that this never returns success, it
 /// only ever returns an error, and this hooks into the machinery to handle
 /// `Result` values to record such trap information.
-fn trap(
-    _store: &mut dyn VMStore,
-    _instance: InstanceId,
-    code: u8,
-) -> Result<Infallible, TrapReason> {
-    Err(TrapReason::Wasm(
-        wasmtime_environ::Trap::from_u8(code).unwrap(),
-    ))
+fn trap(_store: &mut dyn VMStore, _instance: InstanceId, code: u8) -> Result<Infallible> {
+    Err(wasmtime_environ::Trap::from_u8(code).unwrap().into())
 }
 
 fn raise(store: &mut dyn VMStore, _instance: InstanceId) {
@@ -1715,18 +1795,14 @@ fn get_instance_id(_store: &mut dyn VMStore, instance: InstanceId) -> u32 {
 }
 
 #[cfg(feature = "gc")]
-fn throw_ref(
-    store: &mut dyn VMStore,
-    _instance: InstanceId,
-    exnref: u32,
-) -> Result<(), TrapReason> {
+fn throw_ref(store: &mut dyn VMStore, _instance: InstanceId, exnref: u32) -> Result<()> {
     let exnref = VMGcRef::from_raw_u32(exnref).ok_or_else(|| Trap::NullReference)?;
     let exnref = store.unwrap_gc_store_mut().clone_gc_ref(&exnref);
     let exnref = exnref
         .into_exnref(&*store.unwrap_gc_store().gc_heap)
         .expect("gc ref should be an exception object");
     store.set_pending_exception(exnref);
-    Err(TrapReason::Exception)
+    Err(crate::ThrownException.into())
 }
 
 fn breakpoint(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {

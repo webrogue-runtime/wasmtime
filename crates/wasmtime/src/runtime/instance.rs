@@ -109,6 +109,10 @@ impl Instance {
     ///
     /// [inst]: https://webassembly.github.io/spec/core/exec/modules.html#exec-instantiation
     /// [`ExternType`]: crate::ExternType
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     pub fn new(
         mut store: impl AsContextMut,
         module: &Module,
@@ -187,6 +191,12 @@ impl Instance {
     ///
     /// fn assert_send<T: Send>(t: T) -> T { t }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     #[cfg(feature = "async")]
     pub async fn new_async(
         mut store: impl AsContextMut,
@@ -298,6 +308,13 @@ impl Instance {
         // Allocate the GC heap, if necessary.
         if module.env_module().needs_gc_heap {
             store.ensure_gc_store(limiter.as_deref_mut()).await?;
+
+            // Eagerly register trace info for all types in this module.
+            if let Some(gc_store) = store.optional_gc_store_mut() {
+                for (_, ty) in module.signatures().as_module_map().iter() {
+                    gc_store.ensure_trace_info(*ty);
+                }
+            }
         }
 
         let compiled_module = module.compiled_module();
@@ -521,6 +538,12 @@ impl Instance {
     /// # Panics
     ///
     /// Panics if `store` does not own this instance.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     pub fn get_typed_func<Params, Results>(
         &self,
         mut store: impl AsContextMut,
@@ -734,14 +757,7 @@ impl OwnedImports {
     ) -> Result<(), OutOfMemory> {
         match item {
             crate::runtime::vm::Export::Function(f) => {
-                // SAFETY: the funcref associated with a `Func` is valid to use
-                // under the `store` that owns the function.
-                let f = unsafe { f.vm_func_ref(store).as_ref() };
-                self.functions.push(VMFunctionImport {
-                    wasm_call: f.wasm_call.unwrap(),
-                    array_call: f.array_call,
-                    vmctx: f.vmctx,
-                })?;
+                self.functions.push(f.vmimport(store))?;
             }
             crate::runtime::vm::Export::Global(g) => {
                 self.globals.push(g.vmimport(store))?;
@@ -898,6 +914,12 @@ impl<T: 'static> InstancePre<T> {
     /// `store`, or if `store` has async support enabled. Additionally this
     /// function will panic if the `store` provided comes from a different
     /// [`Engine`] than the [`InstancePre`] originally came from.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     pub fn instantiate(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance> {
         let mut store = store.as_context_mut();
         let imports = pre_instantiate_raw(
@@ -933,6 +955,12 @@ impl<T: 'static> InstancePre<T> {
     ///
     /// Panics if any import closed over by this [`InstancePre`] isn't owned by
     /// `store`, or if `store` does not have async support enabled.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     #[cfg(feature = "async")]
     pub async fn instantiate_async(
         &self,

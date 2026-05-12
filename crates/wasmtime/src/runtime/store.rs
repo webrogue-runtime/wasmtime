@@ -76,11 +76,7 @@
 //! contents of `StoreOpaque`. This is an invariant that we, as the authors of
 //! `wasmtime`, must uphold for the public interface to be safe.
 
-#[cfg(all(feature = "gc", feature = "debug"))]
-use crate::OwnedRooted;
 use crate::RootSet;
-#[cfg(feature = "gc")]
-use crate::ThrownException;
 use crate::error::OutOfMemory;
 #[cfg(feature = "async")]
 use crate::fiber;
@@ -102,7 +98,7 @@ use crate::trampoline::VMHostGlobalContext;
 use crate::{BreakpointState, DebugHandler, FrameDataCache};
 use crate::{Engine, Module, Val, ValRaw, module::ModuleRegistry};
 #[cfg(feature = "gc")]
-use crate::{ExnRef, Rooted};
+use crate::{ExnRef, Rooted, ThrownException};
 use crate::{Global, Instance, Table};
 use core::convert::Infallible;
 use core::fmt;
@@ -736,6 +732,12 @@ impl<T> Store<T> {
     }
 
     /// Like `Store::new` but returns an error on allocation failure.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     pub fn try_new(engine: &Engine, data: T) -> Result<Self> {
         let store_data = StoreData::new(engine);
         log::trace!("creating new store {:?}", store_data.id());
@@ -1034,6 +1036,10 @@ impl<T> Store<T> {
     ///
     /// This function will return an error if fuel consumption is not enabled
     /// via [`Config::consume_fuel`](crate::Config::consume_fuel).
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     pub fn get_fuel(&self) -> Result<u64> {
         self.inner.get_fuel()
     }
@@ -1057,6 +1063,10 @@ impl<T> Store<T> {
     ///
     /// This function will return an error if fuel consumption is not enabled via
     /// [`Config::consume_fuel`](crate::Config::consume_fuel).
+    ///
+    /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
+    /// memory allocation fails. See the `OutOfMemory` type's documentation for
+    /// details on Wasmtime's out-of-memory handling.
     pub fn set_fuel(&mut self, fuel: u64) -> Result<()> {
         self.inner.set_fuel(fuel)
     }
@@ -1260,9 +1270,8 @@ impl<T> Store<T> {
     /// state, but should not be used as part of the ordinary
     /// exception-handling flow. For the most idiomatic handling, see
     /// [`StoreContextMut::throw`].
-    #[cfg(feature = "gc")]
     pub fn has_pending_exception(&self) -> bool {
-        self.inner.pending_exception.is_some()
+        self.inner.has_pending_exception()
     }
 
     /// Return all breakpoints.
@@ -1464,9 +1473,8 @@ impl<'a, T> StoreContextMut<'a, T> {
     /// Tests whether there is a pending exception.
     ///
     /// See [`Store::has_pending_exception`] for more details.
-    #[cfg(feature = "gc")]
     pub fn has_pending_exception(&self) -> bool {
-        self.0.inner.pending_exception.is_some()
+        self.0.inner.has_pending_exception()
     }
 }
 
@@ -1969,7 +1977,12 @@ impl StoreOpaque {
 
             let (mem_alloc_index, mem) = engine
                 .allocator()
-                .allocate_memory(&mut request, &mem_ty, None)
+                .allocate_memory(
+                    &mut request,
+                    &mem_ty,
+                    None,
+                    wasmtime_environ::MemoryKind::GcHeap,
+                )
                 .await?;
 
             // Then, allocate the actual GC heap, passing in that memory
@@ -1982,11 +1995,16 @@ impl StoreOpaque {
                     .allocator()
                     .allocate_gc_heap(engine, &**gc_runtime, mem_alloc_index, mem)?;
 
-            Ok(GcStore::new(
-                index,
-                heap,
-                engine.tunables().gc_zeal_alloc_counter,
-            ))
+            let mut gc_store = GcStore::new(index, heap, engine.tunables().gc_zeal_alloc_counter);
+
+            // Eagerly register trace info for any host-created types (via
+            // StructRefPre/ArrayRefPre) that were created before this GC
+            // store was allocated.
+            for ty in &store.gc_host_alloc_types {
+                gc_store.ensure_trace_info(ty.index());
+            }
+
+            Ok(gc_store)
         }
 
         #[cfg(not(feature = "gc"))]
@@ -2084,7 +2102,7 @@ impl StoreOpaque {
 
     /// Returns a mutable reference to the GC store if it has been allocated.
     #[inline]
-    #[cfg(feature = "gc-drc")]
+    #[cfg(any(feature = "gc-drc", feature = "gc-copying"))]
     pub(crate) fn try_gc_store_mut(&mut self) -> Option<&mut GcStore> {
         self.gc_store.as_mut()
     }
@@ -2331,7 +2349,7 @@ impl StoreOpaque {
         if let Some(pending_exception) = self.pending_exception.as_mut() {
             unsafe {
                 let root = pending_exception.as_gc_ref_mut();
-                gc_roots_list.add_root(root.into(), "Pending exception");
+                gc_roots_list.add_vmgcref_root(root.into(), "Pending exception");
             }
         }
         log::trace!("End trace GC roots :: pending exception");
@@ -2741,9 +2759,15 @@ at https://bytecodealliance.org/security.
     }
 
     /// Tests whether there is a pending exception.
-    #[cfg(feature = "gc")]
     pub fn has_pending_exception(&self) -> bool {
-        self.pending_exception.is_some()
+        #[cfg(feature = "gc")]
+        {
+            self.pending_exception.is_some()
+        }
+        #[cfg(not(feature = "gc"))]
+        {
+            false
+        }
     }
 
     #[cfg(feature = "gc")]
@@ -2755,17 +2779,17 @@ at https://bytecodealliance.org/security.
 
     /// Get an owned rooted reference to the pending exception,
     /// without taking it off the store.
-    #[cfg(all(feature = "gc", feature = "debug"))]
+    #[cfg(all(feature = "debug", feature = "gc"))]
     pub(crate) fn pending_exception_owned_rooted(
         &mut self,
-    ) -> Result<Option<OwnedRooted<ExnRef>>, crate::error::OutOfMemory> {
+    ) -> Result<Option<crate::OwnedRooted<crate::ExnRef>>, crate::error::OutOfMemory> {
         let mut nogc = AutoAssertNoGc::new(self);
         nogc.pending_exception
             .take()
             .map(|vmexnref| {
                 let cloned = nogc.clone_gc_ref(vmexnref.as_gc_ref());
                 nogc.pending_exception = Some(cloned.into_exnref_unchecked());
-                OwnedRooted::new(&mut nogc, vmexnref.into())
+                crate::OwnedRooted::new(&mut nogc, vmexnref.into())
             })
             .transpose()
     }

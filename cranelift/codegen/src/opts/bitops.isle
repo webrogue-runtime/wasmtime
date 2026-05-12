@@ -20,10 +20,10 @@
 
 ;; x ^ not(x) == not(x) ^ x == x | not(x) == not(x) | x == -1.
 ;; This identity also holds for non-integer types, vectors, and wider types.
-(rule (simplify (bxor (ty_int ty) x (bnot ty x))) (subsume (iconst_s ty -1)))
-(rule (simplify (bxor (ty_int ty) (bnot ty x) x)) (subsume (iconst_s ty -1)))
-(rule (simplify (bor (ty_int ty) x (bnot ty x))) (subsume (iconst_s ty -1)))
-(rule (simplify (bor (ty_int ty) (bnot ty x) x)) (subsume (iconst_s ty -1)))
+(rule (simplify (bxor (ty_int_vec128 ty) x (bnot ty x))) (subsume (iconst_s ty -1)))
+(rule (simplify (bxor (ty_int_vec128 ty) (bnot ty x) x)) (subsume (iconst_s ty -1)))
+(rule (simplify (bor (ty_int_vec128 ty) x (bnot ty x))) (subsume (iconst_s ty -1)))
+(rule (simplify (bor (ty_int_vec128 ty) (bnot ty x) x)) (subsume (iconst_s ty -1)))
 
 ;; x & x == x & -1 == x.
 (rule (simplify (band ty x x)) (subsume x))
@@ -31,9 +31,9 @@
       (subsume x))
 
 ;; x & 0 == x & not(x) == not(x) & x == 0.
-(rule (simplify (band ty _ zero @ (iconst_u ty 0))) (subsume zero))
-(rule (simplify (band (ty_int ty) x (bnot ty x))) (subsume (iconst_u ty 0)))
-(rule (simplify (band (ty_int ty) (bnot ty x) x)) (subsume (iconst_u ty 0)))
+(rule (simplify (band (ty_int_vec128 ty) _ zero @ (iconst_u ty 0))) (subsume zero))
+(rule (simplify (band (ty_int_vec128 ty) x (bnot ty x))) (subsume (iconst_u ty 0)))
+(rule (simplify (band (ty_int_vec128 ty) (bnot ty x) x)) (subsume (iconst_u ty 0)))
 
 ;; (x & y) ^ (x ^ y) == x | y
 (rule (simplify (bxor ty (band ty X Y) (bxor ty X Y))) (bor ty X Y))
@@ -522,16 +522,6 @@
 (rule (simplify (bor ty y (bxor ty x (band ty z y)))) (bor ty x y))
 (rule (simplify (bor ty (bxor ty (band ty z y) x) y)) (bor ty x y))
 (rule (simplify (bor ty y (bxor ty (band ty z y) x))) (bor ty x y))
-
-; ((x & y) ^ y) + z --> (y + z) - (x & y)
-(rule (simplify (iadd ty (bxor ty (band ty x y) y) z)) (isub ty (iadd ty y z) (band ty x y)))
-(rule (simplify (iadd ty z (bxor ty (band ty x y) y))) (isub ty (iadd ty y z) (band ty x y)))
-(rule (simplify (iadd ty (bxor ty y (band ty x y)) z)) (isub ty (iadd ty y z) (band ty x y)))
-(rule (simplify (iadd ty z (bxor ty y (band ty x y)))) (isub ty (iadd ty y z) (band ty x y)))
-(rule (simplify (iadd ty (bxor ty (band ty y x) y) z)) (isub ty (iadd ty y z) (band ty x y)))
-(rule (simplify (iadd ty z (bxor ty (band ty y x) y))) (isub ty (iadd ty y z) (band ty x y)))
-(rule (simplify (iadd ty (bxor ty y (band ty y x)) z)) (isub ty (iadd ty y z) (band ty x y)))
-(rule (simplify (iadd ty z (bxor ty y (band ty y x)))) (isub ty (iadd ty y z) (band ty x y)))
 
 ; y & (~y | x) --> y & x
 (rule (simplify (band ty y (bor ty (bnot ty y) x))) (band ty y x))

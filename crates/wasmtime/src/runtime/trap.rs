@@ -1,7 +1,5 @@
 #[cfg(feature = "coredump")]
 use super::coredump::WasmCoreDump;
-#[cfg(feature = "gc")]
-use crate::ThrownException;
 use crate::prelude::*;
 use crate::store::StoreOpaque;
 use crate::{AsContext, Module};
@@ -86,8 +84,6 @@ pub(crate) fn from_runtime_box(
         coredumpstack,
     } = *runtime_trap;
     let (mut error, pc) = match reason {
-        #[cfg(feature = "gc")]
-        crate::runtime::vm::TrapReason::Exception => (ThrownException.into(), None),
         // For user-defined errors they're already an `crate::Error` so no
         // conversion is really necessary here, but a `backtrace` may have
         // been captured so it's attempted to get inserted here.
@@ -118,7 +114,6 @@ pub(crate) fn from_runtime_box(
             }
             (err, Some(pc))
         }
-        crate::runtime::vm::TrapReason::Wasm(trap_code) => (trap_code.into(), None),
     };
 
     if let Some(bt) = backtrace {

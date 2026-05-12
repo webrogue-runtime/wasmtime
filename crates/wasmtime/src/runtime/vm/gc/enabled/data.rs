@@ -135,7 +135,7 @@ impl VMGcObjectData {
         let offset = usize::try_from(offset).unwrap();
         let end = offset.checked_add(N).unwrap();
         let bytes = self.data.get(offset..end).expect("out of bounds field");
-        T::read_le(bytes.try_into().unwrap())
+        T::read_le(bytes.as_array().unwrap())
     }
 
     /// Read a POD field out of this object.
@@ -159,7 +159,7 @@ impl VMGcObjectData {
                 self.data.as_mut().len(),
             ),
         };
-        val.write_le(into.try_into().unwrap());
+        val.write_le(into.as_mut_array().unwrap());
     }
 
     /// Get a slice of this object's data.
@@ -202,6 +202,23 @@ impl VMGcObjectData {
         let end = offset.checked_add(src.len()).unwrap();
         let into = self.data.get_mut(offset..end).expect("out of bounds copy");
         into.copy_from_slice(src);
+    }
+
+    /// Copy within this this object's data.
+    ///
+    /// Note that GC data is always stored in little-endian order, and this
+    /// method does not do any conversions to/from host endianness for you.
+    ///
+    /// Panics on out-of-bounds accesses.
+    #[inline]
+    pub fn copy_within<R>(&mut self, src: R, dest: u32)
+    where
+        R: core::ops::RangeBounds<u32>,
+    {
+        let start = src.start_bound().map(|s| usize::try_from(*s).unwrap());
+        let end = src.end_bound().map(|e| usize::try_from(*e).unwrap());
+        let dest = usize::try_from(dest).unwrap();
+        self.data.copy_within((start, end), dest);
     }
 
     impl_pod_methods! {

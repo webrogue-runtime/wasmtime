@@ -307,9 +307,12 @@ unsafe impl GcHeap for NullHeap {
         length: u32,
         layout: &GcArrayLayout,
     ) -> Result<Result<VMArrayRef, u64>> {
+        let layout = layout
+            .layout(length)
+            .ok_or_else(|| format_err!("allocation size too large"))?;
         self.alloc(
             VMGcHeader::from_kind_and_index(VMGcKind::ArrayRef, ty),
-            layout.layout(length),
+            layout,
         )
         .map(|r| {
             r.map(|r| {
@@ -329,9 +332,11 @@ unsafe impl GcHeap for NullHeap {
 
     fn allocated_bytes(&self) -> usize {
         // The null collector never frees, so everything from the start of
-        // the heap up to the bump pointer is allocated.
+        // the heap up to the bump pointer is allocated. Subtract 1 because
+        // the bump pointer starts at index 1 (index 0 is unused since
+        // `VMGcRef` uses `NonZeroU32`), not because any byte was allocated.
         let next = unsafe { *self.next.get() };
-        usize::try_from(next.get()).unwrap()
+        usize::try_from(next.get()).unwrap() - 1
     }
 
     fn gc<'a>(
