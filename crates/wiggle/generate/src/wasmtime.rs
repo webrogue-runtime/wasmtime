@@ -56,6 +56,7 @@ pub fn link_module(
         pub fn #func_name<T, U>(
             linker: &mut wiggle::wasmtime_crate::Linker<T>,
             get_cx: impl Fn(&mut T) -> #u + Send + Sync + Copy + 'static,
+            get_thread: impl Fn(&mut T) -> WasmThread + Send + Sync + Copy + 'static,
         ) -> wiggle::error::Result<()>
             where
                 T: 'static,
@@ -116,10 +117,10 @@ fn generate_func(
 
     let body = quote! {
         let export = caller.get_export("memory");
-        let fuel = wiggle::wasmtime_crate::AsContextMut::as_context_mut(&mut caller).hostcall_fuel();
+        let fuel = wiggle::wasmtime_crate::AsContextMut::as_context_mut(caller).hostcall_fuel();
         let (mut mem, ctx) = match &export {
             Some(wiggle::wasmtime_crate::Extern::Memory(m)) => {
-                let (mem, ctx) = m.data_and_store_mut(&mut caller);
+                let (mem, ctx) = m.data_and_store_mut(caller);
                 let ctx = get_cx(ctx);
                 ctx.set_hostcall_fuel(fuel);
                 (wiggle::GuestMemory::Unshared(mem), ctx)
@@ -142,7 +143,11 @@ fn generate_func(
                     #module_str,
                     #field_str,
                     move |mut caller: wiggle::wasmtime_crate::Caller<'_, T>, #arg_decls| {
-                        Box::new(async move { #body })
+                        Box::new(async move {
+                            get_thread(caller.data_mut()).wrap_async_fn(&mut caller, move |caller| Box::pin(async move {
+                                #body
+                            })).await?
+                        })
                     },
                 )?;
             }
@@ -154,6 +159,7 @@ fn generate_func(
                     #module_str,
                     #field_str,
                     move |mut caller: wiggle::wasmtime_crate::Caller<'_, T> #(, #arg_decls)*| -> wiggle::error::Result<#ret_ty> {
+                        let caller = &mut caller;
                         let result = async { #body };
                         #block_with(result)?
                     },
@@ -167,6 +173,7 @@ fn generate_func(
                     #module_str,
                     #field_str,
                     move |mut caller: wiggle::wasmtime_crate::Caller<'_, T> #(, #arg_decls)*| -> wiggle::error::Result<#ret_ty> {
+                        let caller = &mut caller;
                         #body
                     },
                 )?;

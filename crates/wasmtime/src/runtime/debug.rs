@@ -17,6 +17,7 @@ use crate::{Caller, Result, Store};
 use alloc::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ptr::read_unaligned;
 use core::{ffi::c_void, ptr::NonNull};
 #[cfg(feature = "gc")]
 use wasmtime_environ::FrameTable;
@@ -777,46 +778,46 @@ unsafe fn read_value(
     // valid according to our safety condition.
     match ty {
         FrameValType::I32 => {
-            let value = unsafe { *(address as *const i32) };
+            let value = unsafe { read_unaligned(address as *const i32) };
             Val::I32(value)
         }
         FrameValType::I64 => {
-            let value = unsafe { *(address as *const i64) };
+            let value = unsafe { read_unaligned(address as *const i64) };
             Val::I64(value)
         }
         FrameValType::F32 => {
-            let value = unsafe { *(address as *const u32) };
+            let value = unsafe { read_unaligned(address as *const u32) };
             Val::F32(value)
         }
         FrameValType::F64 => {
-            let value = unsafe { *(address as *const u64) };
+            let value = unsafe { read_unaligned(address as *const u64) };
             Val::F64(value)
         }
         FrameValType::V128 => {
             // Vectors are always stored as little-endian.
-            let value = unsafe { u128::from_le_bytes(*(address as *const [u8; 16])) };
+            let value = unsafe { u128::from_le_bytes(read_unaligned(address as *const [u8; 16])) };
             Val::V128(value.into())
         }
         FrameValType::AnyRef => {
             let mut nogc = AutoAssertNoGc::new(store);
-            let value = unsafe { *(address as *const u32) };
+            let value = unsafe { read_unaligned(address as *const u32) };
             let value = AnyRef::_from_raw(&mut nogc, value);
             Val::AnyRef(value)
         }
         FrameValType::ExnRef => {
             let mut nogc = AutoAssertNoGc::new(store);
-            let value = unsafe { *(address as *const u32) };
+            let value = unsafe { read_unaligned(address as *const u32) };
             let value = ExnRef::_from_raw(&mut nogc, value);
             Val::ExnRef(value)
         }
         FrameValType::ExternRef => {
             let mut nogc = AutoAssertNoGc::new(store);
-            let value = unsafe { *(address as *const u32) };
+            let value = unsafe { read_unaligned(address as *const u32) };
             let value = ExternRef::_from_raw(&mut nogc, value);
             Val::ExternRef(value)
         }
         FrameValType::FuncRef => {
-            let value = unsafe { *(address as *const *mut c_void) };
+            let value = unsafe { read_unaligned(address as *const *mut c_void) };
             let value = unsafe { Func::_from_raw(store, value) };
             Val::FuncRef(value)
         }
