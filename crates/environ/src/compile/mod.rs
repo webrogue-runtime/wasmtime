@@ -383,6 +383,7 @@ pub trait Compiler: Send + Sync {
                 | OperatingSystem::TvOS(_),
                 Architecture::Aarch64(..),
             ) => 0x4000,
+            (OperatingSystem::Windows, _) => 0x1000,
             // 64 KB is the maximal page size (i.e. memory translation granule size)
             // supported by the architecture and is used on some platforms.
             (_, Architecture::Aarch64(..)) => 0x10000,
