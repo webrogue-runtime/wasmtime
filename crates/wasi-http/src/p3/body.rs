@@ -1,5 +1,6 @@
 use crate::FieldMap;
 use crate::p3::bindings::http::types::{ErrorCode, Trailers};
+use crate::p3::helpers::FutureReaderExt;
 use crate::p3::{WasiHttp, WasiHttpCtxView};
 use bytes::Bytes;
 use core::iter;
@@ -9,13 +10,12 @@ use core::task::{Context, Poll, ready};
 use http_body::Body as _;
 use http_body_util::combinators::UnsyncBoxBody;
 use std::any::{Any, TypeId};
-use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::PollSender;
 use wasmtime::component::{
-    Access, Destination, FutureConsumer, FutureReader, Resource, Source, StreamConsumer,
-    StreamProducer, StreamReader, StreamResult,
+    Access, Destination, FutureReader, Resource, Source, StreamConsumer, StreamProducer,
+    StreamReader, StreamResult,
 };
 use wasmtime::error::Context as _;
 use wasmtime::{AsContextMut, StoreContextMut};
@@ -40,33 +40,6 @@ pub(crate) enum Body {
     },
 }
 
-/// [FutureConsumer] implementation for future passed to `consume-body`.
-struct BodyResultConsumer(
-    Option<oneshot::Sender<Box<dyn Future<Output = Result<(), ErrorCode>> + Send>>>,
-);
-
-impl<D> FutureConsumer<D> for BodyResultConsumer
-where
-    D: 'static,
-{
-    type Item = Result<(), ErrorCode>;
-
-    fn poll_consume(
-        mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        store: StoreContextMut<D>,
-        mut src: Source<'_, Self::Item>,
-        _: bool,
-    ) -> Poll<wasmtime::Result<()>> {
-        let mut res = None;
-        src.read(store, &mut res).context("failed to read result")?;
-        let res = res.context("result value missing")?;
-        let tx = self.0.take().context("polled after returning `Ready`")?;
-        _ = tx.send(Box::new(async { res }));
-        Poll::Ready(Ok(()))
-    }
-}
-
 impl Body {
     /// Implementation of `consume-body` shared between requests and responses
     pub(crate) fn consume<T>(
@@ -78,25 +51,22 @@ impl Body {
         StreamReader<u8>,
         FutureReader<Result<Option<Resource<Trailers>>, ErrorCode>>,
     )> {
-        Ok(match self {
+        let (contents_rx, trailers_rx, result_tx) = match self {
             Body::Guest {
                 contents_rx: Some(contents_rx),
                 trailers_rx,
                 result_tx,
-            } => {
-                fut.pipe(&mut store, BodyResultConsumer(Some(result_tx)))?;
-                (contents_rx, trailers_rx)
-            }
+            } => (contents_rx, trailers_rx, result_tx),
             Body::Guest {
                 contents_rx: None,
                 trailers_rx,
                 result_tx,
-            } => {
-                fut.pipe(&mut store, BodyResultConsumer(Some(result_tx)))?;
-                (StreamReader::new(&mut store, iter::empty())?, trailers_rx)
-            }
+            } => (
+                StreamReader::new(&mut store, iter::empty())?,
+                trailers_rx,
+                result_tx,
+            ),
             Body::Host { body, result_tx } => {
-                fut.pipe(&mut store, BodyResultConsumer(Some(result_tx)))?;
                 let (trailers_tx, trailers_rx) = oneshot::channel();
                 (
                     StreamReader::new(
@@ -108,9 +78,16 @@ impl Body {
                         },
                     )?,
                     FutureReader::new(&mut store, trailers_rx)?,
+                    result_tx,
                 )
             }
-        })
+        };
+
+        fut.pipe_cb(&mut store, |_, res| {
+            _ = result_tx.send(Box::new(async { res }));
+            Ok(())
+        })?;
+        Ok((contents_rx, trailers_rx))
     }
 
     /// Implementation of `drop` shared between requests and responses
@@ -276,13 +253,21 @@ impl GuestBody {
         getter: fn(&mut T) -> WasiHttpCtxView<'_>,
     ) -> wasmtime::Result<Self> {
         let (trailers_http_tx, trailers_http_rx) = oneshot::channel();
-        trailers_rx.pipe(
-            &mut store,
-            GuestTrailerConsumer {
-                tx: Some(trailers_http_tx),
-                getter,
-            },
-        )?;
+        trailers_rx.pipe_cb(&mut store, move |data, res| {
+            let res = match res {
+                Ok(Some(trailers)) => {
+                    let WasiHttpCtxView { table, .. } = getter(data);
+                    let trailers = table
+                        .delete(trailers)
+                        .context("failed to delete trailers")?;
+                    Ok(Some(Arc::from(trailers)))
+                }
+                Ok(None) => Ok(None),
+                Err(err) => Err(err),
+            };
+            _ = trailers_http_tx.send(res);
+            Ok(())
+        })?;
 
         let contents_rx = if let Some(rx) = contents_rx {
             let (http_tx, http_rx) = mpsc::channel(1);
@@ -402,44 +387,6 @@ impl http_body::Body for GuestBody {
     }
 }
 
-/// [FutureConsumer] implementation for trailers originating in the guest.
-struct GuestTrailerConsumer<T> {
-    tx: Option<oneshot::Sender<Result<Option<Arc<FieldMap>>, ErrorCode>>>,
-    getter: fn(&mut T) -> WasiHttpCtxView<'_>,
-}
-
-impl<D> FutureConsumer<D> for GuestTrailerConsumer<D>
-where
-    D: 'static,
-{
-    type Item = Result<Option<Resource<Trailers>>, ErrorCode>;
-
-    fn poll_consume(
-        mut self: Pin<&mut Self>,
-        _: &mut Context<'_>,
-        mut store: StoreContextMut<D>,
-        mut src: Source<'_, Self::Item>,
-        _: bool,
-    ) -> Poll<wasmtime::Result<()>> {
-        let mut res = None;
-        src.read(&mut store, &mut res)
-            .context("failed to read result")?;
-        let res = match res.context("result value missing")? {
-            Ok(Some(trailers)) => {
-                let WasiHttpCtxView { table, .. } = (self.getter)(store.data_mut());
-                let trailers = table
-                    .delete(trailers)
-                    .context("failed to delete trailers")?;
-                Ok(Some(Arc::from(trailers)))
-            }
-            Ok(None) => Ok(None),
-            Err(err) => Err(err),
-        };
-        _ = self.tx.take().unwrap().send(res);
-        Poll::Ready(Ok(()))
-    }
-}
-
 /// [StreamProducer] implementation for bodies originating in the host.
 pub(crate) struct HostBodyStreamProducer<T> {
     pub(crate) body: UnsyncBoxBody<Bytes, ErrorCode>,
@@ -466,7 +413,7 @@ where
     D: 'static,
 {
     type Item = u8;
-    type Buffer = Cursor<Bytes>;
+    type Buffer = Bytes;
 
     fn poll_produce<'a>(
         mut self: Pin<&mut Self>,
@@ -513,7 +460,7 @@ where
                                     let cap = cap.into();
                                     if n > cap {
                                         // data frame does not fit in destination, fill it and buffer the rest
-                                        dst.set_buffer(Cursor::new(frame.split_off(cap)));
+                                        dst.set_buffer(frame.split_off(cap));
                                         let mut dst = dst.as_direct(store, cap);
                                         dst.remaining().copy_from_slice(&frame);
                                         dst.mark_written(cap);
@@ -524,7 +471,7 @@ where
                                         dst.mark_written(n);
                                     }
                                 } else {
-                                    dst.set_buffer(Cursor::new(frame));
+                                    dst.set_buffer(frame);
                                 }
                                 return Poll::Ready(Ok(StreamResult::Completed));
                             }

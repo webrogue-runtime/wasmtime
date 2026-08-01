@@ -16,7 +16,6 @@ use crate::flowgraph::ControlFlowGraph;
 use crate::inline::{Inline, do_inlining};
 use crate::ir::Function;
 use crate::isa::TargetIsa;
-use crate::legalizer::simple_legalize;
 use crate::loop_analysis::LoopAnalysis;
 use crate::machinst::{CompiledCode, CompiledCodeStencil};
 use crate::nan_canonicalization::do_nan_canonicalization;
@@ -173,7 +172,7 @@ impl Context {
             self.canonicalize_nans(isa)?;
         }
 
-        self.legalize(isa)?;
+        self.verify_if(isa)?;
 
         self.compute_cfg();
         self.compute_domtree();
@@ -293,19 +292,6 @@ impl Context {
         self.verify_if(isa)
     }
 
-    /// Run the legalizer for `isa` on the function.
-    pub fn legalize(&mut self, isa: &dyn TargetIsa) -> CodegenResult<()> {
-        // Legalization invalidates the domtree and loop_analysis by mutating the CFG.
-        // TODO: Avoid doing this when legalization doesn't actually mutate the CFG.
-        self.domtree.clear();
-        self.loop_analysis.clear();
-        self.cfg.clear();
-
-        // Run some specific legalizations only.
-        simple_legalize(&mut self.func, isa);
-        self.verify_if(isa)
-    }
-
     /// Compute the control flow graph.
     pub fn compute_cfg(&mut self) {
         self.cfg.compute(&self.func)
@@ -333,7 +319,10 @@ impl Context {
     where
         FOI: Into<FlagsOrIsa<'a>>,
     {
-        eliminate_unreachable_code(&mut self.func, &mut self.cfg, &self.domtree);
+        let domtree = &self.domtree;
+        eliminate_unreachable_code(&mut self.func, &mut self.cfg, |block| {
+            domtree.is_reachable(block)
+        });
         self.verify_if(fisa)
     }
 
@@ -382,11 +371,18 @@ impl Context {
             &self.loop_analysis,
             &mut alias_analysis,
             ctrl_plane,
+            &mut self.cfg,
         );
         pass.run();
         log::debug!("egraph stats: {:?}", pass.stats);
         trace!("After egraph optimization:\n{}", self.func.display());
 
-        self.verify_if(fisa)
+        // Branch optimizations can invalidate these; recompute them.
+        self.compute_cfg();
+        self.compute_domtree();
+
+        self.verify_if(fisa)?;
+
+        Ok(())
     }
 }

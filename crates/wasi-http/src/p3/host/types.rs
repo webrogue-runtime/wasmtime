@@ -9,15 +9,12 @@ use crate::p3::body::{Body, HostBodyStreamProducer};
 use crate::p3::{HeaderResult, HttpError, RequestOptionsResult, WasiHttp, WasiHttpCtxView};
 use core::mem;
 use core::pin::Pin;
-use core::task::{Context, Poll, ready};
 use http::header::CONTENT_LENGTH;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use wasmtime::component::{
-    Access, FutureProducer, FutureReader, Resource, ResourceTable, StreamReader,
-};
+use wasmtime::AsContextMut;
+use wasmtime::component::{Access, FutureReader, Resource, ResourceTable, StreamReader};
 use wasmtime::error::Context as _;
-use wasmtime::{AsContextMut, StoreContextMut};
 
 fn get_fields<'a>(
     table: &'a ResourceTable,
@@ -123,12 +120,37 @@ fn delete_request_options(
         .context("failed to delete request options from table")
 }
 
+/// Parse an outgoing request `authority`, rejecting a malformed value.
+///
+/// `http::uri::Authority` accepts an authority whose port section is empty or
+/// non-numeric (for example `example.com:` or `example.com:abc`), so the port
+/// is validated here as well. A `:` inside an IPv6 literal host such as `[::1]`
+/// is part of the host rather than a port delimiter, so the port is only looked
+/// for after any closing bracket.
+fn parse_authority(authority: String) -> Result<http::uri::Authority, ()> {
+    let has_port = match authority.rfind(']') {
+        Some(i) => authority[i..].contains(':'),
+        None => authority.contains(':'),
+    };
+    let authority = http::uri::Authority::try_from(authority).map_err(|_| ())?;
+    if has_port && authority.port_u16().is_none() {
+        return Err(());
+    }
+    Ok(authority)
+}
+
 fn parse_header_value(
     name: &http::HeaderName,
     value: impl AsRef<[u8]>,
 ) -> Result<http::HeaderValue, HeaderError> {
     if name == CONTENT_LENGTH {
         let s = str::from_utf8(value.as_ref()).or(Err(HeaderError::InvalidSyntax))?;
+        // RFC 9110 defines `Content-Length` as `1*DIGIT`. `u64`'s `FromStr` is
+        // more lenient and also accepts a leading `+`, so reject anything that
+        // isn't a non-empty run of decimal digits.
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(HeaderError::InvalidSyntax);
+        }
         let v: u64 = s.parse().or(Err(HeaderError::InvalidSyntax))?;
         Ok(v.into())
     } else {
@@ -136,51 +158,13 @@ fn parse_header_value(
     }
 }
 
-enum GuestBodyResultProducer {
-    Receiver(oneshot::Receiver<Box<dyn Future<Output = Result<(), ErrorCode>> + Send>>),
-    Future(Pin<Box<dyn Future<Output = Result<(), ErrorCode>> + Send>>),
-}
-
-fn poll_future<T>(
-    cx: &mut Context<'_>,
-    fut: Pin<&mut (impl Future<Output = T> + ?Sized)>,
-    finish: bool,
-) -> Poll<Option<T>> {
-    match fut.poll(cx) {
-        Poll::Ready(v) => Poll::Ready(Some(v)),
-        Poll::Pending if finish => Poll::Ready(None),
-        Poll::Pending => Poll::Pending,
-    }
-}
-
-impl<D> FutureProducer<D> for GuestBodyResultProducer {
-    type Item = Result<(), ErrorCode>;
-
-    fn poll_produce(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        _: StoreContextMut<D>,
-        finish: bool,
-    ) -> Poll<wasmtime::Result<Option<Self::Item>>> {
-        match &mut *self {
-            Self::Receiver(rx) => {
-                match ready!(poll_future(cx, Pin::new(rx), finish)) {
-                    Some(Ok(fut)) => {
-                        let mut fut = Box::into_pin(fut);
-                        // poll the received future once and update state
-                        let res = poll_future(cx, fut.as_mut(), finish);
-                        *self = Self::Future(fut);
-                        res.map(Ok)
-                    }
-                    Some(Err(..)) => {
-                        // oneshot sender dropped, treat as success
-                        Poll::Ready(Ok(Some(Ok(()))))
-                    }
-                    None => Poll::Ready(Ok(None)),
-                }
-            }
-            Self::Future(fut) => poll_future(cx, fut.as_mut(), finish).map(Ok),
-        }
+async fn guest_body_result(
+    rx: oneshot::Receiver<Box<dyn Future<Output = Result<(), ErrorCode>> + Send>>,
+) -> wasmtime::Result<Result<(), ErrorCode>> {
+    match rx.await {
+        Ok(fut) => Ok(Pin::from(fut).await),
+        // oneshot sender dropped, treat as success
+        Err(..) => Ok(Ok(())),
     }
 }
 
@@ -306,8 +290,8 @@ impl HostFields for WasiHttpCtxView<'_> {
     }
 }
 
-impl HostRequestWithStore for WasiHttp {
-    fn new<T>(
+impl<T> HostRequestWithStore<T> for WasiHttp {
+    fn new(
         mut store: Access<T, Self>,
         headers: Resource<Headers>,
         contents: Option<StreamReader<u8>>,
@@ -350,11 +334,11 @@ impl HostRequestWithStore for WasiHttp {
         let req = table.push(req).context("failed to push request to table")?;
         Ok((
             req,
-            FutureReader::new(&mut store, GuestBodyResultProducer::Receiver(result_rx))?,
+            FutureReader::new(&mut store, guest_body_result(result_rx))?,
         ))
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut store: Access<T, Self>,
         req: Resource<Request>,
         fut: FutureReader<Result<(), ErrorCode>>,
@@ -371,7 +355,7 @@ impl HostRequestWithStore for WasiHttp {
         body.consume(store, fut, getter)
     }
 
-    fn drop<T>(mut store: Access<'_, T, Self>, req: Resource<Request>) -> wasmtime::Result<()> {
+    fn drop(mut store: Access<'_, T, Self>, req: Resource<Request>) -> wasmtime::Result<()> {
         let Request { body, .. } = store
             .get()
             .table
@@ -462,13 +446,9 @@ impl HostRequest for WasiHttpCtxView<'_> {
             req.authority = None;
             return Ok(Ok(()));
         };
-        let has_port = authority.contains(':');
-        let Ok(authority) = http::uri::Authority::try_from(authority) else {
+        let Ok(authority) = parse_authority(authority) else {
             return Ok(Err(()));
         };
-        if has_port && authority.port_u16().is_none() {
-            return Ok(Err(()));
-        }
         req.authority = Some(authority);
         Ok(Ok(()))
     }
@@ -589,8 +569,8 @@ impl HostRequestOptions for WasiHttpCtxView<'_> {
     }
 }
 
-impl HostResponseWithStore for WasiHttp {
-    fn new<T>(
+impl<T> HostResponseWithStore<T> for WasiHttp {
+    fn new(
         mut store: Access<T, Self>,
         headers: Resource<Headers>,
         contents: Option<StreamReader<u8>>,
@@ -627,11 +607,11 @@ impl HostResponseWithStore for WasiHttp {
             .context("failed to push response to table")?;
         Ok((
             res,
-            FutureReader::new(&mut store, GuestBodyResultProducer::Receiver(result_rx))?,
+            FutureReader::new(&mut store, guest_body_result(result_rx))?,
         ))
     }
 
-    fn consume_body<T>(
+    fn consume_body(
         mut store: Access<T, Self>,
         res: Resource<Response>,
         fut: FutureReader<Result<(), ErrorCode>>,
@@ -648,7 +628,7 @@ impl HostResponseWithStore for WasiHttp {
         body.consume(store, fut, getter)
     }
 
-    fn drop<T>(mut store: Access<'_, T, Self>, res: Resource<Response>) -> wasmtime::Result<()> {
+    fn drop(mut store: Access<'_, T, Self>, res: Resource<Response>) -> wasmtime::Result<()> {
         let Response { body, .. } = store
             .get()
             .table
@@ -703,5 +683,46 @@ impl Host for WasiHttpCtxView<'_> {
         error: crate::p3::RequestOptionsError,
     ) -> wasmtime::Result<RequestOptionsError> {
         error.downcast()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_header_value;
+    use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+
+    #[test]
+    fn content_length_rejects_non_digits() {
+        assert!(parse_header_value(&CONTENT_LENGTH, "0").is_ok());
+        assert!(parse_header_value(&CONTENT_LENGTH, "1234").is_ok());
+
+        // `u64::from_str` accepts these but they are not `1*DIGIT` per RFC 9110.
+        assert!(parse_header_value(&CONTENT_LENGTH, "+5").is_err());
+        assert!(parse_header_value(&CONTENT_LENGTH, "-5").is_err());
+        assert!(parse_header_value(&CONTENT_LENGTH, " 5").is_err());
+        assert!(parse_header_value(&CONTENT_LENGTH, "").is_err());
+
+        // other header names are unaffected
+        assert!(parse_header_value(&CONTENT_TYPE, "text/plain").is_ok());
+    }
+
+    #[test]
+    fn authority_accepts_ipv6_and_validates_ports() {
+        use super::parse_authority;
+
+        // Host names and IPv4 literals, with and without an explicit port.
+        assert!(parse_authority("example.com".into()).is_ok());
+        assert!(parse_authority("example.com:443".into()).is_ok());
+        assert!(parse_authority("127.0.0.1:80".into()).is_ok());
+
+        // Bracketed IPv6 literals: the colons belong to the host, so a missing
+        // port must still be accepted and not mistaken for an empty port.
+        assert!(parse_authority("[::1]".into()).is_ok());
+        assert!(parse_authority("[2001:db8::1]".into()).is_ok());
+        assert!(parse_authority("[::1]:443".into()).is_ok());
+
+        // When a port section is present it must be a valid number.
+        assert!(parse_authority("example.com:".into()).is_err());
+        assert!(parse_authority("example.com:abc".into()).is_err());
     }
 }

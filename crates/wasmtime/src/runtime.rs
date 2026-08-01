@@ -31,7 +31,6 @@ use core::marker;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-#[cfg(feature = "component-model-async")]
 mod bug;
 
 #[macro_use]
@@ -58,6 +57,8 @@ pub(crate) mod resources;
 pub(crate) mod store;
 pub(crate) mod trampoline;
 pub(crate) mod trap;
+#[cfg(feature = "component-model-async")]
+pub(crate) mod try_mutex;
 pub(crate) mod type_registry;
 pub(crate) mod types;
 pub(crate) mod v128;
@@ -81,10 +82,8 @@ cfg_if::cfg_if! {
     }
 }
 
-#[cfg(feature = "component-model-async")]
 pub use bug::WasmtimeBug;
-#[cfg(feature = "component-model-async")]
-pub(crate) use bug::bail_bug;
+pub(crate) use bug::{bail_bug, bug};
 pub use code_memory::CodeMemory;
 #[cfg(feature = "debug")]
 pub use debug::*;

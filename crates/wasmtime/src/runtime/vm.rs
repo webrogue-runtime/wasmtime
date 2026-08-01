@@ -53,7 +53,6 @@ use wasmtime_environ::ModuleInternedTypeIndex;
 mod always_mut;
 #[cfg(feature = "component-model")]
 pub mod component;
-mod const_expr;
 mod export;
 mod gc;
 mod imports;
@@ -91,6 +90,9 @@ pub(crate) mod interpreter_disabled;
 #[cfg(not(feature = "pulley"))]
 pub(crate) use interpreter_disabled as interpreter;
 
+#[cfg(feature = "component-model-async")]
+pub(crate) use sys::{component_async_tls_get, component_async_tls_set};
+
 #[cfg(feature = "debug-builtins")]
 pub use wasmtime_jit_debug::gdb_jit_int::GdbJitImageRegistration;
 
@@ -100,12 +102,11 @@ pub use crate::runtime::vm::gc::*;
 pub use crate::runtime::vm::imports::Imports;
 pub use crate::runtime::vm::instance::{
     GcHeapAllocationIndex, Instance, InstanceAllocationRequest, InstanceAllocator, InstanceHandle,
-    MemoryAllocationIndex, OnDemandInstanceAllocator, TableAllocationIndex, initialize_instance,
+    MemoryAllocationIndex, OnDemandInstanceAllocator, TableAllocationIndex,
 };
 #[cfg(feature = "pooling-allocator")]
 pub use crate::runtime::vm::instance::{
-    InstanceLimits, PoolConcurrencyLimitError, PoolingAllocatorMetrics, PoolingInstanceAllocator,
-    PoolingInstanceAllocatorConfig,
+    PoolConcurrencyLimitError, PoolingAllocatorMetrics, PoolingInstanceAllocator,
 };
 pub use crate::runtime::vm::interpreter::*;
 #[cfg(feature = "threads")]
@@ -127,6 +128,8 @@ pub use crate::runtime::vm::throw::*;
 pub use crate::runtime::vm::traphandlers::*;
 #[cfg(feature = "component-model")]
 pub use crate::runtime::vm::vmcontext::VMArrayCallFunction;
+#[cfg(feature = "component-model-async")]
+pub use crate::runtime::vm::vmcontext::VMLazyThread;
 pub use crate::runtime::vm::vmcontext::{
     VMArrayCallHostFuncContext, VMContext, VMFuncRef, VMFunctionImport, VMGlobalDefinition,
     VMGlobalImport, VMGlobalKind, VMMemoryDefinition, VMMemoryImport, VMOpaqueContext,
@@ -153,9 +156,9 @@ mod cow_disabled;
 #[cfg(has_virtual_memory)]
 mod mmap;
 
-#[cfg(feature = "gc-null")]
+#[allow(unused, reason = "hard to cfg on/off, weird feature interactions")]
 mod send_sync_unsafe_cell;
-#[cfg(feature = "gc-null")]
+#[allow(unused, reason = "hard to cfg on/off, weird feature interactions")]
 pub use send_sync_unsafe_cell::SendSyncUnsafeCell;
 
 cfg_if::cfg_if! {
@@ -217,10 +220,6 @@ pub unsafe trait VMStore: 'static {
     /// completely semantically transparent. Returns the new deadline.
     #[cfg(target_has_atomic = "64")]
     fn new_epoch_updated_deadline(&mut self) -> Result<crate::UpdateDeadline>;
-
-    /// Metadata required for resources for the component model.
-    #[cfg(feature = "component-model")]
-    fn component_task_state_mut(&mut self) -> &mut crate::component::store::ComponentTaskState;
 
     #[cfg(feature = "component-model-async")]
     fn component_async_store(

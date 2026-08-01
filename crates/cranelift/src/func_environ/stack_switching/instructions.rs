@@ -1,12 +1,12 @@
-use cranelift_codegen::ir::BlockArg;
-use itertools::{Either, Itertools};
-
+use crate::translate::set_block_params;
 use crate::trap::TranslateTrap;
+use cranelift_codegen::ir::BlockArg;
 use cranelift_codegen::ir::condcodes::*;
 use cranelift_codegen::ir::types::*;
-use cranelift_codegen::ir::{self, MemFlags};
+use cranelift_codegen::ir::{self, MemFlagsData};
 use cranelift_codegen::ir::{Block, BlockCall, InstBuilder, JumpTableData};
 use cranelift_frontend::FunctionBuilder;
+use itertools::{Either, Itertools};
 use wasmtime_environ::{PtrSize, TagIndex, TypeIndex, WasmResult, WasmValType, wasm_unsupported};
 
 fn control_context_size(triple: &target_lexicon::Triple) -> WasmResult<u8> {
@@ -103,7 +103,7 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> VMPayloads {
             let offset: i64 = env.offsets.ptr.vmcontref_args().into();
-            let address = builder.ins().iadd_imm(self.address, offset);
+            let address = builder.ins().iadd_imm_s(self.address, offset);
             VMPayloads::new(address)
         }
 
@@ -113,7 +113,7 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> VMPayloads {
             let offset: i64 = env.offsets.ptr.vmcontref_values().into();
-            let address = builder.ins().iadd_imm(self.address, offset);
+            let address = builder.ins().iadd_imm_s(self.address, offset);
             VMPayloads::new(address)
         }
 
@@ -123,7 +123,7 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> VMCommonStackInformation {
             let offset: i64 = env.offsets.ptr.vmcontref_common_stack_information().into();
-            let address = builder.ins().iadd_imm(self.address, offset);
+            let address = builder.ins().iadd_imm_s(self.address, offset);
             VMCommonStackInformation { address }
         }
 
@@ -137,7 +137,8 @@ pub(crate) mod stack_switching_helpers {
             new_stack_chain: &VMStackChain,
         ) {
             let offset = env.offsets.ptr.vmcontref_parent_chain().into();
-            new_stack_chain.store(env, builder, self.address, offset)
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            new_stack_chain.store(env, builder, self.address, offset, Some(region))
         }
 
         /// Loads the parent of this continuation, which may either be another
@@ -149,7 +150,15 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> VMStackChain {
             let offset = env.offsets.ptr.vmcontref_parent_chain().into();
-            VMStackChain::load(env, builder, self.address, offset, env.pointer_type())
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            VMStackChain::load(
+                env,
+                builder,
+                self.address,
+                offset,
+                env.pointer_type(),
+                Some(region),
+            )
         }
 
         pub fn set_last_ancestor<'a>(
@@ -159,7 +168,8 @@ pub(crate) mod stack_switching_helpers {
             last_ancestor: ir::Value,
         ) {
             let offset: i32 = env.offsets.ptr.vmcontref_last_ancestor().into();
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             builder
                 .ins()
                 .store(mem_flags, last_ancestor, self.address, offset);
@@ -171,7 +181,8 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> ir::Value {
             let offset: i32 = env.offsets.ptr.vmcontref_last_ancestor().into();
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             builder
                 .ins()
                 .load(env.pointer_type(), mem_flags, self.address, offset)
@@ -184,7 +195,8 @@ pub(crate) mod stack_switching_helpers {
             env: &mut crate::func_environ::FuncEnvironment<'a>,
             builder: &mut FunctionBuilder,
         ) -> ir::Value {
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             let offset: i32 = env.offsets.ptr.vmcontref_revision().into();
             let revision = builder.ins().load(I64, mem_flags, self.address, offset);
             revision
@@ -199,9 +211,10 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
             revision: ir::Value,
         ) -> ir::Value {
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             let offset: i32 = env.offsets.ptr.vmcontref_revision().into();
-            let revision_plus1 = builder.ins().iadd_imm(revision, 1);
+            let revision_plus1 = builder.ins().iadd_imm_s(revision, 1);
             builder
                 .ins()
                 .store(mem_flags, revision_plus1, self.address, offset);
@@ -215,7 +228,7 @@ pub(crate) mod stack_switching_helpers {
         ) -> VMContinuationStack {
             // The top of stack field is stored at offset 0 of the `FiberStack`.
             let offset: i64 = env.offsets.ptr.vmcontref_stack().into();
-            let fiber_stack_top_of_stack_ptr = builder.ins().iadd_imm(self.address, offset);
+            let fiber_stack_top_of_stack_ptr = builder.ins().iadd_imm_s(self.address, offset);
             VMContinuationStack::new(fiber_stack_top_of_stack_ptr)
         }
     }
@@ -228,18 +241,32 @@ pub(crate) mod stack_switching_helpers {
             }
         }
 
-        fn get(&self, builder: &mut FunctionBuilder, ty: ir::Type, offset: i32) -> ir::Value {
-            let mem_flags = ir::MemFlags::trusted();
+        fn get(
+            &self,
+            env: &mut crate::func_environ::FuncEnvironment<'_>,
+            builder: &mut FunctionBuilder,
+            ty: ir::Type,
+            offset: i32,
+        ) -> ir::Value {
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             builder.ins().load(ty, mem_flags, self.address, offset)
         }
 
-        fn set<U>(&self, builder: &mut FunctionBuilder, offset: i32, value: ir::Value) {
+        fn set<U>(
+            &self,
+            env: &mut crate::func_environ::FuncEnvironment<'_>,
+            builder: &mut FunctionBuilder,
+            offset: i32,
+            value: ir::Value,
+        ) {
             debug_assert_eq!(
                 builder.func.dfg.value_type(value),
                 Type::int_with_byte_size(u16::try_from(core::mem::size_of::<U>()).unwrap())
                     .unwrap()
             );
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             builder.ins().store(mem_flags, value, self.address, offset);
         }
 
@@ -249,7 +276,8 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> ir::Value {
             let offset = env.offsets.ptr.vmhostarray_data().into();
-            self.get(builder, env.pointer_type(), offset)
+            let pointer_type = env.pointer_type();
+            self.get(env, builder, pointer_type, offset)
         }
 
         pub fn get_length<'a>(
@@ -259,7 +287,7 @@ pub(crate) mod stack_switching_helpers {
         ) -> ir::Value {
             // Array length is stored as u32.
             let offset = env.offsets.ptr.vmhostarray_length().into();
-            self.get(builder, I32, offset)
+            self.get(env, builder, I32, offset)
         }
 
         fn set_length<'a>(
@@ -270,7 +298,7 @@ pub(crate) mod stack_switching_helpers {
         ) {
             // Array length is stored as u32.
             let offset = env.offsets.ptr.vmhostarray_length().into();
-            self.set::<u32>(builder, offset, length);
+            self.set::<u32>(env, builder, offset, length);
         }
 
         fn set_capacity<'a>(
@@ -281,7 +309,7 @@ pub(crate) mod stack_switching_helpers {
         ) {
             // Array capacity is stored as u32.
             let offset = env.offsets.ptr.vmhostarray_capacity().into();
-            self.set::<u32>(builder, offset, capacity);
+            self.set::<u32>(env, builder, offset, capacity);
         }
 
         fn set_data<'a>(
@@ -292,7 +320,8 @@ pub(crate) mod stack_switching_helpers {
         ) {
             debug_assert_eq!(builder.func.dfg.value_type(data), env.pointer_type());
             let offset: i32 = env.offsets.ptr.vmhostarray_data().into();
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             builder.ins().store(mem_flags, data, self.address, offset);
         }
 
@@ -308,14 +337,14 @@ pub(crate) mod stack_switching_helpers {
             let original_length = self.get_length(env, builder);
             let new_length = builder
                 .ins()
-                .iadd_imm(original_length, i64::from(arg_count));
+                .iadd_imm_s(original_length, i64::from(arg_count));
             self.set_length(env, builder, new_length);
 
             let (_align, entry_size) = T::vmhostarray_entry_layout(&env.offsets.ptr);
             let original_length = builder.ins().uextend(I64, original_length);
             let byte_offset = builder
                 .ins()
-                .imul_imm(original_length, i64::from(entry_size));
+                .imul_imm_s(original_length, i64::from(entry_size));
             builder.ins().iadd(data, byte_offset)
         }
 
@@ -371,7 +400,10 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
             load_types: &[ir::Type],
         ) -> Vec<ir::Value> {
-            let memflags = ir::MemFlags::trusted();
+            let region = env
+                .alias_regions
+                .continuation_stack_memory_region(builder.func);
+            let memflags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
 
             let data_start_pointer = self.get_data(env, builder);
             let mut values = vec![];
@@ -409,7 +441,10 @@ pub(crate) mod stack_switching_helpers {
                 size <= entry_size
             }));
 
-            let memflags = ir::MemFlags::trusted();
+            let region = env
+                .alias_regions
+                .continuation_stack_memory_region(builder.func);
+            let memflags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
 
             let data_start_pointer = self.get_data(env, builder);
 
@@ -489,7 +524,7 @@ pub(crate) mod stack_switching_helpers {
             _env: &mut crate::func_environ::FuncEnvironment<'a>,
             builder: &mut FunctionBuilder,
         ) -> ir::Value {
-            builder.ins().icmp_imm(
+            builder.ins().icmp_imm_s(
                 IntCC::Equal,
                 self.discriminant,
                 i64::try_from(wasmtime_environ::STACK_CHAIN_INITIAL_STACK_DISCRIMINANT).unwrap(),
@@ -510,14 +545,19 @@ pub(crate) mod stack_switching_helpers {
         }
 
         /// Load a `VMStackChain` object from the given address.
+        ///
+        /// The `region` is the alias region for the two-pointer field being
+        /// loaded (e.g. the `VMStoreContext::stack_chain` region, or the
+        /// `VMContRef` region for a continuation's parent chain).
         pub fn load<'a>(
             _env: &mut crate::func_environ::FuncEnvironment<'a>,
             builder: &mut FunctionBuilder,
             pointer: ir::Value,
             initial_offset: i32,
             pointer_type: ir::Type,
+            region: Option<ir::AliasRegion>,
         ) -> VMStackChain {
-            let memflags = ir::MemFlags::trusted();
+            let memflags = ir::MemFlagsData::trusted().with_alias_region(region);
             let mut offset = initial_offset;
             let mut data = vec![];
             for _ in 0..2 {
@@ -529,14 +569,19 @@ pub(crate) mod stack_switching_helpers {
         }
 
         /// Store this `VMStackChain` object at the given address.
+        ///
+        /// The `region` is the alias region for the two-pointer field being
+        /// stored (e.g. the `VMStoreContext::stack_chain` region, or the
+        /// `VMContRef` region for a continuation's parent chain).
         pub fn store<'a>(
             &self,
             env: &mut crate::func_environ::FuncEnvironment<'a>,
             builder: &mut FunctionBuilder,
             target_pointer: ir::Value,
             initial_offset: i32,
+            region: Option<ir::AliasRegion>,
         ) {
-            let memflags = ir::MemFlags::trusted();
+            let memflags = ir::MemFlagsData::trusted().with_alias_region(region);
             let mut offset = initial_offset;
             let data = self.to_raw_parts();
 
@@ -587,7 +632,7 @@ pub(crate) mod stack_switching_helpers {
         ) -> ir::Value {
             let offset: i64 = env.offsets.ptr.vmcommon_stack_information_state().into();
 
-            builder.ins().iadd_imm(self.address, offset)
+            builder.ins().iadd_imm_s(self.address, offset)
         }
 
         fn get_stack_limits_ptr<'a>(
@@ -597,7 +642,7 @@ pub(crate) mod stack_switching_helpers {
         ) -> ir::Value {
             let offset: i64 = env.offsets.ptr.vmcommon_stack_information_limits().into();
 
-            builder.ins().iadd_imm(self.address, offset)
+            builder.ins().iadd_imm_s(self.address, offset)
         }
 
         fn load_state<'a>(
@@ -605,7 +650,8 @@ pub(crate) mod stack_switching_helpers {
             env: &mut crate::func_environ::FuncEnvironment<'a>,
             builder: &mut FunctionBuilder,
         ) -> ir::Value {
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             let state_ptr = self.get_state_ptr(env, builder);
 
             builder.ins().load(I32, mem_flags, state_ptr, 0)
@@ -618,7 +664,8 @@ pub(crate) mod stack_switching_helpers {
             discriminant: u32,
         ) {
             let discriminant = builder.ins().iconst(I32, i64::from(discriminant));
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             let state_ptr = self.get_state_ptr(env, builder);
 
             builder.ins().store(mem_flags, discriminant, state_ptr, 0);
@@ -671,7 +718,7 @@ pub(crate) mod stack_switching_helpers {
             let allocated = wasmtime_environ::STACK_STATE_FRESH_DISCRIMINANT;
             builder
                 .ins()
-                .icmp_imm(IntCC::NotEqual, actual_state, i64::from(allocated))
+                .icmp_imm_s(IntCC::NotEqual, actual_state, i64::from(allocated))
         }
 
         pub fn get_handler_list<'a>(
@@ -680,7 +727,7 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> VMHandlerList {
             let offset: i64 = env.offsets.ptr.vmcommon_stack_information_handlers().into();
-            let address = builder.ins().iadd_imm(self.address, offset);
+            let address = builder.ins().iadd_imm_s(self.address, offset);
             VMHandlerList::new(address)
         }
 
@@ -690,7 +737,8 @@ pub(crate) mod stack_switching_helpers {
             builder: &mut FunctionBuilder,
         ) -> ir::Value {
             // Field first_switch_handler_index has type u32
-            let memflags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let memflags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             let offset: i32 = env
                 .offsets
                 .ptr
@@ -706,7 +754,8 @@ pub(crate) mod stack_switching_helpers {
             value: ir::Value,
         ) {
             // Field first_switch_handler_index has type u32
-            let memflags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let memflags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             let offset: i32 = env
                 .offsets
                 .ptr
@@ -726,39 +775,46 @@ pub(crate) mod stack_switching_helpers {
         ) {
             let stack_limits_ptr = self.get_stack_limits_ptr(env, builder);
 
-            let memflags = ir::MemFlags::trusted();
-
-            let mut copy_to_vm_runtime_limits = |our_offset, their_offset| {
-                let our_value = builder.ins().load(
-                    env.pointer_type(),
-                    memflags,
-                    stack_limits_ptr,
-                    i32::from(our_offset),
-                );
-                builder.ins().store(
-                    memflags,
-                    our_value,
-                    vmruntime_limits_ptr,
-                    i32::from(their_offset),
-                );
-            };
-
-            let pointer_size = u8::try_from(env.pointer_type().bytes()).unwrap();
+            let pointer_type = env.pointer_type();
             let stack_limit_offset = env.offsets.ptr.vmstack_limits_stack_limit();
             let last_wasm_entry_fp_offset = env.offsets.ptr.vmstack_limits_last_wasm_entry_fp();
-            copy_to_vm_runtime_limits(
-                stack_limit_offset,
-                pointer_size.vmstore_context_stack_limit(),
+
+            // The load side reads this continuation's inline `VMStackLimits`
+            // (the `VMContRef` region); the store side targets the
+            // `VMStoreContext`.
+            let vmcontref_region = env.alias_regions.vmcontref_region(builder.func);
+            let our_memflags =
+                ir::MemFlagsData::trusted().with_alias_region(Some(vmcontref_region));
+
+            let stack_limit = builder.ins().load(
+                pointer_type,
+                our_memflags,
+                stack_limits_ptr,
+                i32::from(stack_limit_offset),
             );
-            copy_to_vm_runtime_limits(
-                last_wasm_entry_fp_offset,
-                pointer_size.vmstore_context_last_wasm_entry_fp(),
+            env.alias_regions.store_vmstore_context_stack_limit(
+                &mut builder.cursor(),
+                vmruntime_limits_ptr,
+                stack_limit,
+            );
+
+            let last_wasm_entry_fp = builder.ins().load(
+                pointer_type,
+                our_memflags,
+                stack_limits_ptr,
+                i32::from(last_wasm_entry_fp_offset),
+            );
+            env.alias_regions.store_vmstore_context_last_wasm_entry_fp(
+                &mut builder.cursor(),
+                vmruntime_limits_ptr,
+                last_wasm_entry_fp,
             );
         }
 
         /// Overwrites the `last_wasm_entry_fp` field of the `VMStackLimits`
-        /// object in the `VMStackLimits` of this object by loading the corresponding
-        /// field from the `VMRuntimeLimits`.
+        /// object in the `VMStackLimits` of this object by loading the
+        /// corresponding field from the `VMStoreContext`.
+        ///
         /// If `load_stack_limit` is true, we do the same for the `stack_limit`
         /// field.
         pub fn load_limits_from_vmcontext<'a>(
@@ -770,35 +826,35 @@ pub(crate) mod stack_switching_helpers {
         ) {
             let stack_limits_ptr = self.get_stack_limits_ptr(env, builder);
 
-            let memflags = ir::MemFlags::trusted();
-            let pointer_size = u8::try_from(env.pointer_type().bytes()).unwrap();
+            // The load side reads the `VMStoreContext`...
+            let last_wasm_entry_fp = env
+                .alias_regions
+                .vmstore_context_last_wasm_entry_fp(&mut builder.cursor(), vmruntime_limits_ptr);
 
-            let mut copy = |runtime_limits_offset, stack_limits_offset| {
-                let from_vm_runtime_limits = builder.ins().load(
-                    env.pointer_type(),
-                    memflags,
-                    vmruntime_limits_ptr,
-                    runtime_limits_offset,
-                );
-                builder.ins().store(
-                    memflags,
-                    from_vm_runtime_limits,
-                    stack_limits_ptr,
-                    stack_limits_offset,
-                );
-            };
-
+            // ...and store to this continuation's inline `VMStackLimits`.
+            let vmcontref_region = env.alias_regions.vmcontref_region(builder.func);
+            let our_memflags =
+                ir::MemFlagsData::trusted().with_alias_region(Some(vmcontref_region));
             let last_wasm_entry_fp_offset = env.offsets.ptr.vmstack_limits_last_wasm_entry_fp();
-            copy(
-                pointer_size.vmstore_context_last_wasm_entry_fp(),
-                last_wasm_entry_fp_offset,
+            builder.ins().store(
+                our_memflags,
+                last_wasm_entry_fp,
+                stack_limits_ptr,
+                i32::from(last_wasm_entry_fp_offset),
             );
 
             if load_stack_limit {
+                // Load from the `VMStoreContext`...
+                let stack_limit = env
+                    .alias_regions
+                    .vmstore_context_stack_limit(&mut builder.cursor(), vmruntime_limits_ptr);
+                // ...and store to this continuation's inline `VMStackLimits`.
                 let stack_limit_offset = env.offsets.ptr.vmstack_limits_stack_limit();
-                copy(
-                    pointer_size.vmstore_context_stack_limit(),
-                    stack_limit_offset,
+                builder.ins().store(
+                    our_memflags,
+                    stack_limit,
+                    stack_limits_ptr,
+                    i32::from(stack_limit_offset),
                 );
             }
         }
@@ -817,7 +873,8 @@ pub(crate) mod stack_switching_helpers {
             env: &mut crate::func_environ::FuncEnvironment<'a>,
             builder: &mut FunctionBuilder,
         ) -> ir::Value {
-            let mem_flags = ir::MemFlags::trusted();
+            let region = env.alias_regions.vmcontref_region(builder.func);
+            let mem_flags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             builder
                 .ins()
                 .load(env.pointer_type(), mem_flags, self.tos_ptr, 0)
@@ -832,7 +889,7 @@ pub(crate) mod stack_switching_helpers {
         ) -> ir::Value {
             let tos = self.load_top_of_stack(env, builder);
             // Control context begins 24 bytes below top of stack (see unix.rs)
-            builder.ins().iadd_imm(tos, -0x18)
+            builder.ins().iadd_imm_s(tos, -0x18)
         }
     }
 }
@@ -897,7 +954,10 @@ pub(crate) fn vmcontref_store_payloads<'a>(
             let ptr = builder.block_params(store_data_block)[0];
 
             // Store the values.
-            let memflags = ir::MemFlags::trusted();
+            let region = env
+                .alias_regions
+                .continuation_stack_memory_region(builder.func);
+            let memflags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
             let mut offset = 0;
             for value in values {
                 builder.ins().store(memflags, *value, ptr, offset);
@@ -914,18 +974,12 @@ pub(crate) fn tag_address<'a>(
 ) -> ir::Value {
     let vmctx = env.vmctx_val(&mut builder.cursor());
     let tag_index = wasmtime_environ::TagIndex::from_u32(index);
-    let pointer_type = env.pointer_type();
     if let Some(def_index) = env.module.defined_tag_index(tag_index) {
         let offset = i32::try_from(env.offsets.vmctx_vmtag_definition(def_index)).unwrap();
-        builder.ins().iadd_imm(vmctx, i64::from(offset))
+        builder.ins().iadd_imm_s(vmctx, i64::from(offset))
     } else {
-        let offset = i32::try_from(env.offsets.vmctx_vmtag_import_from(tag_index)).unwrap();
-        builder.ins().load(
-            pointer_type,
-            ir::MemFlags::trusted().with_readonly(),
-            vmctx,
-            ir::immediates::Offset32::new(offset),
-        )
+        env.alias_regions
+            .vmctx_vmtag_import_from(&mut builder.cursor(), vmctx, tag_index)
     }
 }
 
@@ -940,20 +994,20 @@ pub fn vmctx_load_stack_chain<'a>(
     let stack_chain_offset = env.offsets.ptr.vmstore_context_stack_chain().into();
 
     // First we need to get the `VMStoreContext`.
-    let vm_store_context_offset = env.offsets.ptr.vmctx_store_context();
-    let vm_store_context = builder.ins().load(
-        env.pointer_type(),
-        MemFlags::trusted(),
-        vmctx,
-        vm_store_context_offset,
-    );
+    let vm_store_context = env
+        .alias_regions
+        .vmctx_store_context(&mut builder.cursor(), vmctx);
 
+    let stack_chain_region = env
+        .alias_regions
+        .vmstore_context_stack_chain_region(builder.func);
     VMStackChain::load(
         env,
         builder,
         vm_store_context,
         stack_chain_offset,
         env.pointer_type(),
+        Some(stack_chain_region),
     )
 }
 
@@ -968,15 +1022,20 @@ pub fn vmctx_store_stack_chain<'a>(
     let stack_chain_offset = env.offsets.ptr.vmstore_context_stack_chain().into();
 
     // First we need to get the `VMStoreContext`.
-    let vm_store_context_offset = env.offsets.ptr.vmctx_store_context();
-    let vm_store_context = builder.ins().load(
-        env.pointer_type(),
-        MemFlags::trusted(),
-        vmctx,
-        vm_store_context_offset,
-    );
+    let vm_store_context = env
+        .alias_regions
+        .vmctx_store_context(&mut builder.cursor(), vmctx);
 
-    stack_chain.store(env, builder, vm_store_context, stack_chain_offset)
+    let stack_chain_region = env
+        .alias_regions
+        .vmstore_context_stack_chain_region(builder.func);
+    stack_chain.store(
+        env,
+        builder,
+        vm_store_context,
+        stack_chain_offset,
+        Some(stack_chain_region),
+    )
 }
 
 /// Similar to `vmctx_store_stack_chain`, but instead of storing an arbitrary
@@ -989,21 +1048,6 @@ pub fn vmctx_set_active_continuation<'a>(
 ) {
     let chain = VMStackChain::from_continuation(env, builder, contref);
     vmctx_store_stack_chain(env, builder, vmctx, &chain)
-}
-
-pub fn vmctx_load_vm_runtime_limits_ptr<'a>(
-    env: &mut crate::func_environ::FuncEnvironment<'a>,
-    builder: &mut FunctionBuilder,
-    vmctx: ir::Value,
-) -> ir::Value {
-    let pointer_type = env.pointer_type();
-    let offset = i32::from(env.offsets.ptr.vmctx_store_context());
-
-    // The *pointer* to the VMRuntimeLimits does not change within the
-    // same function, allowing us to set the `read_only` flag.
-    let flags = ir::MemFlags::trusted().with_readonly();
-
-    builder.ins().load(pointer_type, flags, vmctx, offset)
 }
 
 /// This function generates code that searches for a handler for `tag_address`,
@@ -1138,18 +1182,21 @@ fn search_handler<'a>(
 
         let base = handler_list_data_ptr;
         let entry_size = env.pointer_type().bytes();
-        let offset = builder.ins().imul_imm(index, i64::from(entry_size));
+        let offset = builder.ins().imul_imm_s(index, i64::from(entry_size));
         let offset = builder.ins().uextend(I64, offset);
         let entry_address = builder.ins().iadd(base, offset);
 
-        let memflags = ir::MemFlags::trusted();
+        let region = env
+            .alias_regions
+            .continuation_stack_memory_region(builder.func);
+        let memflags = ir::MemFlagsData::trusted().with_alias_region(Some(region));
 
         let handled_tag = builder
             .ins()
             .load(env.pointer_type(), memflags, entry_address, 0);
 
         let tags_match = builder.ins().icmp(IntCC::Equal, handled_tag, tag_address);
-        let incremented_index = builder.ins().iadd_imm(index, 1);
+        let incremented_index = builder.ins().iadd_imm_s(index, 1);
         builder.ins().brif(
             tags_match,
             on_match,
@@ -1221,7 +1268,7 @@ pub(crate) fn translate_cont_new<'a>(
         .ins()
         .iconst(I32, i64::try_from(return_types.len()).unwrap());
 
-    let cont_new_func = super::builtins::cont_new(env, &mut builder.func)?;
+    let cont_new_func = env.builtin_functions.cont_new(&mut builder.func);
     let vmctx = env.vmctx_val(&mut builder.cursor());
     let call_inst = builder
         .ins()
@@ -1362,7 +1409,9 @@ pub(crate) fn translate_resume<'a>(
         // as well as the `VMRuntimeLimits`.
         // See the comment on `wasmtime_environ::VMStackChain` for a description
         // of the invariants that we maintain for the various stack limits.
-        let vm_runtime_limits_ptr = vmctx_load_vm_runtime_limits_ptr(env, builder, vmctx);
+        let vm_runtime_limits_ptr = env
+            .alias_regions
+            .vmctx_store_context(&mut builder.cursor(), vmctx);
         parent_csi.load_limits_from_vmcontext(env, builder, vm_runtime_limits_ptr, true);
         resume_csi.write_limits_to_vmcontext(env, builder, vm_runtime_limits_ptr);
 
@@ -1524,23 +1573,21 @@ pub(crate) fn translate_resume<'a>(
                 .collect();
 
             let values = suspended_contref.values(env, builder);
-            let mut suspend_args: Vec<BlockArg> = values
-                .load_data_entries(env, builder, &param_types)
-                .into_iter()
-                .map(|v| BlockArg::Value(v))
-                .collect();
+            let mut suspend_args: Vec<ir::Value> =
+                values.load_data_entries(env, builder, &param_types);
 
             // At the suspend site, we store the suspend args in the the
             // `values` buffer of the VMContRef that was active at the time that
             // the suspend instruction was performed.
-            suspend_args.push(BlockArg::Value(suspended_contobj));
+            suspend_args.push(suspended_contobj);
 
             // We clear the suspend args. This is mostly for consistency. Note
             // that we don't zero out the data buffer, we still need it for the
 
             values.clear(env, builder, false);
 
-            builder.ins().jump(target_block, &suspend_args);
+            set_block_params(env, builder, target_block, &suspend_args);
+            builder.ins().jump(target_block, &[]);
         }
 
         preamble_blocks
@@ -1761,7 +1808,9 @@ pub(crate) fn translate_switch<'a>(
 
         // Load current runtime limits from `VMContext` and store in the
         // switcher continuation.
-        let vm_runtime_limits_ptr = vmctx_load_vm_runtime_limits_ptr(env, builder, vmctx);
+        let vm_runtime_limits_ptr = env
+            .alias_regions
+            .vmctx_store_context(&mut builder.cursor(), vmctx);
         switcher_contref_csi.load_limits_from_vmcontext(env, builder, vm_runtime_limits_ptr, false);
 
         let revision = switcher_contref.get_revision(env, builder);
@@ -1871,26 +1920,39 @@ pub(crate) fn translate_switch<'a>(
         let slot = builder.create_sized_stack_slot(slot_size);
         let tmp_control_context = builder.ins().stack_addr(env.pointer_type(), slot, 0);
 
-        let flags = MemFlags::trusted();
+        // The `*_last_ancestor_cc` control contexts live on continuation
+        // stacks, but the temporary lives in a current-frame stack slot, so the
+        // former get the continuation-stack-memory region while the latter gets
+        // its own stack-slot region.
+        let region = env
+            .alias_regions
+            .continuation_stack_memory_region(builder.func);
+        let cc_flags = MemFlagsData::trusted().with_alias_region(Some(region));
+        let tmp_region = env.alias_regions.stack_slot_region(builder.func, slot);
+        let tmp_flags = MemFlagsData::trusted().with_alias_region(Some(tmp_region));
         let mut offset: i32 = 0;
         while offset < i32::from(cctx_size) {
             // switchee_last_ancestor_cc -> tmp control context
-            let tmp1 =
-                builder
-                    .ins()
-                    .load(env.pointer_type(), flags, switchee_last_ancestor_cc, offset);
+            let tmp1 = builder.ins().load(
+                env.pointer_type(),
+                cc_flags,
+                switchee_last_ancestor_cc,
+                offset,
+            );
             builder
                 .ins()
-                .store(flags, tmp1, tmp_control_context, offset);
+                .store(tmp_flags, tmp1, tmp_control_context, offset);
 
             // switcher_last_ancestor_cc -> switchee_last_ancestor_cc
-            let tmp2 =
-                builder
-                    .ins()
-                    .load(env.pointer_type(), flags, switcher_last_ancestor_cc, offset);
+            let tmp2 = builder.ins().load(
+                env.pointer_type(),
+                cc_flags,
+                switcher_last_ancestor_cc,
+                offset,
+            );
             builder
                 .ins()
-                .store(flags, tmp2, switchee_last_ancestor_cc, offset);
+                .store(cc_flags, tmp2, switchee_last_ancestor_cc, offset);
 
             offset += i32::try_from(env.pointer_type().bytes()).unwrap();
         }

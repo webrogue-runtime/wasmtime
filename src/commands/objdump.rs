@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use wasmtime::{Engine, Result, bail, error::Context as _};
 use wasmtime_environ::{
-    FilePos, FrameInstPos, FrameStackShape, FrameStateSlot, FrameTable, FrameTableDescriptorIndex,
-    ModulePC, StackMap, Trap, obj,
+    CompiledTrap, FilePos, FrameInstPos, FrameStackShape, FrameStateSlot, FrameTable,
+    FrameTableDescriptorIndex, ModulePC, StackMap, obj,
 };
 use wasmtime_unwinder::{ExceptionHandler, ExceptionTable};
 
@@ -205,6 +205,7 @@ impl ObjdumpCommand {
                 || name.ends_with("_array_call")
                 || name.ends_with("_wasm_call")
                 || name.contains("unsafe-intrinsics-")
+                || name.contains("module_start")
             {
                 Func::Trampoline
             } else if name.contains("libcall") || name.starts_with("component") {
@@ -429,7 +430,7 @@ enum Func {
 struct Decorator<'a> {
     objdump: &'a ObjdumpCommand,
     addrmap: Option<Peekable<Box<dyn Iterator<Item = (u32, FilePos)> + 'a>>>,
-    traps: Option<Peekable<Box<dyn Iterator<Item = (u32, Trap)> + 'a>>>,
+    traps: Option<Peekable<Box<dyn Iterator<Item = (u32, CompiledTrap)> + 'a>>>,
     stack_maps: Option<Peekable<Box<dyn Iterator<Item = (u32, StackMap<'a>)> + 'a>>>,
     exception_tables:
         Option<Peekable<Box<dyn Iterator<Item = (u32, Option<u32>, Vec<ExceptionHandler>)> + 'a>>>,

@@ -100,6 +100,11 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         }
     }
 
+    /// Returns the `Instance` that's being lowered into.
+    pub fn instance_handle(&self) -> Instance {
+        self.instance
+    }
+
     /// Returns the `&ComponentInstance` that's being lowered into.
     pub fn instance(&self) -> &ComponentInstance {
         self.instance.id().get(self.store.0)
@@ -216,7 +221,7 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         ty: TypeResourceTableIndex,
         rep: u32,
     ) -> Result<u32> {
-        self.resource_tables().guest_resource_lower_own(rep, ty)
+        self.resource_tables()?.guest_resource_lower_own(rep, ty)
     }
 
     /// Lowers a `borrow` resource into the guest, converting the `rep` to a
@@ -237,19 +242,19 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         if self.instance().resource_owned_by_own_instance(ty) {
             return Ok(rep);
         }
-        self.resource_tables().guest_resource_lower_borrow(rep, ty)
+        self.resource_tables()?.guest_resource_lower_borrow(rep, ty)
     }
 
     /// Lifts a host-owned `own` resource at the `idx` specified into the
     /// representation of that resource.
     pub fn host_resource_lift_own(&mut self, idx: HostResourceIndex) -> Result<u32> {
-        self.resource_tables().host_resource_lift_own(idx)
+        self.resource_tables()?.host_resource_lift_own(idx)
     }
 
     /// Lifts a host-owned `borrow` resource at the `idx` specified into the
     /// representation of that resource.
     pub fn host_resource_lift_borrow(&mut self, idx: HostResourceIndex) -> Result<u32> {
-        self.resource_tables().host_resource_lift_borrow(idx)
+        self.resource_tables()?.host_resource_lift_borrow(idx)
     }
 
     /// Lowers a resource into the host-owned table, returning the index it was
@@ -263,7 +268,7 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         dtor: Option<NonNull<VMFuncRef>>,
         instance: Option<RuntimeInstance>,
     ) -> Result<HostResourceIndex> {
-        self.resource_tables()
+        self.resource_tables()?
             .host_resource_lower_own(rep, dtor, instance)
     }
 
@@ -278,18 +283,18 @@ impl<'a, T: 'static> LowerContext<'a, T> {
         InstanceType::new(self.instance())
     }
 
-    fn resource_tables(&mut self) -> HostResourceTables<'_> {
+    fn resource_tables(&mut self) -> Result<HostResourceTables<'_>> {
         let (tables, data) = self
             .store
             .0
-            .component_resource_tables_and_host_resource_data(Some(self.instance));
-        HostResourceTables::from_parts(tables, data)
+            .component_resource_tables_and_host_resource_data(Some(self.instance))?;
+        Ok(HostResourceTables::from_parts(tables, data))
     }
 
     /// See [`HostResourceTables::validate_scope_exit`].
     #[inline]
     pub fn validate_scope_exit(&mut self) -> Result<()> {
-        self.resource_tables().validate_scope_exit()
+        self.resource_tables()?.validate_scope_exit()
     }
 }
 
@@ -301,6 +306,7 @@ impl<'a, T: 'static> LowerContext<'a, T> {
 #[doc(hidden)]
 pub struct LiftContext<'a> {
     store_id: StoreId,
+    current_scope_id: Option<u32>,
     /// Like lowering, lifting always has options configured.
     options: OptionsIndex,
 
@@ -332,9 +338,10 @@ impl<'a> LiftContext<'a> {
         store: &'a mut StoreOpaque,
         options: OptionsIndex,
         instance_handle: Instance,
-    ) -> LiftContext<'a> {
+    ) -> Result<LiftContext<'a>> {
         let store_id = store.id();
         let hostcall_fuel = store.hostcall_fuel();
+        let current_scope_id = store.current_scope_id()?;
         // From `&mut StoreOpaque` provided the goal here is to project out
         // three different disjoint fields owned by the store: memory,
         // `CallContexts`, and `HandleTable`. There's no native API for that
@@ -347,8 +354,9 @@ impl<'a> LiftContext<'a> {
             store.lift_context_parts(instance_handle);
         let (component, instance) = instance.component_and_self();
 
-        LiftContext {
+        Ok(LiftContext {
             store_id,
+            current_scope_id,
             memory,
             options,
             types: component.types(),
@@ -358,7 +366,7 @@ impl<'a> LiftContext<'a> {
             host_table,
             host_resource_data,
             hostcall_fuel,
-        }
+        })
     }
 
     /// Returns the canonical options that are being used during lifting.
@@ -398,8 +406,13 @@ impl<'a> LiftContext<'a> {
     }
 
     #[cfg(feature = "component-model-async")]
-    pub(crate) fn concurrent_state_mut(&mut self) -> &mut ConcurrentState {
-        self.task_state.concurrent_state_mut()
+    pub(crate) fn concurrent_state_and_instance_mut(
+        &mut self,
+    ) -> (&mut ConcurrentState, Pin<&mut ComponentInstance>) {
+        (
+            self.task_state.concurrent_state_mut(),
+            self.instance.as_mut(),
+        )
     }
 
     /// Lifts an `own` resource from the guest at the `idx` specified into its
@@ -461,6 +474,7 @@ impl<'a> LiftContext<'a> {
                 host_table: self.host_table,
                 task_state: self.task_state,
                 guest: Some(self.instance.as_mut().instance_states()),
+                current_scope_id: self.current_scope_id,
             },
             self.host_resource_data,
         )

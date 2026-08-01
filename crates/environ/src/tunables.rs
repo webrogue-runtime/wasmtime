@@ -82,6 +82,10 @@ define_tunables! {
         /// the guest.
         pub debug_guest: bool,
 
+        /// Whether we are enabling native symbols to get inserted into the
+        /// final `*.cwasm`.
+        pub debug_symbols: bool,
+
         /// Whether or not to retain DWARF sections in compiled modules.
         pub parse_wasm_debuginfo: bool,
 
@@ -180,6 +184,18 @@ define_tunables! {
         ///
         /// This is the same as `memory_may_move` but for GC heaps.
         pub gc_heap_may_move: bool,
+
+        /// Boolean to track whether compiled code retains metadata necessary to
+        /// report extra information on internal assertions failing.
+        pub metadata_for_internal_asserts: bool,
+
+        /// Boolean to track whether compiled code retains metadata necessary to
+        /// report extra information on gc heap corruption being detected.
+        pub metadata_for_gc_heap_corruption: bool,
+
+        /// Whether `metadata.code.branch_hint` sections are parsed and used to
+        /// mark cold blocks during compilation.
+        pub branch_hinting: bool,
     }
 
     pub struct ConfigTunables {
@@ -263,6 +279,10 @@ impl Tunables {
             gc_heap_guard_size: 0,
             gc_heap_reservation_for_growth: 0,
             gc_heap_may_move: true,
+            metadata_for_internal_asserts: false,
+            metadata_for_gc_heap_corruption: true,
+            branch_hinting: false,
+            debug_symbols: true,
         }
     }
 

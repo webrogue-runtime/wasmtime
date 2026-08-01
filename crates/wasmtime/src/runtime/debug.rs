@@ -17,7 +17,6 @@ use crate::{Caller, Result, Store};
 use alloc::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ptr::read_unaligned;
 use core::{ffi::c_void, ptr::NonNull};
 #[cfg(feature = "gc")]
 use wasmtime_environ::FrameTable;
@@ -646,10 +645,10 @@ impl FrameDataCache {
                 // module that actually contains the physical PC
                 // (i.e., the outermost function that inlined the
                 // others).
-                let (module, frames) = VirtualFrame::decode(registry, frame.pc());
+                let (store_code, frames) = VirtualFrame::decode(registry, frame.pc());
                 let frames = frames
                     .into_iter()
-                    .map(|frame| FrameData::compute(frame, &module))
+                    .map(|frame| FrameData::compute(frame, store_code))
                     .collect::<Vec<_>>();
                 v.insert(frames)
             }
@@ -673,18 +672,17 @@ struct VirtualFrame {
 impl VirtualFrame {
     /// Return virtual frames corresponding to a physical frame, from
     /// outermost to innermost.
-    fn decode(registry: &ModuleRegistry, pc: usize) -> (Module, Vec<VirtualFrame>) {
-        let (module_with_code, pc) = registry
-            .module_and_code_by_pc(pc)
+    fn decode(registry: &ModuleRegistry, pc: usize) -> (&StoreCode, Vec<VirtualFrame>) {
+        let (store_code, pc) = registry
+            .store_code_by_pc(pc)
             .expect("Wasm frame PC does not correspond to a module");
-        let module = module_with_code.module();
-        let table = module.frame_table().unwrap();
+        let table = store_code.code_memory().frame_table().unwrap();
         let pc = u32::try_from(pc).expect("PC offset too large");
         let program_points = table.find_program_point(pc, FrameInstPos::Post)
             .expect("There must be a program point record in every frame when debug instrumentation is enabled");
 
         (
-            module.clone(),
+            store_code,
             program_points
                 .map(|(wasm_pc, frame_descriptor, stack_shape)| VirtualFrame {
                     wasm_pc,
@@ -720,8 +718,8 @@ struct FrameData {
 }
 
 impl FrameData {
-    fn compute(frame: VirtualFrame, module: &Module) -> Self {
-        let frame_table = module.frame_table().unwrap();
+    fn compute(frame: VirtualFrame, store_code: &StoreCode) -> Self {
+        let frame_table = store_code.code_memory().frame_table().unwrap();
         // Parse the frame descriptor.
         let (data, slot_to_fp_offset) = frame_table
             .frame_descriptor(frame.frame_descriptor)
@@ -774,50 +772,52 @@ unsafe fn read_value(
 ) -> Val {
     let address = unsafe { slot_base.offset(isize::try_from(offset.offset()).unwrap()) };
 
-    // SAFETY: each case reads a value from memory that should be
-    // valid according to our safety condition.
+    // SAFETY: each case reads a value from memory that should be valid
+    // according to our safety condition. State-slot values are packed without
+    // alignment padding, so these loads must accept unaligned addresses.
     match ty {
         FrameValType::I32 => {
-            let value = unsafe { read_unaligned(address as *const i32) };
+            let value = unsafe { (address as *const i32).read_unaligned() };
             Val::I32(value)
         }
         FrameValType::I64 => {
-            let value = unsafe { read_unaligned(address as *const i64) };
+            let value = unsafe { (address as *const i64).read_unaligned() };
             Val::I64(value)
         }
         FrameValType::F32 => {
-            let value = unsafe { read_unaligned(address as *const u32) };
+            let value = unsafe { (address as *const u32).read_unaligned() };
             Val::F32(value)
         }
         FrameValType::F64 => {
-            let value = unsafe { read_unaligned(address as *const u64) };
+            let value = unsafe { (address as *const u64).read_unaligned() };
             Val::F64(value)
         }
         FrameValType::V128 => {
             // Vectors are always stored as little-endian.
-            let value = unsafe { u128::from_le_bytes(read_unaligned(address as *const [u8; 16])) };
+            let value =
+                unsafe { u128::from_le_bytes((address as *const [u8; 16]).read_unaligned()) };
             Val::V128(value.into())
         }
         FrameValType::AnyRef => {
             let mut nogc = AutoAssertNoGc::new(store);
-            let value = unsafe { read_unaligned(address as *const u32) };
+            let value = unsafe { (address as *const u32).read_unaligned() };
             let value = AnyRef::_from_raw(&mut nogc, value);
             Val::AnyRef(value)
         }
         FrameValType::ExnRef => {
             let mut nogc = AutoAssertNoGc::new(store);
-            let value = unsafe { read_unaligned(address as *const u32) };
+            let value = unsafe { (address as *const u32).read_unaligned() };
             let value = ExnRef::_from_raw(&mut nogc, value);
             Val::ExnRef(value)
         }
         FrameValType::ExternRef => {
             let mut nogc = AutoAssertNoGc::new(store);
-            let value = unsafe { read_unaligned(address as *const u32) };
+            let value = unsafe { (address as *const u32).read_unaligned() };
             let value = ExternRef::_from_raw(&mut nogc, value);
             Val::ExternRef(value)
         }
         FrameValType::FuncRef => {
-            let value = unsafe { read_unaligned(address as *const *mut c_void) };
+            let value = unsafe { (address as *const *mut c_void).read_unaligned() };
             let value = unsafe { Func::_from_raw(store, value) };
             Val::FuncRef(value)
         }

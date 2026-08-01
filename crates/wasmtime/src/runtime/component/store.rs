@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use crate::runtime::component::concurrent::ConcurrentState;
 use crate::runtime::component::{HostResourceData, Instance};
 use crate::runtime::vm;
 use crate::runtime::vm::component::{
@@ -14,6 +13,7 @@ use wasmtime_environ::prelude::TryPrimaryMap;
 #[cfg(feature = "component-model-async")]
 use crate::{
     component::ResourceTable,
+    component::concurrent::ConcurrentState,
     runtime::vm::{VMStore, component::InstanceState},
 };
 
@@ -66,6 +66,7 @@ pub enum ComponentTaskState {
 
     /// Used when `Config::concurrency_support` is enabled and has
     /// full state for all async tasks.
+    #[cfg(feature = "component-model-async")]
     Concurrent(ConcurrentState),
 }
 
@@ -136,7 +137,7 @@ impl ComponentStoreData {
         let mut fibers = Vec::new();
         let mut futures = Vec::new();
         store
-            .concurrent_state_mut()
+            .concurrent_state_mut_without_forcing_current_thread()
             .take_fibers_and_futures(&mut fibers, &mut futures);
 
         for mut fiber in fibers {
@@ -164,6 +165,11 @@ impl ComponentStoreData {
         for _ in 0..self.num_component_instances {
             allocator.decrement_component_instance_count();
         }
+    }
+
+    #[cfg(all(feature = "component-model-async", feature = "gc"))]
+    pub fn task_state_mut(&mut self) -> &mut ComponentTaskState {
+        &mut self.task_state
     }
 }
 
@@ -292,10 +298,6 @@ impl StoreOpaque {
         &mut self.store_data_mut().components
     }
 
-    pub(crate) fn component_task_state_mut(&mut self) -> &mut ComponentTaskState {
-        &mut self.component_data_mut().task_state
-    }
-
     pub(crate) fn push_component_instance(&mut self, instance: Instance) {
         // We don't actually need the instance itself right now, but it seems
         // like something we will almost certainly eventually want to keep
@@ -318,9 +320,32 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "component-model-async")]
-    pub(crate) fn concurrent_state_mut(&mut self) -> &mut ConcurrentState {
+    pub(crate) fn concurrent_state_mut_without_forcing_current_thread(
+        &mut self,
+    ) -> &mut ConcurrentState {
         debug_assert!(self.concurrency_support());
         self.component_data_mut().task_state.concurrent_state_mut()
+    }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn concurrent_state_mut_already_forced_current_thread(
+        &mut self,
+    ) -> &mut ConcurrentState {
+        debug_assert!(self.concurrency_support());
+        debug_assert!(
+            !self
+                .vm_store_context_mut()
+                .current_thread_mut()
+                .is_deferred()
+        );
+        self.concurrent_state_mut_without_forcing_current_thread()
+    }
+
+    #[cfg(feature = "component-model-async")]
+    pub(crate) fn concurrent_state_mut(&mut self) -> Result<&mut ConcurrentState> {
+        debug_assert!(self.concurrency_support());
+        self.current_thread()?;
+        Ok(self.component_data_mut().task_state.concurrent_state_mut())
     }
 
     #[inline]
@@ -357,18 +382,21 @@ impl StoreOpaque {
     pub(crate) fn component_resource_tables(
         &mut self,
         instance: Option<Instance>,
-    ) -> vm::component::ResourceTables<'_> {
-        self.component_resource_tables_and_host_resource_data(instance)
-            .0
+    ) -> Result<vm::component::ResourceTables<'_>> {
+        Ok(self
+            .component_resource_tables_and_host_resource_data(instance)?
+            .0)
     }
 
     pub(crate) fn component_resource_tables_and_host_resource_data(
         &mut self,
         instance: Option<Instance>,
-    ) -> (
+    ) -> Result<(
         vm::component::ResourceTables<'_>,
         &mut crate::component::HostResourceData,
-    ) {
+    )> {
+        let current_scope_id = self.current_scope_id()?;
+
         let store_id = self.id();
         let data = self.component_data_mut();
         let guest = instance.map(|i| {
@@ -381,19 +409,21 @@ impl StoreOpaque {
                 .instance_states()
         });
 
-        (
+        Ok((
             vm::component::ResourceTables {
                 host_table: &mut data.component_host_table,
                 task_state: &mut data.task_state,
                 guest,
+                current_scope_id,
             },
             &mut data.host_resource_data,
-        )
+        ))
     }
 
     pub(crate) fn enter_call_not_concurrent(&mut self) -> Result<()> {
         let state = match &mut self.component_data_mut().task_state {
             ComponentTaskState::NotConcurrent(state) => state,
+            #[cfg(feature = "component-model-async")]
             ComponentTaskState::Concurrent(_) => unreachable!(),
         };
         state.scopes.push(CallContext::default())?;
@@ -403,6 +433,7 @@ impl StoreOpaque {
     pub(crate) fn exit_call_not_concurrent(&mut self) {
         let state = match &mut self.component_data_mut().task_state {
             ComponentTaskState::NotConcurrent(state) => state,
+            #[cfg(feature = "component-model-async")]
             ComponentTaskState::Concurrent(_) => unreachable!(),
         };
         state.scopes.pop();
@@ -419,9 +450,23 @@ impl StoreOpaque {
     #[cfg(feature = "component-model-async")]
     fn concurrent_resource_table(&mut self) -> Option<&mut ResourceTable> {
         if self.concurrency_support() {
-            Some(self.concurrent_state_mut().table())
+            Some(
+                self.concurrent_state_mut_without_forcing_current_thread()
+                    .table(),
+            )
         } else {
             None
+        }
+    }
+
+    pub(crate) fn current_scope_id_not_concurrent(&mut self) -> Result<Option<u32>> {
+        match &mut self.component_data_mut().task_state {
+            ComponentTaskState::NotConcurrent(state) => match state.scopes.len().checked_sub(1) {
+                Some(i) => Ok(Some(u32::try_from(i)?)),
+                None => Ok(None),
+            },
+            #[cfg(feature = "component-model-async")]
+            ComponentTaskState::Concurrent(_) => crate::bail_bug!("should not be reachable"),
         }
     }
 }
@@ -504,17 +549,12 @@ impl ComponentTaskState {
     pub fn call_context(&mut self, id: u32) -> Result<&mut CallContext> {
         match self {
             ComponentTaskState::NotConcurrent(state) => Ok(&mut state.scopes[id as usize]),
+            #[cfg(feature = "component-model-async")]
             ComponentTaskState::Concurrent(state) => state.call_context(id),
         }
     }
 
-    pub fn current_call_context_scope_id(&self) -> Result<u32> {
-        match self {
-            ComponentTaskState::NotConcurrent(state) => Ok(u32::try_from(state.scopes.len() - 1)?),
-            ComponentTaskState::Concurrent(state) => state.current_call_context_scope_id(),
-        }
-    }
-
+    #[cfg(feature = "component-model-async")]
     pub fn concurrent_state_mut(&mut self) -> &mut ConcurrentState {
         match self {
             ComponentTaskState::Concurrent(state) => state,
