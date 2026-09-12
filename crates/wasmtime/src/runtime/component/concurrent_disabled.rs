@@ -151,7 +151,6 @@ unsafe impl Lower for StreamAny {
 impl StoreOpaque {
     pub(crate) fn enter_guest_sync_call(
         &mut self,
-        _guest_caller: Option<RuntimeInstance>,
         _callee_async: bool,
         _callee: RuntimeInstance,
     ) -> Result<()> {
@@ -166,20 +165,8 @@ impl StoreOpaque {
         self.enter_call_not_concurrent()
     }
 
-    pub(crate) fn host_task_reenter_caller(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     pub(crate) fn host_task_delete(&mut self, (): ()) -> Result<()> {
         Ok(self.exit_call_not_concurrent())
-    }
-
-    pub(crate) fn check_blocking(&mut self) -> crate::Result<()> {
-        Ok(())
-    }
-
-    pub(crate) fn may_enter(&mut self, _instance: RuntimeInstance) -> Result<bool> {
-        Ok(!self.trapped())
     }
 
     pub(crate) fn current_scope_id(&mut self) -> Result<Option<u32>> {

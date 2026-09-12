@@ -7,17 +7,17 @@
   (core instance $libc (instantiate $libc))
   (core type $start-func-ty (func (param i32)))
   (core func $thread.new-indirect
-    (canon thread.new-indirect $start-func-ty (table $libc "t")))
-  (core func $thread.unsuspend (canon thread.unsuspend))
+    (canon thread.new-indirect $start-func-ty (core table $libc "t")))
+  (core func $thread.resume-later (canon thread.resume-later))
   (core func $thread.index (canon thread.index))
-  (core func $thread.yield-cancellable (canon thread.yield cancellable))
+  (core func $thread.yield (canon thread.yield))
   (core func $task.return (canon task.return))
 
   (core module $m
     (import "" "thread.new-indirect" (func $thread.new-indirect (param i32 i32) (result i32)))
-    (import "" "thread.unsuspend" (func $thread.unsuspend (param i32)))
+    (import "" "thread.resume-later" (func $thread.resume-later (param i32)))
     (import "" "thread.index" (func $thread.index (result i32)))
-    (import "" "thread.yield-cancellable" (func $thread.yield-cancellable (result i32)))
+    (import "" "thread.yield" (func $thread.yield (result i32)))
     (import "" "task.return" (func $task.return))
     (import "" "tbl" (table $tbl 1 funcref))
 
@@ -25,14 +25,14 @@
     (func (export "run") (result i32)
       (local $tid i32)
       (local.set $tid (call $thread.new-indirect (i32.const 0) (call $thread.index)))
-      (call $thread.unsuspend (local.get $tid))
+      (call $thread.resume-later (local.get $tid))
       i32.const 1 ;; CALLBACK_CODE_YIELD
     )
 
-    ;; thread: call `thread.yield-cancellable` and double-check it didn't pick
+    ;; thread: call `thread.yield` and double-check it didn't pick
     ;; up anything
     (func $explicit-start (param $ctx i32)
-      (if (call $thread.yield-cancellable)
+      (if (call $thread.yield)
         (then (unreachable)))
     )
     (elem (table $tbl) (i32.const 0) func $explicit-start)
@@ -46,13 +46,13 @@
 
   (core instance $i (instantiate $m (with "" (instance
     (export "thread.new-indirect" (func $thread.new-indirect))
-    (export "thread.unsuspend" (func $thread.unsuspend))
+    (export "thread.resume-later" (func $thread.resume-later))
     (export "thread.index" (func $thread.index))
-    (export "thread.yield-cancellable" (func $thread.yield-cancellable))
+    (export "thread.yield" (func $thread.yield))
     (export "task.return" (func $task.return))
     (export "tbl" (table $libc "t"))))))
 
   (func (export "run") async
-    (canon lift (core func $i "run") async (callback (func $i "cb"))))
+    (canon lift (core func $i "run") async (callback (core func $i "cb"))))
 )
 (assert_return (invoke "run"))

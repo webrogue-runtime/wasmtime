@@ -34,7 +34,7 @@ use crate::{
     masm::CalleeKind,
 };
 use cranelift_codegen::{
-    Final, MachBufferFinalized, MachLabel,
+    ExceptionContextLoc, Final, MachBufferFinalized, MachExceptionHandler, MachLabel,
     binemit::CodeOffset,
     ir::{MemFlagsData, RelSourceLoc, SourceLoc},
     isa::{
@@ -129,14 +129,14 @@ impl Masm for MacroAssembler {
 
         self.with_scratch::<IntScratch, _>(|masm, scratch| {
             masm.load_ptr(
-                masm.address_at_reg(vmctx, ptr_size.vmcontext_store_context().into())?,
+                masm.address_at_reg(vmctx, ptr_size.vmctx().store_context().into())?,
                 scratch.writable(),
             )?;
 
             masm.load_ptr(
                 Address::offset(
                     scratch.inner(),
-                    ptr_size.vmstore_context_stack_limit().into(),
+                    ptr_size.vm_store_context().stack_limit().into(),
                 ),
                 scratch.writable(),
             )?;
@@ -221,6 +221,13 @@ impl Masm for MacroAssembler {
         self.sp_offset = offset.as_u32();
 
         Ok(())
+    }
+
+    fn prepare_for_exception_handler(&mut self, target_offset: SPOffset) -> Result<Reg> {
+        self.asm.mov_rr(rbp(), writable!(rsp()), OperandSize::S64);
+        self.sp_offset = 0;
+        self.reserve_stack(target_offset.as_u32())?;
+        Ok(regs::rax())
     }
 
     fn local_address(&mut self, local: &LocalSlot) -> Result<Address> {
@@ -326,7 +333,12 @@ impl Masm for MacroAssembler {
     fn call(
         &mut self,
         stack_args_size: u32,
-        mut load_callee: impl FnMut(&mut Self) -> Result<(CalleeKind, CallingConvention)>,
+        context: &mut CodeGenContext<Emission>,
+        mut load_callee: impl FnMut(
+            &mut Self,
+            &mut CodeGenContext<Emission>,
+        ) -> Result<(CalleeKind, CallingConvention)>,
+        mut finalize: impl FnMut(&mut Self, &mut CodeGenContext<Emission>) -> Result<()>,
     ) -> Result<u32> {
         let alignment: u32 = <Self::ABI as abi::ABI>::call_stack_align().into();
         let addend: u32 = <Self::ABI as abi::ABI>::initial_frame_size().into();
@@ -334,11 +346,13 @@ impl Masm for MacroAssembler {
         let aligned_args_size = align_to(stack_args_size, alignment);
         let total_stack = delta + aligned_args_size;
         self.reserve_stack(total_stack)?;
-        let (callee, cc) = load_callee(self)?;
+        let (callee, cc) = load_callee(self, context)?;
         match callee {
             CalleeKind::Indirect(reg) => self.asm.call_with_reg(cc, reg),
             CalleeKind::Direct(idx) => self.asm.call_with_name(cc, idx),
         };
+        finalize(self, context)?;
+
         Ok(total_stack)
     }
 
@@ -1043,14 +1057,21 @@ impl Masm for MacroAssembler {
             self.asm.lzcnt(src, dst, size);
         } else {
             self.with_scratch::<IntScratch, _>(|masm, scratch| {
-                // Use the following approach:
-                // dst = size.num_bits() - bsr(src) - is_not_zero
-                //     = size.num.bits() + -bsr(src) - is_not_zero.
+                // For a non-zero input, BSR returns the index of the
+                // most-significant set bit, so clz is:
+                //     dst = (num_bits - 1) - bsr(src)
+                // which is emitted as a negate followed by an add:
+                //     dst = -bsr(src) + (num_bits - 1)
+                //
+                // BSR leaves the destination undefined when the source is 0
+                //
+                // A conditional move substitutes -1 for the undefined index
+                // in the zero case.
                 masm.asm.bsr(src, dst, size);
-                masm.asm.setcc(IntCmpKind::Ne, scratch.writable());
+                masm.asm.mov_ir((-1i64) as u64, scratch.writable(), size);
+                masm.asm.cmov(scratch.inner(), dst, IntCmpKind::Eq, size);
                 masm.asm.neg(dst.to_reg(), dst, size);
-                masm.asm.add_ir(size.num_bits() as i32, dst, size);
-                masm.asm.sub_rr(scratch.inner(), dst, size);
+                masm.asm.add_ir((size.num_bits() - 1) as i32, dst, size);
             });
         }
 
@@ -1062,17 +1083,18 @@ impl Masm for MacroAssembler {
             self.asm.tzcnt(src, dst, size);
         } else {
             self.with_scratch::<IntScratch, _>(|masm, scratch| {
-                // Use the following approach:
-                // dst = bsf(src) + (is_zero * size.num_bits())
-                //     = bsf(src) + (is_zero << size.log2()).
-                // BSF outputs the correct value for every value except 0.
-                // When the value is 0, BSF outputs 0, correct output for ctz is
-                // the number of bits.
+                // BSF returns the index of the least-significant set bit, which
+                // is the correct output of ctz for any non-zero input.
+                //
+                // However, it leaves the destination undefined when the source
+                // is 0.
+                //
+                // Perform a conditional move to ensure that the destination
+                // register is always correctly defined.
                 masm.asm.bsf(src, dst, size);
-                masm.asm.setcc(IntCmpKind::Eq, scratch.writable());
                 masm.asm
-                    .shift_ir(size.log2(), scratch.writable(), ShiftKind::Shl, size);
-                masm.asm.add_rr(scratch.inner(), dst, size);
+                    .mov_ir(size.num_bits() as u64, scratch.writable(), size);
+                masm.asm.cmov(scratch.inner(), dst, IntCmpKind::Eq, size);
             });
         }
 
@@ -1392,6 +1414,41 @@ impl Masm for MacroAssembler {
         Ok(())
     }
 
+    fn emit_stack_map(&mut self, sp_offset: SPOffset, offsets: &[SPOffset]) -> Result<()> {
+        let frame_size = sp_offset.as_u32();
+        let return_addr = self.asm.buffer().cur_offset();
+        let map = cranelift_codegen::ir::UserStackMap::from_sp_offsets(
+            offsets.iter().map(SPOffset::as_u32),
+        );
+        self.asm
+            .buffer_mut()
+            .push_user_stack_map_sp_relative(return_addr, frame_size, map);
+        Ok(())
+    }
+
+    fn emit_try_call_site(
+        &mut self,
+        sp_offset: SPOffset,
+        vmctx_slot_offset: u32,
+        handlers: impl Iterator<Item = MachExceptionHandler>,
+    ) -> Result<()> {
+        let frame_offset = sp_offset.as_u32();
+        let vmctx_offset = frame_offset
+            .checked_sub(vmctx_slot_offset)
+            .ok_or_else(CodeGenError::invalid_local_offset)?;
+
+        let handlers = std::iter::once(MachExceptionHandler::Context(
+            ExceptionContextLoc::SPOffset(vmctx_offset),
+        ))
+        .chain(handlers);
+
+        self.asm
+            .buffer_mut()
+            .add_try_call_site(Some(frame_offset), handlers);
+
+        Ok(())
+    }
+
     fn current_code_offset(&self) -> Result<CodeOffset> {
         Ok(self.asm.buffer().cur_offset())
     }
@@ -1596,29 +1653,31 @@ impl Masm for MacroAssembler {
     fn atomic_rmw(
         &mut self,
         context: &mut CodeGenContext<Emission>,
-        addr: Self::Address,
         size: OperandSize,
         op: RmwOp,
         flags: MemFlagsData,
         extend: Option<Extend<Zero>>,
     ) -> Result<()> {
         let res = match op {
-            RmwOp::Add => {
+            RmwOp::Add | RmwOp::Sub | RmwOp::Xchg => {
                 let operand = context.pop_to_reg(self, None)?;
-                self.asm
-                    .lock_xadd(addr, writable!(operand.reg), size, flags);
-                operand.reg
-            }
-            RmwOp::Sub => {
-                let operand = context.pop_to_reg(self, None)?;
-                self.asm.neg(operand.reg, writable!(operand.reg), size);
-                self.asm
-                    .lock_xadd(addr, writable!(operand.reg), size, flags);
-                operand.reg
-            }
-            RmwOp::Xchg => {
-                let operand = context.pop_to_reg(self, None)?;
-                self.asm.xchg(addr, writable!(operand.reg), size, flags);
+                let base = context.pop_to_reg(self, None)?;
+                let addr = self.address_at_reg(base.reg, 0)?;
+
+                match op {
+                    RmwOp::Add => self
+                        .asm
+                        .lock_xadd(addr, writable!(operand.reg), size, flags),
+                    RmwOp::Sub => {
+                        self.asm.neg(operand.reg, writable!(operand.reg), size);
+                        self.asm
+                            .lock_xadd(addr, writable!(operand.reg), size, flags);
+                    }
+                    RmwOp::Xchg => self.asm.xchg(addr, writable!(operand.reg), size, flags),
+                    _ => unreachable!(),
+                }
+
+                context.free_reg(base.reg);
                 operand.reg
             }
             RmwOp::And | RmwOp::Or | RmwOp::Xor => {
@@ -1630,8 +1689,11 @@ impl Masm for MacroAssembler {
                         "invalid op for atomic_rmw_seq, should be one of `or`, `and` or `xor`"
                     ),
                 };
+
                 let dst = context.reg(regs::rax(), self)?;
                 let operand = context.pop_to_reg(self, None)?;
+                let base = context.pop_to_reg(self, None)?;
+                let addr = self.address_at_reg(base.reg, 0)?;
 
                 self.with_scratch::<IntScratch, _>(|masm, scratch| {
                     masm.asm.atomic_rmw_seq(
@@ -1646,6 +1708,7 @@ impl Masm for MacroAssembler {
                 });
 
                 context.free_reg(operand.reg);
+                context.free_reg(base.reg);
                 dst
             }
         };
@@ -1783,20 +1846,18 @@ impl Masm for MacroAssembler {
     fn atomic_cas(
         &mut self,
         context: &mut CodeGenContext<Emission>,
-        addr: Self::Address,
         size: OperandSize,
         flags: MemFlagsData,
         extend: Option<Extend<Zero>>,
     ) -> Result<()> {
-        // `cmpxchg` expects `expected` to be in the `*a*` register.
-        // reserve rax for the expected argument.
-
         let replacement =
             context.without::<Result<TypedReg>, _, _>(&[regs::rax()], self, |cx, masm| {
                 cx.pop_to_reg(masm, None)
             })??;
 
         let expected = context.pop_to_reg(self, Some(regs::rax()))?;
+        let base = context.pop_to_reg(self, None)?;
+        let addr = self.address_at_reg(base.reg, 0)?;
 
         self.asm
             .cmpxchg(addr, replacement.reg, writable!(expected.reg), size, flags);
@@ -1808,6 +1869,7 @@ impl Masm for MacroAssembler {
 
         context.stack.push(expected.into());
         context.free_reg(replacement);
+        context.free_reg(base.reg);
 
         Ok(())
     }

@@ -12,14 +12,15 @@
   )
 )
 ;; function u0:0(i64 vmctx, i64, i32) -> i8x16 tail {
-;;     region0 = 8 "VMContext+0x8"
-;;     region1 = 134217752 "VMStoreContext+0x18"
-;;     region2 = 134217760 "VMStoreContext+0x20"
-;;     region3 = 134217768 "VMStoreContext+0x28"
-;;     region4 = 1073741824 "GcHeap"
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 196 ""
+;;     region3 = 206 ""
+;;     region4 = 108 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
 ;;     gv2 = load.i64 notrap aligned region1 gv1+24
+;;     const0 = 0x00000000000000000000000000000000
 ;;     stack_limit = gv2
 ;;
 ;;                                 block0(v0: i64, v1: i64, v2: i32):
@@ -34,6 +35,6 @@
 ;; @002e                               jump block1
 ;;
 ;;                                 block1:
-;; @002c                               v17 = bxor.i8x16 v9, v9
-;; @002e                               return v17
+;;                                     v18 = vconst.i8x16 const0
+;; @002e                               return v18  ; v18 = const0
 ;; }

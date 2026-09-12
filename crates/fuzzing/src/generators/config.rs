@@ -146,6 +146,7 @@ impl Config {
             component_model_error_context,
             component_model_gc,
             component_model_map,
+            component_model_memory64,
             component_model_fixed_length_lists,
             component_model_implements,
             simd,
@@ -174,6 +175,7 @@ impl Config {
             component_model_error_context.unwrap_or(false);
         self.module_config.component_model_gc = component_model_gc.unwrap_or(false);
         self.module_config.component_model_map = component_model_map.unwrap_or(false);
+        self.module_config.component_model_memory64 = component_model_memory64.unwrap_or(false);
         self.module_config.component_model_fixed_length_lists =
             component_model_fixed_length_lists.unwrap_or(false);
         self.module_config.component_model_implements = component_model_implements.unwrap_or(false);
@@ -196,9 +198,11 @@ impl Config {
         config.gc_enabled = gc.unwrap_or(false);
         config.reference_types_enabled = config.gc_enabled
             || self.module_config.function_references_enabled
+            || self.module_config.component_model_async
             || reference_types.unwrap_or(false);
         config.extended_const_enabled = extended_const.unwrap_or(false);
-        config.exceptions_enabled = exceptions.unwrap_or(false);
+        config.exceptions_enabled =
+            self.module_config.stack_switching || exceptions.unwrap_or(false);
         if multi_memory.unwrap_or(false) {
             config.max_memories = limits::MEMORIES_PER_MODULE as usize;
         } else {
@@ -329,6 +333,7 @@ impl Config {
             Some(self.module_config.component_model_error_context);
         cfg.wasm.component_model_gc = Some(self.module_config.component_model_gc);
         cfg.wasm.component_model_map = Some(self.module_config.component_model_map);
+        cfg.wasm.component_model_memory64 = Some(self.module_config.component_model_memory64);
         cfg.wasm.component_model_fixed_length_lists =
             Some(self.module_config.component_model_fixed_length_lists);
         cfg.wasm.component_model_implements = Some(self.module_config.component_model_implements);
@@ -699,10 +704,8 @@ impl WasmtimeConfig {
                     config.config.simd_enabled = false;
                 }
 
-                // Account for the proposals that are currently only
-                // supported on x64.
+                // Account for the proposals that Winch only supports on x64.
                 if cfg!(target_arch = "aarch64") {
-                    config.config.simd_enabled = false;
                     config.config.wide_arithmetic_enabled = false;
                     config.config.threads_enabled = false;
                 }
@@ -862,7 +865,7 @@ impl WasmtimeConfig {
 
         // When using the pooling allocator, GC heap tunables must match memory
         // tunables.
-        if let InstanceAllocationStrategy::Pooling(_) = &self.strategy {
+        if let InstanceAllocationStrategy::Pooling(pcfg) = &self.strategy {
             let reservation = mcfg.gc_heap_reservation.max(mcfg.memory_reservation);
             mcfg.gc_heap_reservation = reservation;
             mcfg.memory_reservation = reservation;
@@ -880,6 +883,19 @@ impl WasmtimeConfig {
             // memory_may_move is not in MemoryConfig, but gc_heap_may_move
             // must not conflict. Set it to None so the default matches.
             mcfg.gc_heap_may_move = None;
+
+            // Don't let the initial size of a GC heap exceed the maximum
+            // allowed by the pooling allocator. Note that these sizes are
+            // rounded up to the wasm page size used by GC at this time as
+            // that's what happens internally.
+            if let Some(amt) = mcfg.gc_heap_initial_size {
+                let page_size = 64 * 1024;
+                let amt = amt.next_multiple_of(page_size);
+                // Round down so the GC's round-up-to-page-size doesn't push
+                // this back over the pooling limit.
+                let max = (pcfg.max_memory_size as u64) / page_size * page_size;
+                mcfg.gc_heap_initial_size = Some(amt.min(max));
+            }
         }
 
         if !self.debug_symbols {

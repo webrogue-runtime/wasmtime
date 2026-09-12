@@ -83,7 +83,9 @@ impl FnCall {
     /// 3. Spills the value stack.
     /// 4. Creates the stack space needed for the return area.
     /// 5. Emits the call.
-    /// 6. Cleans up the stack space.
+    /// 6. Records any GC stack map and active exception handlers at the call's
+    ///    return address.
+    /// 7. Cleans up the stack space.
     pub fn emit<M: MacroAssembler>(
         env: &mut FuncEnv<M::Ptr>,
         masm: &mut M,
@@ -96,10 +98,29 @@ impl FnCall {
         context.spill(masm)?;
         let ret_area = Self::make_ret_area(&sig, masm)?;
         let arg_stack_space = sig.params_stack_size();
-        let reserved_stack = masm.call(arg_stack_space, |masm| {
-            Self::assign(sig, &callee_context, ret_area.as_ref(), context, masm)?;
-            Ok((kind, sig.call_conv))
-        })?;
+        let reserved_stack = masm.call(
+            arg_stack_space,
+            context,
+            |masm, context| {
+                Self::assign(sig, &callee_context, ret_area.as_ref(), context, masm)?;
+                Ok((kind, sig.call_conv))
+            },
+            |masm, context| {
+                let sp = masm.sp_offset()?;
+                let offsets = context.calculate_stack_map_offsets(sp)?;
+                if !offsets.is_empty() {
+                    masm.emit_stack_map(sp, &offsets)?;
+                }
+                if !context.exception_handlers.is_empty() {
+                    masm.emit_try_call_site(
+                        sp,
+                        context.frame.vmctx_slot().offset,
+                        context.exception_handlers.handlers(),
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
 
         Self::cleanup(
             sig,
@@ -201,11 +222,13 @@ impl FnCall {
             context.without::<Result<(Reg, Reg)>, M, _>(&sig.regs, masm, |context, masm| {
                 Ok((context.any_gpr(masm)?, context.any_gpr(masm)?))
             })??;
-        let callee_vmctx_offset = vmoffsets.vmctx_vmfunction_import_vmctx(index);
+        let vmimport = vmoffsets.imported_functions().at(index);
+        let callee_vmctx_offset = vmimport + u32::from(vmoffsets.ptr.vm_function_import().vmctx());
         let callee_vmctx_addr = masm.address_at_vmctx(callee_vmctx_offset)?;
         masm.load_ptr(callee_vmctx_addr, writable!(callee_vmctx))?;
 
-        let callee_body_offset = vmoffsets.vmctx_vmfunction_import_wasm_call(index);
+        let callee_body_offset =
+            vmimport + u32::from(vmoffsets.ptr.vm_function_import().wasm_call());
         let callee_addr = masm.address_at_vmctx(callee_body_offset)?;
         masm.load_ptr(callee_addr, writable!(callee))?;
 
@@ -240,13 +263,13 @@ impl FnCall {
         // Load the callee VMContext, that will be passed as first argument to
         // the function call.
         masm.load_ptr(
-            masm.address_at_reg(funcref_ptr, ptr.vm_func_ref_vmctx().into())?,
+            masm.address_at_reg(funcref_ptr, ptr.vm_func_ref().vmctx().into())?,
             writable!(callee_vmctx),
         )?;
 
         // Load the function pointer to be called.
         masm.load_ptr(
-            masm.address_at_reg(funcref_ptr, ptr.vm_func_ref_wasm_call().into())?,
+            masm.address_at_reg(funcref_ptr, ptr.vm_func_ref().wasm_call().into())?,
             writable!(funcref),
         )?;
         context.free_reg(funcref_ptr);

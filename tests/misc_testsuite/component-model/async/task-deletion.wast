@@ -21,15 +21,11 @@
             (import "" "task.cancel" (func $task-cancel))
             (import "" "thread.new-indirect" (func $thread-new-indirect (param i32 i32) (result i32)))
             (import "" "thread.suspend" (func $thread-suspend (result i32)))
-            (import "" "thread.suspend-cancellable" (func $thread-suspend-cancellable (result i32)))
-            (import "" "thread.yield-to-suspended" (func $thread-yield-to-suspended (param i32) (result i32)))
-            (import "" "thread.yield-to-suspended-cancellable" (func $thread-yield-to-suspended-cancellable (param i32) (result i32)))
-            (import "" "thread.suspend-to" (func $thread-suspend-to (param i32) (result i32)))
-            (import "" "thread.suspend-to-cancellable" (func $thread-suspend-to-cancellable (param i32) (result i32)))
+            (import "" "thread.yield-then-resume" (func $thread-yield-then-resume (param i32) (result i32)))
+            (import "" "thread.suspend-then-promote" (func $thread-suspend-then-promote (param i32) (result i32)))
             (import "" "thread.yield" (func $thread-yield (result i32)))
-            (import "" "thread.yield-cancellable" (func $thread-yield-cancellable (result i32)))
             (import "" "thread.index" (func $thread-index (result i32)))
-            (import "" "thread.unsuspend" (func $thread-unsuspend (param i32)))
+            (import "" "thread.resume-later" (func $thread-resume-later (param i32)))
             (import "" "waitable.join" (func $waitable.join (param i32 i32)))
             (import "" "waitable-set.new" (func $waitable-set.new (result i32)))
             (import "" "waitable-set.wait" (func $waitable-set.wait (param i32 i32) (result i32)))
@@ -52,11 +48,11 @@
                     (br $top)))
 
             (func (export "explicit-thread-calls-return-stackful")
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $call-return-ftbl-idx) (i32.const 42))))
 
             (func (export "explicit-thread-calls-return-stackless") (result i32)
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $call-return-ftbl-idx) (i32.const 42)))
                 (i32.const 0 (; EXIT ;)))
 
@@ -64,33 +60,33 @@
                 (unreachable))
 
             (func (export "explicit-thread-suspends-sync") (result i32)
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $suspend-ftbl-idx) (i32.const 42)))
                 (i32.const 42))
 
             (func (export "explicit-thread-suspends-stackful")
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $suspend-ftbl-idx) (i32.const 42)))
                 (call $task-return (i32.const 42)))
 
             (func (export "explicit-thread-suspends-stackless") (result i32)
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $suspend-ftbl-idx) (i32.const 42)))
                 (call $task-return (i32.const 42))
                 (i32.const 0))
 
             (func (export "explicit-thread-yield-loops-sync") (result i32)
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $yield-loop-ftbl-idx) (i32.const 42)))
                 (i32.const 42))
 
             (func (export "explicit-thread-yield-loops-stackful")
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $yield-loop-ftbl-idx) (i32.const 42)))
                 (call $task-return (i32.const 42)))
 
             (func (export "explicit-thread-yield-loops-stackless") (result i32)
-                (call $thread-unsuspend
+                (call $thread-resume-later
                     (call $thread-new-indirect (global.get $suspend-ftbl-idx) (i32.const 42)))
                 (call $task-return (i32.const 42))
                 (i32.const 0 (; EXIT ;)))
@@ -110,20 +106,16 @@
         (core func $task-return (canon task.return (result u32)))
         (core func $task-cancel (canon task.cancel))
         (core func $thread-new-indirect
-            (canon thread.new-indirect $start-func-ty (table $indirect-function-table)))
+            (canon thread.new-indirect $start-func-ty (core table $indirect-function-table)))
         (core func $thread-yield (canon thread.yield))
-        (core func $thread-yield-cancellable (canon thread.yield cancellable))
         (core func $thread-index (canon thread.index))
-        (core func $thread-yield-to-suspended (canon thread.yield-to-suspended))
-        (core func $thread-yield-to-suspended-cancellable (canon thread.yield-to-suspended cancellable))
-        (core func $thread-unsuspend (canon thread.unsuspend))
-        (core func $thread-suspend-to (canon thread.suspend-to))
-        (core func $thread-suspend-to-cancellable (canon thread.suspend-to cancellable))
+        (core func $thread-yield-then-resume (canon thread.yield-then-resume))
+        (core func $thread-resume-later (canon thread.resume-later))
+        (core func $thread-suspend-then-promote (canon thread.suspend-then-promote))
         (core func $thread-suspend (canon thread.suspend))
-        (core func $thread-suspend-cancellable (canon thread.suspend cancellable))
         (core func $waitable-set.new (canon waitable-set.new))
         (core func $waitable.join (canon waitable.join))
-        (core func $waitable-set.wait (canon waitable-set.wait (memory $memory "mem")))
+        (core func $waitable-set.wait (canon waitable-set.wait (memory (core memory $memory "mem"))))
 
         ;; Instantiate the main module
         (core instance $cm (
@@ -134,15 +126,11 @@
                     (export "task.cancel" (func $task-cancel))
                     (export "thread.new-indirect" (func $thread-new-indirect))
                     (export "thread.index" (func $thread-index))
-                    (export "thread.yield-to-suspended" (func $thread-yield-to-suspended))
-                    (export "thread.yield-to-suspended-cancellable" (func $thread-yield-to-suspended-cancellable))
+                    (export "thread.yield-then-resume" (func $thread-yield-then-resume))
                     (export "thread.yield" (func $thread-yield))
-                    (export "thread.yield-cancellable" (func $thread-yield-cancellable))
-                    (export "thread.suspend-to" (func $thread-suspend-to))
-                    (export "thread.suspend-to-cancellable" (func $thread-suspend-to-cancellable))
+                    (export "thread.suspend-then-promote" (func $thread-suspend-then-promote))
                     (export "thread.suspend" (func $thread-suspend))
-                    (export "thread.suspend-cancellable" (func $thread-suspend-cancellable))
-                    (export "thread.unsuspend" (func $thread-unsuspend))
+                    (export "thread.resume-later" (func $thread-resume-later))
                     (export "waitable.join" (func $waitable.join))
                     (export "waitable-set.wait" (func $waitable-set.wait))
                     (export "waitable-set.new" (func $waitable-set.new))))
@@ -151,19 +139,19 @@
         (func (export "explicit-thread-calls-return-stackful") async (result u32)
             (canon lift (core func $cm "explicit-thread-calls-return-stackful") async))
         (func (export "explicit-thread-calls-return-stackless") async (result u32)
-            (canon lift (core func $cm "explicit-thread-calls-return-stackless") async (callback (func $cm "cb"))))
+            (canon lift (core func $cm "explicit-thread-calls-return-stackless") async (callback (core func $cm "cb"))))
         (func (export "explicit-thread-suspends-sync") async (result u32)
             (canon lift (core func $cm "explicit-thread-suspends-sync")))
         (func (export "explicit-thread-suspends-stackful") async (result u32)
             (canon lift (core func $cm "explicit-thread-suspends-stackful") async))
         (func (export "explicit-thread-suspends-stackless") async (result u32)
-            (canon lift (core func $cm "explicit-thread-suspends-stackless") async (callback (func $cm "cb"))))
+            (canon lift (core func $cm "explicit-thread-suspends-stackless") async (callback (core func $cm "cb"))))
         (func (export "explicit-thread-yield-loops-sync") async (result u32)
             (canon lift (core func $cm "explicit-thread-yield-loops-sync")))
         (func (export "explicit-thread-yield-loops-stackful") async (result u32)
             (canon lift (core func $cm "explicit-thread-yield-loops-stackful") async))
         (func (export "explicit-thread-yield-loops-stackless") async (result u32)
-            (canon lift (core func $cm "explicit-thread-yield-loops-stackless") async (callback (func $cm "cb"))))
+            (canon lift (core func $cm "explicit-thread-yield-loops-stackless") async (callback (core func $cm "cb"))))
     )
 
     (component $D
@@ -249,28 +237,28 @@
         )
 
         (core func $waitable-set.new (canon waitable-set.new))
-        (core func $waitable-set.wait (canon waitable-set.wait (memory $memory "mem")))
+        (core func $waitable-set.wait (canon waitable-set.wait (memory (core memory $memory "mem"))))
         (core func $waitable.join (canon waitable.join))
         (core func $subtask.cancel (canon subtask.cancel async))
         (core func $thread.yield (canon thread.yield))
         ;; sync lowered
-        (canon lower (func $explicit-thread-calls-return-stackful) (memory $memory "mem") (core func $explicit-thread-calls-return-stackful'))
-        (canon lower (func $explicit-thread-calls-return-stackless) (memory $memory "mem") (core func $explicit-thread-calls-return-stackless'))
-        (canon lower (func $explicit-thread-suspends-sync) (memory $memory "mem") (core func $explicit-thread-suspends-sync'))
-        (canon lower (func $explicit-thread-suspends-stackful) (memory $memory "mem") (core func $explicit-thread-suspends-stackful'))
-        (canon lower (func $explicit-thread-suspends-stackless) (memory $memory "mem") (core func $explicit-thread-suspends-stackless'))
-        (canon lower (func $explicit-thread-yield-loops-sync) (memory $memory "mem") (core func $explicit-thread-yield-loops-sync'))
-        (canon lower (func $explicit-thread-yield-loops-stackful) (memory $memory "mem") (core func $explicit-thread-yield-loops-stackful'))
-        (canon lower (func $explicit-thread-yield-loops-stackless) (memory $memory "mem") (core func $explicit-thread-yield-loops-stackless'))
+        (canon lower (func $explicit-thread-calls-return-stackful) (memory (core memory $memory "mem")) (core func $explicit-thread-calls-return-stackful'))
+        (canon lower (func $explicit-thread-calls-return-stackless) (memory (core memory $memory "mem")) (core func $explicit-thread-calls-return-stackless'))
+        (canon lower (func $explicit-thread-suspends-sync) (memory (core memory $memory "mem")) (core func $explicit-thread-suspends-sync'))
+        (canon lower (func $explicit-thread-suspends-stackful) (memory (core memory $memory "mem")) (core func $explicit-thread-suspends-stackful'))
+        (canon lower (func $explicit-thread-suspends-stackless) (memory (core memory $memory "mem")) (core func $explicit-thread-suspends-stackless'))
+        (canon lower (func $explicit-thread-yield-loops-sync) (memory (core memory $memory "mem")) (core func $explicit-thread-yield-loops-sync'))
+        (canon lower (func $explicit-thread-yield-loops-stackful) (memory (core memory $memory "mem")) (core func $explicit-thread-yield-loops-stackful'))
+        (canon lower (func $explicit-thread-yield-loops-stackless) (memory (core memory $memory "mem")) (core func $explicit-thread-yield-loops-stackless'))
         ;; async lowered
-        (canon lower (func $explicit-thread-calls-return-stackful) async (memory $memory "mem") (core func $explicit-thread-calls-return-stackful-async'))
-        (canon lower (func $explicit-thread-calls-return-stackless) async (memory $memory "mem") (core func $explicit-thread-calls-return-stackless-async'))
-        (canon lower (func $explicit-thread-suspends-sync) async (memory $memory "mem") (core func $explicit-thread-suspends-sync-async'))
-        (canon lower (func $explicit-thread-suspends-stackful) async (memory $memory "mem") (core func $explicit-thread-suspends-stackful-async'))
-        (canon lower (func $explicit-thread-suspends-stackless) async (memory $memory "mem") (core func $explicit-thread-suspends-stackless-async'))
-        (canon lower (func $explicit-thread-yield-loops-sync) async (memory $memory "mem") (core func $explicit-thread-yield-loops-sync-async'))
-        (canon lower (func $explicit-thread-yield-loops-stackful) async (memory $memory "mem") (core func $explicit-thread-yield-loops-stackful-async'))
-        (canon lower (func $explicit-thread-yield-loops-stackless) async (memory $memory "mem") (core func $explicit-thread-yield-loops-stackless-async'))
+        (canon lower (func $explicit-thread-calls-return-stackful) async (memory (core memory $memory "mem")) (core func $explicit-thread-calls-return-stackful-async'))
+        (canon lower (func $explicit-thread-calls-return-stackless) async (memory (core memory $memory "mem")) (core func $explicit-thread-calls-return-stackless-async'))
+        (canon lower (func $explicit-thread-suspends-sync) async (memory (core memory $memory "mem")) (core func $explicit-thread-suspends-sync-async'))
+        (canon lower (func $explicit-thread-suspends-stackful) async (memory (core memory $memory "mem")) (core func $explicit-thread-suspends-stackful-async'))
+        (canon lower (func $explicit-thread-suspends-stackless) async (memory (core memory $memory "mem")) (core func $explicit-thread-suspends-stackless-async'))
+        (canon lower (func $explicit-thread-yield-loops-sync) async (memory (core memory $memory "mem")) (core func $explicit-thread-yield-loops-sync-async'))
+        (canon lower (func $explicit-thread-yield-loops-stackful) async (memory (core memory $memory "mem")) (core func $explicit-thread-yield-loops-stackful-async'))
+        (canon lower (func $explicit-thread-yield-loops-stackless) async (memory (core memory $memory "mem")) (core func $explicit-thread-yield-loops-stackless-async'))
         (core instance $dm (instantiate $DM (with "" (instance
             (export "mem" (memory $memory "mem"))
             (export "explicit-thread-calls-return-stackful" (func $explicit-thread-calls-return-stackful'))

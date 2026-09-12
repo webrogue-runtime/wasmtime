@@ -1,7 +1,6 @@
 ;;! component_model_async = true
 ;;! component_model_more_async_builtins = true
 ;;! reference_types = true
-;;! gc_types = true
 ;;! multi_memory = true
 
 ;; synchronous future.read; sync lift
@@ -11,7 +10,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory")))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory"))))
 
     (core module $m
       (import "" "read" (func $read (param i32 i32) (result i32)))
@@ -72,7 +71,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory") async))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory")) async))
 
     (core module $m
       (import "" "read" (func $read (param i32 i32) (result i32)))
@@ -123,7 +122,7 @@
   (func (export "run") (alias export $other-child "run"))
 )
 
-(assert_trap (invoke "run") "wasm trap: cannot block a synchronous task before returning")
+(assert_return (invoke "run"))
 
 ;; synchronous future.read; async lift
 (component
@@ -132,7 +131,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory")))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory"))))
 
     (core module $m
       (import "" "read" (func $read (param i32 i32) (result i32)))
@@ -152,7 +151,7 @@
       ))
     ))
     (func (export "run") async (param "x" $future)
-      (canon lift (core func $i "run") async (callback (func $i "cb"))))
+      (canon lift (core func $i "run") async (callback (core func $i "cb"))))
   )
   (instance $child (instantiate $child))
 
@@ -197,7 +196,7 @@
     (core instance $libc (instantiate $libc))
 
     (type $future (future))
-    (core func $read (canon future.read $future (memory $libc "memory") async))
+    (core func $read (canon future.read $future (memory (core memory $libc "memory")) async))
     (core func $return (canon task.return))
 
     (core module $m
@@ -221,7 +220,7 @@
       ))
     ))
     (func (export "run") async (param "x" $future)
-      (canon lift (core func $i "run") async (callback (func $i "cb"))))
+      (canon lift (core func $i "run") async (callback (core func $i "cb"))))
   )
   (instance $child (instantiate $child))
 

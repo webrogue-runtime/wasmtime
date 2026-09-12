@@ -263,15 +263,17 @@ impl MemoryPool {
             let allocator = ModuleAffinityIndexAllocator::new(
                 num_slots.try_into().unwrap(),
                 config.max_unused_warm_slots,
-            );
-            Stripe {
+            )?;
+            Ok(Stripe {
                 allocator,
                 pkey: pkeys.get(i).cloned(),
-            }
+            })
         };
 
         debug_assert!(layout.num_stripes > 0);
-        let stripes: Vec<_> = (0..layout.num_stripes).map(create_stripe).collect();
+        let stripes: Vec<_> = (0..layout.num_stripes)
+            .map(create_stripe)
+            .collect::<Result<_, OutOfMemory>>()?;
 
         let pool = Self {
             stripes,
@@ -478,13 +480,50 @@ impl MemoryPool {
         image: Option<MemoryImageSlot>,
         bytes_resident: usize,
     ) {
-        self.return_memory_image_slot(allocation_index, image);
-
-        let (stripe_index, striped_allocation_index) =
-            StripedAllocationIndex::from_unstriped_slot_index(allocation_index, self.stripes.len());
+        let (stripe_index, slot_id) = self.return_slot(allocation_index, image);
         self.stripes[stripe_index]
             .allocator
-            .free(SlotId(striped_allocation_index.0), bytes_resident);
+            .free(slot_id, bytes_resident);
+    }
+
+    /// Same as [`Self::deallocate`], but for many memories at once, returning
+    /// slot indices to each stripe's index allocator under a single lock
+    /// acquisition per stripe.
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::deallocate`].
+    pub unsafe fn deallocate_many(
+        &self,
+        items: impl Iterator<Item = (MemoryAllocationIndex, Option<MemoryImageSlot>, usize)>,
+    ) {
+        let mut per_stripe: smallvec::SmallVec<[smallvec::SmallVec<[(SlotId, usize); 8]>; 16]> = (0
+            ..self.stripes.len())
+            .map(|_| Default::default())
+            .collect();
+        for (allocation_index, image, bytes_resident) in items {
+            let (stripe_index, slot_id) = self.return_slot(allocation_index, image);
+            per_stripe[stripe_index].push((slot_id, bytes_resident));
+        }
+        for (stripe, items) in self.stripes.iter().zip(per_stripe) {
+            if !items.is_empty() {
+                stripe.allocator.free_many(items);
+            }
+        }
+    }
+
+    /// Return `allocation_index`'s image slot to the pool and translate the
+    /// index to its stripe and stripe-local slot id, on behalf of
+    /// [`Self::deallocate`] and [`Self::deallocate_many`].
+    fn return_slot(
+        &self,
+        allocation_index: MemoryAllocationIndex,
+        image: Option<MemoryImageSlot>,
+    ) -> (usize, SlotId) {
+        self.return_memory_image_slot(allocation_index, image);
+        let (stripe_index, striped_allocation_index) =
+            StripedAllocationIndex::from_unstriped_slot_index(allocation_index, self.stripes.len());
+        (stripe_index, SlotId(striped_allocation_index.0))
     }
 
     /// Purging everything related to `module`.
@@ -550,6 +589,19 @@ impl MemoryPool {
         self.mapping.offset(offset).expect("offset is in bounds")
     }
 
+    /// Return the protection key that this slot's memory was striped with when
+    /// the pool was created, if any.
+    ///
+    /// This mirrors the striping performed in `new`: memory is only colored
+    /// when there are at least two stripes, and slot `i` is colored with the
+    /// `i % num_stripes`th key.
+    fn pkey_for_slot(&self, allocation_index: MemoryAllocationIndex) -> Option<ProtectionKey> {
+        if self.stripes.len() < 2 {
+            return None;
+        }
+        self.stripes[allocation_index.index() % self.stripes.len()].pkey
+    }
+
     /// Take ownership of the given image slot.
     ///
     /// This method is used when a `MemoryAllocationIndex` has been allocated
@@ -581,6 +633,7 @@ impl MemoryPool {
                 self.get_base(allocation_index),
                 HostAlignedByteCount::ZERO,
                 self.layout.max_memory_bytes.byte_count(),
+                self.pkey_for_slot(allocation_index),
             )
         });
 

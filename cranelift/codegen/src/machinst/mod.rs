@@ -52,7 +52,6 @@ use crate::ir::{
 use crate::isa::FunctionAlignment;
 use crate::result::CodegenResult;
 use crate::settings;
-use crate::settings::Flags;
 use crate::value_label::ValueLabelsRanges;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -325,7 +324,7 @@ pub trait MachInst: Clone + Debug {
     /// target, an I64 may be stored in two registers, each of which holds an
     /// I32. The actually-stored types are used only to inform the backend when
     /// generating spills and reloads for individual registers.
-    fn rc_for_type(ty: Type) -> CodegenResult<(&'static [RegClass], &'static [Type])>;
+    fn rc_for_type(ty: &Type) -> CodegenResult<(&[RegClass], &[Type])>;
 
     /// Get an appropriate type that can fully hold a value in a given
     /// register class. This may not be the only type that maps to
@@ -384,10 +383,6 @@ pub trait MachInst: Clone + Debug {
     /// label-use kinds always have wide enough range that islands are
     /// never required may leave this at zero.
     fn worst_case_island_growth() -> CodeOffset;
-
-    /// What is the register class used for reference types (GC-observable pointers)? Can
-    /// be dependent on compilation flags.
-    fn ref_type_regclass(_flags: &Flags) -> RegClass;
 
     /// Is this a safepoint?
     fn is_safepoint(&self) -> bool;
@@ -704,6 +699,44 @@ impl<T: CompilePhase> CompiledCodeBase<T> {
                         patchable.len
                     )?;
                     patchables.next();
+                }
+
+                writeln!(buf)?;
+            }
+
+            // `disasm_all` stops at the first instruction it cannot decode and
+            // reports success rather than an error, so without this the rest of
+            // the block would silently vanish from the listing. That matters
+            // most for `precise-output` filetests, whose expectations would
+            // then assert nothing at all about those bytes. Print them as
+            // `.byte` directives instead, the same form capstone itself
+            // produces for undecodable s390x instructions.
+            let decoded: usize = insns.iter().map(|i| i.bytes().len()).sum();
+            for (chunk_idx, chunk) in buffer[decoded..].chunks(8).enumerate() {
+                let addr = start as u64 + decoded as u64 + (chunk_idx * 8) as u64;
+                let chunk_end = addr + chunk.len() as u64;
+                let contains = |off| addr <= off && off < chunk_end;
+
+                write!(buf, "  .byte ")?;
+                for (i, byte) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        write!(buf, ", ")?;
+                    }
+                    write!(buf, "{byte:#04x}")?;
+                }
+
+                for reloc in relocs.iter().filter(|reloc| contains(reloc.offset as u64)) {
+                    write!(
+                        buf,
+                        " ; reloc_external {} {} {}",
+                        reloc.kind,
+                        reloc.target.display(params),
+                        reloc.addend,
+                    )?;
+                }
+
+                if let Some(trap) = traps.iter().find(|trap| contains(trap.offset as u64)) {
+                    write!(buf, " ; trap: {}", trap.code)?;
                 }
 
                 writeln!(buf)?;

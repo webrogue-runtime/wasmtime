@@ -35,6 +35,7 @@ The emoji legend is:
 | [`function-references`]  | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
 | [`gc`]                   | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
 | [`exception-handling`]   | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
+| [`wide-arithmetic`]      | ✅      | ✅    | ✅       | ✅     | ✅  | ✅    |
 
 [^1]: The `component-model` proposal is not at phase 4 in the standardization
     process but it is still enabled-by-default in Wasmtime.
@@ -51,7 +52,6 @@ The emoji legend is:
 |--------------------------|---------|-------|----------|--------|-----|--------|
 | [`custom-page-sizes`]    | ❌      | ✅    | ✅       | ✅     | ✅  | ✅     |
 | [`threads`]              | ✅      | ✅    | 🚧[^8]   | ❌[^4] | ✅  | ✅     |
-| [`wide-arithmetic`]      | ❌      | ✅    | ✅       | ✅     | ✅  | ✅     |
 
 [^4]: Fuzzing with threads is an open implementation question that is expected
     to get fleshed out as the [`shared-everything-threads`] proposal advances.
@@ -83,6 +83,7 @@ The emoji legend is:
 | [`flexible-vectors`]          | [#9464](https://github.com/bytecodealliance/wasmtime/issues/9464) |
 | [`memory-control`]            | [#9467](https://github.com/bytecodealliance/wasmtime/issues/9467) |
 | [`shared-everything-threads`] | [#9466](https://github.com/bytecodealliance/wasmtime/issues/9466) |
+| [`compact-import-section`]    | [#14108](https://github.com/bytecodealliance/wasmtime/issues/14108) |
 
 [`mutable-globals`]: https://github.com/WebAssembly/mutable-global/blob/master/proposals/mutable-global/Overview.md
 [`sign-extension-ops`]: https://github.com/WebAssembly/spec/blob/master/proposals/sign-extension-ops/Overview.md
@@ -108,13 +109,54 @@ The emoji legend is:
 [`wide-arithmetic`]: https://github.com/WebAssembly/wide-arithmetic/blob/main/proposals/wide-arithmetic/Overview.md
 [`gc`]: https://github.com/WebAssembly/gc
 [`custom-page-sizes`]: https://github.com/WebAssembly/custom-page-sizes
+[`compact-import-section`]: https://github.com/WebAssembly/compact-import-section
+
+## Component-Model Proposals
+
+Changes to the component model aren't currently of the same shape as changes to
+core WebAssembly itself. There are not proposal repositories at this time but
+instead the main specification has "emoji gates" where parts of the
+specification are considered gated when the descriptive text or binary form is
+annotated with a specific emoji. This is the status of the emojis and
+implementations within Wasmtime.
+
+**On-by-default proposals**
+
+|  Proposal                 | Emoji | Phase 4 | Tests | Finished | Fuzzed | API | C API  |
+|---------------------------|-------|---------|-------|----------|--------|-----|--------|
+| async                     | 🔀    | ✅      | ✅    | ✅       | ✅     | ✅  | 🚧[^c1]|
+
+**Off-by-default proposals**
+
+|  Proposal                 | Emoji | Phase 4 | Tests | Finished | Fuzzed | API | C API  |
+|---------------------------|-------|---------|-------|----------|--------|-----|--------|
+| map                       | 🗺️     | ✅      | ✅    | ✅       | ✅     | ✅  | ✅     |
+| implements                | 🏷️     | ✅      | ✅    | ✅       | ❌     | ✅  | ✅     |
+| more async options [^c2]  | 🚝    | ❌      | ✅    | ❌       | ❌     | ✅  | ✅     |
+| stackful async [^c2]      | 🚟    | ❌      | ✅    | ❌       | ❌     | ✅  | ✅     |
+| threading                 | 🧵    | ❌      | ✅    | ❌       | ❌     | ✅  | ❌     |
+| fixed-length-lists        | 🔧    | ❌      | ✅    | 🚧       | ❌     | ✅  | ❌     |
+| memory64                  | 🐘    | ❌      | 🚧    | 🚧       | ❌     | 🚧  | ❌     |
+| error-context [^c2]       | 📝    | ❌      | ❌    | ❌       | ❌     | 🚧  | ❌     |
+| values                    | 🪙    | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+| nested names              | 🪺    | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+| canonical names           | 🔗    | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+| shared-everything-threads | 🧵②   | ❌      | ❌    | ❌       | ❌     | ❌  | ❌     |
+
+[^c1]: Tracked in [#13705](https://github.com/bytecodealliance/wasmtime/issues/13705)
+[^c2]: These features were sliced out of the original async proposal for the
+    component model but the implementation remains in Wasmtime.
+
+
 
 ## Feature requirements
 
 For each column in the above tables, this is a further explanation of its meaning:
 
 * **Phase 4** - The proposal must be in phase 4, or greater, of [the
-  WebAssembly standardization process][phases].
+  WebAssembly standardization process][phases]. For component model proposals
+  this means that the WASI subgroup has voted to include this feature in a
+  release of WASI
 
 * **Tests** - All spec tests must be passing in Wasmtime and where appropriate
   Wasmtime-specific tests, for example for the API, should be passing. Tests

@@ -4,6 +4,7 @@
 use super::sys::DecommitBehavior;
 use crate::Engine;
 use crate::prelude::*;
+use crate::runtime::vm::mpk::ProtectionKey;
 use crate::runtime::vm::sys::vm::{self, MemoryImageSource, PageMap, reset_with_pagemap};
 use crate::runtime::vm::{
     HostAlignedByteCount, MmapOffset, ModuleMemoryImageSource, host_page_size,
@@ -337,6 +338,14 @@ pub struct MemoryImageSlot {
     /// initial image content, as appropriate. Everything between
     /// `self.accessible` and `self.static_size` is inaccessible.
     dirty: bool,
+
+    /// The MPK protection key that this slot's stripe was colored with, if the
+    /// pooling allocator is striping memory with protection keys.
+    ///
+    /// This must be re-applied after every `mmap` performed on this slot, since
+    /// `mmap` resets the affected pages back to the default key 0 which is
+    /// accessible from every stripe.
+    pkey: Option<ProtectionKey>,
 }
 
 impl fmt::Debug for MemoryImageSlot {
@@ -363,6 +372,7 @@ impl MemoryImageSlot {
         base: MmapOffset,
         accessible: HostAlignedByteCount,
         static_size: usize,
+        pkey: Option<ProtectionKey>,
     ) -> Self {
         MemoryImageSlot {
             base,
@@ -370,6 +380,7 @@ impl MemoryImageSlot {
             accessible,
             image: None,
             dirty: false,
+            pkey,
         }
     }
 
@@ -489,6 +500,11 @@ impl MemoryImageSlot {
                     unsafe {
                         image.map_at(&self.base)?;
                     }
+                    // `map_at` above `mmap`'d over part of this slot, which
+                    // reset those pages to the default protection key. Restore
+                    // this slot's key so the image is not left accessible to
+                    // every other stripe.
+                    self.reapply_pkey(image.linear_memory_offset, image.len, true)?;
                 }
             }
             self.image = maybe_image.cloned();
@@ -506,6 +522,9 @@ impl MemoryImageSlot {
             unsafe {
                 image.remap_as_zeros_at(self.base.as_mut_ptr())?;
             }
+            // As in `instantiate`, the `mmap` above dropped this slot's
+            // protection key over the image's range, so restore it.
+            self.reapply_pkey(image.linear_memory_offset, image.len, true)?;
             self.image = None;
         }
         Ok(())
@@ -682,6 +701,43 @@ impl MemoryImageSlot {
         Ok(())
     }
 
+    /// Re-color `offset..offset + len` within this slot with this slot's MPK
+    /// protection key, if any.
+    ///
+    /// This is a no-op unless the pooling allocator is striping memory with
+    /// protection keys. It must be called after every `mmap` that lands inside
+    /// this slot: `mmap` associates the pages it replaces with the default key
+    /// 0, which is accessible regardless of which stripe is currently active,
+    /// so skipping this would let one instance read and write another
+    /// instance's memory.
+    ///
+    /// Note that `mprotect` preserves the existing key, so `set_protection`
+    /// does not need this treatment.
+    fn reapply_pkey(
+        &self,
+        offset: HostAlignedByteCount,
+        len: HostAlignedByteCount,
+        readwrite: bool,
+    ) -> Result<()> {
+        let Some(pkey) = self.pkey else {
+            return Ok(());
+        };
+        if len.is_zero() {
+            return Ok(());
+        }
+        // `mmap` rounds lengths up to a page boundary, so the restored range is
+        // allowed to extend to the end of the slot's final page.
+        debug_assert!(
+            offset.byte_count() + len.byte_count()
+                <= self.static_size.next_multiple_of(host_page_size())
+        );
+        unsafe {
+            let start = self.base.as_mut_ptr().add(offset.byte_count());
+            pkey.reprotect(start.addr(), len.byte_count(), readwrite)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_image(&self) -> bool {
         self.image.is_some()
     }
@@ -704,6 +760,11 @@ impl MemoryImageSlot {
             vm::erase_existing_mapping(self.base.as_mut_ptr(), self.static_size)?;
         }
 
+        // The `mmap` above covers the whole slot and left it inaccessible, so
+        // restore this slot's protection key across the same range.
+        let static_size = HostAlignedByteCount::new_rounded_up(self.static_size)?;
+        self.reapply_pkey(HostAlignedByteCount::ZERO, static_size, false)?;
+
         self.image = None;
         self.accessible = HostAlignedByteCount::ZERO;
 
@@ -715,7 +776,7 @@ impl MemoryImageSlot {
 mod test {
     use super::*;
     use crate::runtime::vm::mmap::{AlignedLength, Mmap};
-    use crate::runtime::vm::sys::vm::decommit_pages;
+    use crate::runtime::vm::sys::vm::{decommit_pages, iovec};
     use crate::runtime::vm::{HostAlignedByteCount, MmapVec, host_page_size};
     use std::sync::Arc;
     use wasmtime_environ::{IndexType, Limits, Memory, MemoryKind, Tunables};
@@ -752,6 +813,16 @@ mod test {
             fn mmap(&self) -> Option<&MmapVec> {
                 None
             }
+        }
+    }
+
+    fn decommit(base: *mut u8, len: usize) {
+        unsafe {
+            decommit_pages(&[iovec {
+                iov_base: base.cast(),
+                iov_len: len,
+            }])
+            .unwrap();
         }
     }
 
@@ -803,8 +874,12 @@ mod test {
         // 4 MiB mmap'd area, not accessible
         let mmap = mmap_4mib_inaccessible();
         // Create a MemoryImageSlot on top of it
-        let mut memfd =
-            MemoryImageSlot::create(mmap.zero_offset(), HostAlignedByteCount::ZERO, 4 << 20);
+        let mut memfd = MemoryImageSlot::create(
+            mmap.zero_offset(),
+            HostAlignedByteCount::ZERO,
+            4 << 20,
+            None,
+        );
         assert!(!memfd.is_dirty());
         // instantiate with 64 KiB initial size
         memfd
@@ -836,9 +911,7 @@ mod test {
         // instantiate again; we should see zeroes, even as the
         // reuse-anon-mmap-opt kicks in
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
         assert!(!memfd.is_dirty());
         memfd
@@ -864,8 +937,12 @@ mod test {
         // 4 MiB mmap'd area, not accessible
         let mmap = mmap_4mib_inaccessible();
         // Create a MemoryImageSlot on top of it
-        let mut memfd =
-            MemoryImageSlot::create(mmap.zero_offset(), HostAlignedByteCount::ZERO, 4 << 20);
+        let mut memfd = MemoryImageSlot::create(
+            mmap.zero_offset(),
+            HostAlignedByteCount::ZERO,
+            4 << 20,
+            None,
+        );
         // Create an image with some data.
         let image = Arc::new(create_memfd_with_data(page_size, &[1, 2, 3, 4]).unwrap());
         // Instantiate with this image
@@ -888,9 +965,7 @@ mod test {
 
         // Clear and re-instantiate same image
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -905,9 +980,7 @@ mod test {
 
         // Clear and re-instantiate no image
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -923,9 +996,7 @@ mod test {
 
         // Clear and re-instantiate image again
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -941,9 +1012,7 @@ mod test {
         // Create another image with different data.
         let image2 = Arc::new(create_memfd_with_data(page_size, &[10, 11, 12, 13]).unwrap());
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -959,9 +1028,7 @@ mod test {
         // Instantiate the original image again; we should notice it's
         // a different image and not reuse the mappings.
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
         memfd
             .instantiate(
@@ -985,8 +1052,12 @@ mod test {
             ..Tunables::default_miri()
         };
         let mmap = mmap_4mib_inaccessible();
-        let mut memfd =
-            MemoryImageSlot::create(mmap.zero_offset(), HostAlignedByteCount::ZERO, 4 << 20);
+        let mut memfd = MemoryImageSlot::create(
+            mmap.zero_offset(),
+            HostAlignedByteCount::ZERO,
+            4 << 20,
+            None,
+        );
 
         // Test basics with the image
         for image_off in [0, page_size, page_size * 2] {
@@ -1016,9 +1087,7 @@ mod test {
                 };
 
                 memfd
-                    .clear_and_remain_ready(None, amt_to_memset, |ptr, len| unsafe {
-                        decommit_pages(ptr, len).unwrap()
-                    })
+                    .clear_and_remain_ready(None, amt_to_memset, decommit)
                     .unwrap();
             }
         }
@@ -1044,9 +1113,7 @@ mod test {
                 });
             }
             memfd
-                .clear_and_remain_ready(None, amt_to_memset, |ptr, len| unsafe {
-                    decommit_pages(ptr, len).unwrap()
-                })
+                .clear_and_remain_ready(None, amt_to_memset, decommit)
                 .unwrap();
         }
     }
@@ -1063,8 +1130,12 @@ mod test {
         };
 
         let mmap = mmap_4mib_inaccessible();
-        let mut memfd =
-            MemoryImageSlot::create(mmap.zero_offset(), HostAlignedByteCount::ZERO, 4 << 20);
+        let mut memfd = MemoryImageSlot::create(
+            mmap.zero_offset(),
+            HostAlignedByteCount::ZERO,
+            4 << 20,
+            None,
+        );
         let image = Arc::new(create_memfd_with_data(page_size, &[1, 2, 3, 4]).unwrap());
         let initial = 64 << 10;
 
@@ -1089,9 +1160,7 @@ mod test {
         }
 
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
         let slice = unsafe { mmap.slice(0..(64 << 10) + page_size) };
         assert_eq!(&[1, 2, 3, 4], &slice[page_size..][..4]);
@@ -1119,9 +1188,7 @@ mod test {
         }
 
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
 
         // Test that memory is still accessible, but it's been reset
@@ -1149,9 +1216,7 @@ mod test {
         }
 
         memfd
-            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, |ptr, len| unsafe {
-                decommit_pages(ptr, len).unwrap()
-            })
+            .clear_and_remain_ready(None, HostAlignedByteCount::ZERO, decommit)
             .unwrap();
 
         // Reset the image to none and double-check everything is back to zero
@@ -1178,8 +1243,12 @@ mod test {
         };
         let mmap = mmap_4mib_inaccessible();
         let mmap_len = page_size * 9;
-        let mut memfd =
-            MemoryImageSlot::create(mmap.zero_offset(), HostAlignedByteCount::ZERO, mmap_len);
+        let mut memfd = MemoryImageSlot::create(
+            mmap.zero_offset(),
+            HostAlignedByteCount::ZERO,
+            mmap_len,
+            None,
+        );
         let pagemap = PageMap::new();
         let pagemap = pagemap.as_ref();
 
@@ -1204,9 +1273,7 @@ mod test {
         let assert_pristine_after_reset = |memfd: &mut MemoryImageSlot| unsafe {
             // Wipe the image, keeping some bytes resident.
             memfd
-                .clear_and_remain_ready(pagemap, keep_resident, |ptr, len| {
-                    decommit_pages(ptr, len).unwrap()
-                })
+                .clear_and_remain_ready(pagemap, keep_resident, decommit)
                 .unwrap();
 
             // Double check that the contents of memory are as expected after
@@ -1236,9 +1303,7 @@ mod test {
                 )
                 .unwrap();
             memfd
-                .clear_and_remain_ready(pagemap, HostAlignedByteCount::ZERO, |ptr, len| {
-                    decommit_pages(ptr, len).unwrap()
-                })
+                .clear_and_remain_ready(pagemap, HostAlignedByteCount::ZERO, decommit)
                 .unwrap();
 
             // Next re-instantiate a final time to get used for the next test.

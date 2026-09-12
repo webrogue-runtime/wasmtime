@@ -41,6 +41,7 @@ mod alias_region;
 mod bounds_checks;
 mod builder;
 mod compiler;
+mod component_sync_call;
 mod debug;
 mod func_environ;
 mod translate;
@@ -49,7 +50,7 @@ mod trap;
 use self::compiler::Compiler;
 
 const TRAP_INTERNAL_ASSERT: TrapCode = TrapCode::unwrap_user(1);
-const TRAP_GC_HEAP_CORRUPT: TrapCode = TrapCode::unwrap_user(2);
+pub const TRAP_GC_HEAP_CORRUPT: TrapCode = TrapCode::unwrap_user(2);
 const TRAP_OFFSET: u8 = 3;
 pub const TRAP_CANNOT_LEAVE_COMPONENT: TrapCode =
     TrapCode::unwrap_user(Trap::CannotLeaveComponent as u8 + TRAP_OFFSET);
@@ -77,6 +78,16 @@ pub const TRAP_CAST_FAILURE: TrapCode =
     TrapCode::unwrap_user(Trap::CastFailure as u8 + TRAP_OFFSET);
 pub const TRAP_UNCAUGHT_EXCEPTION: TrapCode =
     TrapCode::unwrap_user(Trap::UncaughtException as u8 + TRAP_OFFSET);
+
+/// The CLIF trap code for a Wasmtime trap code.
+///
+/// This is the inverse of `clif_trap_to_env_trap`'s fallback arm, and is what
+/// all of the `TRAP_*` constants above compute for their particular trap. Use
+/// it for traps that don't have a constant above, e.g. the trap named by a
+/// fused adapter's `trap` intrinsic.
+const fn env_trap_to_clif_trap(trap: Trap) -> TrapCode {
+    TrapCode::unwrap_user(trap as u8 + TRAP_OFFSET)
+}
 
 /// Creates a new cranelift `Signature` with no wasm params/results for the
 /// given calling convention.

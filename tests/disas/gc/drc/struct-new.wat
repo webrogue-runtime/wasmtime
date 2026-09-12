@@ -13,14 +13,14 @@
 )
 ;; function u0:0(i64 vmctx, i64, f32, i32, i32) -> i32 tail {
 ;;     ss0 = explicit_slot 4, align = 4
-;;     region0 = 8 "VMContext+0x8"
-;;     region1 = 134217752 "VMStoreContext+0x18"
-;;     region2 = 40 "VMContext+0x28"
-;;     region3 = 3355443200 "TypeIdsArray+0x0"
-;;     region4 = 134217760 "VMStoreContext+0x20"
-;;     region5 = 1073741824 "GcHeap"
-;;     region6 = 134217768 "VMStoreContext+0x28"
-;;     region7 = 3087007744 "Stack(ss0)"
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 130 ""
+;;     region3 = 6 ""
+;;     region4 = 196 ""
+;;     region5 = 108 ""
+;;     region6 = 206 ""
+;;     region7 = 232 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
 ;;     gv2 = load.i64 notrap aligned region1 gv1+24

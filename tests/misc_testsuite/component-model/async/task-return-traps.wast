@@ -14,7 +14,7 @@
     (core instance $i (instantiate $m
         (with "" (instance (export "task.return" (func $task-return))))
     ))
-    (func (export "foo") async (canon lift (core func $i "foo") async (callback (func $i "callback"))))
+    (func (export "foo") async (canon lift (core func $i "foo") async (callback (core func $i "callback"))))
 )
 (assert_trap (invoke "foo") "async-lifted export failed to produce a result")
 
@@ -24,12 +24,12 @@
     (core module $m
         (import "" "task.return" (func $task-return))
         (import "" "thread.new-indirect" (func $thread-new-indirect (param i32 i32) (result i32)))
-        (import "" "thread.unsuspend" (func $thread-unsuspend (param i32)))
+        (import "" "thread.resume-later" (func $thread.resume-later (param i32)))
         (import "libc" "__indirect_function_table" (table $indirect-function-table 1 funcref))
         (func $thread-start (param i32) (; empty ;))
         (elem (table $indirect-function-table) (i32.const 0) func $thread-start)
         (func (export "foo") (result i32)
-            (call $thread-unsuspend
+            (call $thread.resume-later
                 (call $thread-new-indirect (i32.const 0) (i32.const 0)))
             i32.const 0
         )
@@ -39,18 +39,18 @@
     (core type $start-func-ty (func (param i32)))
     (alias core export $libc "__indirect_function_table" (core table $indirect-function-table))
     (core func $thread-new-indirect
-        (canon thread.new-indirect $start-func-ty (table $indirect-function-table)))
-    (core func $thread-unsuspend (canon thread.unsuspend))
+        (canon thread.new-indirect $start-func-ty (core table $indirect-function-table)))
+    (core func $thread.resume-later (canon thread.resume-later))
     (core func $task-return (canon task.return))
     (core instance $i (instantiate $m
         (with "" (instance
             (export "thread.new-indirect" (func $thread-new-indirect))
-            (export "thread.unsuspend" (func $thread-unsuspend))
+            (export "thread.resume-later" (func $thread.resume-later))
             (export "task.return" (func $task-return))
         ))
         (with "libc" (instance $libc))
     ))
-    (func (export "foo") async (canon lift (core func $i "foo") async (callback (func $i "callback"))))
+    (func (export "foo") async (canon lift (core func $i "foo") async (callback (core func $i "callback"))))
 )
 
 (assert_trap (invoke "foo") "async-lifted export failed to produce a result")
@@ -61,12 +61,12 @@
     (core module $m
         (import "" "task.return" (func $task-return))
         (import "" "thread.new-indirect" (func $thread-new-indirect (param i32 i32) (result i32)))
-        (import "" "thread.unsuspend" (func $thread-unsuspend (param i32)))
+        (import "" "thread.resume-later" (func $thread.resume-later (param i32)))
         (import "libc" "__indirect_function_table" (table $indirect-function-table 1 funcref))
         (func $thread-start (param i32) (; empty ;))
         (elem (table $indirect-function-table) (i32.const 0) func $thread-start)
         (func (export "foo")
-            (call $thread-unsuspend
+            (call $thread.resume-later
                 (call $thread-new-indirect (i32.const 0) (i32.const 0)))
         )
     )
@@ -74,13 +74,13 @@
     (core type $start-func-ty (func (param i32)))
     (alias core export $libc "__indirect_function_table" (core table $indirect-function-table))
     (core func $thread-new-indirect
-        (canon thread.new-indirect $start-func-ty (table $indirect-function-table)))
-    (core func $thread-unsuspend (canon thread.unsuspend))
+        (canon thread.new-indirect $start-func-ty (core table $indirect-function-table)))
+    (core func $thread.resume-later (canon thread.resume-later))
     (core func $task-return (canon task.return))
     (core instance $i (instantiate $m
         (with "" (instance
             (export "thread.new-indirect" (func $thread-new-indirect))
-            (export "thread.unsuspend" (func $thread-unsuspend))
+            (export "thread.resume-later" (func $thread.resume-later))
             (export "task.return" (func $task-return))
         ))
         (with "libc" (instance $libc))
@@ -125,7 +125,7 @@
         (import "" "task.return" (func $task-return))
         (func (export "foo") (call $task-return))
     )
-    (core func $task-return (canon task.return (memory $libc "memory")))
+    (core func $task-return (canon task.return (memory (core memory $libc "memory"))))
     (core instance $i (instantiate $m
         (with "" (instance (export "task.return" (func $task-return))))
     ))

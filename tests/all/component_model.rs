@@ -13,6 +13,7 @@ mod async_dynamic;
 mod bindgen;
 mod call_hook;
 mod dynamic;
+mod fixed_length_list;
 mod func;
 mod import;
 mod instance;
@@ -22,6 +23,7 @@ mod missing_async;
 mod nested;
 mod post_return;
 mod resources;
+mod stream_sync_dropped;
 mod strings;
 mod sync_call_inline;
 
@@ -282,8 +284,8 @@ fn make_echo_component_with_params(type_definition: &str, params: &[Param]) -> S
             (func (export "echo") (param "a" $Foo) (result $Foo)
                 (canon lift
                     (core func $i "echo")
-                    (memory $i "memory")
-                    (realloc (func $i "realloc"))
+                    (memory (core memory $i "memory"))
+                    (realloc (core func $i "realloc"))
                 )
             )
         )"#

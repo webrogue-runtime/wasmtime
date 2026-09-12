@@ -42,6 +42,10 @@ mod string_pool;
 mod trap_encoding;
 mod tunables;
 mod types;
+#[macro_use]
+mod vmctxtypes;
+#[macro_use]
+mod vmtypes;
 mod vmoffsets;
 mod wasm_error;
 
@@ -64,6 +68,7 @@ pub use crate::string_pool::{Atom, StringPool};
 pub use crate::trap_encoding::*;
 pub use crate::tunables::*;
 pub use crate::types::*;
+pub use crate::vmctxtypes::{ArrayOffsets, VmctxArrayIndex};
 pub use crate::vmoffsets::*;
 pub use crate::wasm_error::*;
 pub use object;

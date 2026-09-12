@@ -46,6 +46,24 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
+// These impls are strictly not necessary but they're currently serving the
+// purpose of the reducing the recursion limit necessary to prove
+// types/futures/etc are `Send` in Wasmtime. This is related to
+// rust-lang/rust#159228.
+//
+// SAFETY: we're re-stating what rustc itself is already going to infer. The
+// `_assert_send_sync` function beneath this is intended to serve as a
+// double-assertion that this actually holds.
+unsafe impl Send for Engine {}
+unsafe impl Sync for Engine {}
+
+fn _assert_send_sync(e: &Engine) {
+    fn _assert<T: Send + Sync>(_: &T) {}
+    let Engine { inner } = e;
+    _assert(e);
+    _assert(inner);
+}
+
 struct EngineInner {
     config: Config,
     features: WasmFeatures,
@@ -577,6 +595,7 @@ information about this check\
             "has_pauth" => "paca",
             "has_fp16" => "fp16",
             "has_dotprod" => "dotprod",
+            "has_i8mm" => "i8mm",
 
             // aarch64 features which don't need detection
             // No effect on its own.
@@ -607,6 +626,7 @@ information about this check\
             "has_avx" => "avx",
             "has_avx2" => "avx2",
             "has_fma" => "fma",
+            "has_avx_vnni" => "avxvnni",
             "has_bmi1" => "bmi1",
             "has_bmi2" => "bmi2",
             "has_avx512bitalg" => "avx512bitalg",
@@ -614,6 +634,7 @@ information about this check\
             "has_avx512f" => "avx512f",
             "has_avx512vl" => "avx512vl",
             "has_avx512vbmi" => "avx512vbmi",
+            "has_avx512vnni" => "avx512vnni",
             "has_lzcnt" => "lzcnt",
 
             // pulley features

@@ -10,7 +10,7 @@ use syn::{Token, braced, token};
 use wasmtime_wit_bindgen::{
     FunctionConfig, FunctionFilter, FunctionFlags, Opts, Ownership, TrappableError,
 };
-use wit_parser::{PackageId, Resolve, UnresolvedPackageGroup, WorldId};
+use wit_parser::{PackageId, Resolve, WorldId};
 
 pub struct Config {
     opts: Opts,
@@ -152,6 +152,7 @@ impl Parse for Config {
                         opts.anyhow = val;
                     }
                     Opt::IncludeGeneratedCodeFromFile(i) => include_generated_code_from_file = i,
+                    Opt::IncludeComponentType(val) => opts.include_component_type = val,
                     Opt::Imports(config, span) => {
                         if imports_configured {
                             return Err(Error::new(span, "cannot specify imports configuration"));
@@ -237,7 +238,7 @@ fn parse_source(
 
     if let Some(inline) = inline {
         pkgs.truncate(0);
-        pkgs.push(resolve.push_group(UnresolvedPackageGroup::parse("macro-input", inline)?)?);
+        pkgs.push(resolve.push_str("macro-input", inline)?);
     }
 
     Ok((resolve, pkgs, files))
@@ -263,6 +264,7 @@ mod kw {
     syn::custom_keyword!(wasmtime_crate);
     syn::custom_keyword!(anyhow);
     syn::custom_keyword!(include_generated_code_from_file);
+    syn::custom_keyword!(include_component_type);
     syn::custom_keyword!(debug);
     syn::custom_keyword!(imports);
     syn::custom_keyword!(exports);
@@ -287,6 +289,7 @@ enum Opt {
     WasmtimeCrate(syn::Path),
     Anyhow(bool),
     IncludeGeneratedCodeFromFile(bool),
+    IncludeComponentType(bool),
     Debug(bool),
     Imports(FunctionConfig, Span),
     Exports(FunctionConfig, Span),
@@ -428,6 +431,12 @@ impl Parse for Opt {
             input.parse::<kw::include_generated_code_from_file>()?;
             input.parse::<Token![:]>()?;
             Ok(Opt::IncludeGeneratedCodeFromFile(
+                input.parse::<syn::LitBool>()?.value,
+            ))
+        } else if l.peek(kw::include_component_type) {
+            input.parse::<kw::include_component_type>()?;
+            input.parse::<Token![:]>()?;
+            Ok(Opt::IncludeComponentType(
                 input.parse::<syn::LitBool>()?.value,
             ))
         } else if l.peek(kw::imports) {

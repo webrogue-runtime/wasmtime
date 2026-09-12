@@ -285,11 +285,11 @@ pub fn translate_operator(
             environ.stacks.popn(params.len());
             builder.switch_to_block(loop_body);
             push_block_params(environ, builder, loop_body);
-            environ.translate_loop_header(builder)?;
+            environ.translate_loop_header(builder);
         }
         Operator::If { blockty } => {
             // Read the hint before `environ` is borrowed mutably below.
-            let branch_hint = environ.take_branch_hint(builder.srcloc().bits() as usize);
+            let branch_hint = environ.take_branch_hint(builder.srcloc().bits().into());
 
             let val = environ.stacks.pop1();
 
@@ -715,13 +715,16 @@ pub fn translate_operator(
             let mut args = environ.stacks.peekn(num_args).to_vec();
             bitcast_wasm_params(environ, sig_ref, &mut args, builder);
 
-            let inst_results = environ.translate_call(
-                builder,
-                environ.next_srcloc,
-                function_index,
-                sig_ref,
-                &args,
-            )?;
+            let inst_results = unwrap_or_return_unreachable_state!(
+                environ,
+                environ.translate_call(
+                    builder,
+                    environ.next_srcloc,
+                    function_index,
+                    sig_ref,
+                    &args,
+                )?
+            );
 
             debug_assert_eq!(
                 inst_results.len(),
@@ -3191,7 +3194,7 @@ pub fn translate_operator(
             let param_count = params.len();
 
             let return_values =
-                environ.translate_suspend(builder, tag_index.as_u32(), &params, &return_types);
+                environ.translate_suspend(builder, tag_index.as_u32(), &params, &return_types)?;
 
             environ.stacks.popn(param_count);
             environ.stacks.pushn(&return_values);
@@ -3235,14 +3238,78 @@ pub fn translate_operator(
             environ.stacks.pushn(&cont_return_vals);
         }
         Operator::ResumeThrow {
-            cont_type_index: _,
-            tag_index: _,
-            resume_table: _,
+            cont_type_index,
+            tag_index,
+            resume_table: wasm_resume_table,
         } => {
-            // TODO(10248) This depends on exception handling
-            return Err(wasmtime_environ::WasmError::Unsupported(
-                "resume.throw instructions not supported, yet".to_string(),
-            ));
+            let mut clif_resume_table = vec![];
+            for handle in &wasm_resume_table.handlers {
+                match handle {
+                    wasmparser::Handle::OnLabel { tag, label } => {
+                        let i = environ.stacks.control_stack.len() - 1 - (*label as usize);
+                        let frame = &mut environ.stacks.control_stack[i];
+                        frame.set_branched_to_exit();
+                        clif_resume_table.push((*tag, Some(frame.br_destination())));
+                    }
+                    wasmparser::Handle::OnSwitch { tag } => {
+                        clif_resume_table.push((*tag, None));
+                    }
+                }
+            }
+
+            let cont_type_index = TypeIndex::from_u32(*cont_type_index);
+            let tag_index = TagIndex::from_u32(*tag_index);
+            let arity = environ.tag_params(tag_index).len();
+            let (contobj, exception_args) = environ.stacks.peekn(arity + 1).split_last().unwrap();
+            let contobj = *contobj;
+            let exception_args = exception_args.to_vec();
+            let cont_return_vals = environ.translate_resume_throw(
+                builder,
+                cont_type_index.as_u32(),
+                tag_index,
+                &exception_args,
+                contobj,
+                &clif_resume_table,
+            )?;
+
+            environ.stacks.popn(arity + 1);
+            environ.stacks.pushn(&cont_return_vals);
+        }
+        Operator::ResumeThrowRef {
+            cont_type_index,
+            resume_table: wasm_resume_table,
+        } => {
+            let mut clif_resume_table = vec![];
+            for handle in &wasm_resume_table.handlers {
+                match handle {
+                    wasmparser::Handle::OnLabel { tag, label } => {
+                        let i = environ.stacks.control_stack.len() - 1 - (*label as usize);
+                        let frame = &mut environ.stacks.control_stack[i];
+                        frame.set_branched_to_exit();
+                        clif_resume_table.push((*tag, Some(frame.br_destination())));
+                    }
+                    wasmparser::Handle::OnSwitch { tag } => {
+                        clif_resume_table.push((*tag, None));
+                    }
+                }
+            }
+
+            let cont_type_index = TypeIndex::from_u32(*cont_type_index);
+            // The validator leaves the continuation on top of the exception
+            // reference.
+            let operands = environ.stacks.peekn(2);
+            let exnref = operands[0];
+            let contobj = operands[1];
+            let cont_return_vals = environ.translate_resume_throw_ref(
+                builder,
+                cont_type_index.as_u32(),
+                exnref,
+                contobj,
+                &clif_resume_table,
+            )?;
+
+            environ.stacks.popn(2);
+            environ.stacks.pushn(&cont_return_vals);
         }
         Operator::Switch {
             cont_type_index,
@@ -3271,10 +3338,10 @@ pub fn translate_operator(
                     WasmHeapType::ConcreteCont(index) => {
                         let mti = index
                             .as_module_type_index()
-                            .expect("Only supporting module type indices on switch for now");
+                            .expect("expected module-local type index");
 
                         environ
-                            .continuation_arguments(TypeIndex::from_u32(mti.as_u32()))
+                            .continuation_arguments_from_interned(mti)
                             .iter()
                             .map(|ty| crate::value_type(environ.isa(), *ty))
                             .collect()
@@ -4041,7 +4108,7 @@ fn translate_br_if(
     env: &mut FuncEnvironment<'_>,
 ) {
     // Read the hint before `env` is borrowed mutably below.
-    let branch_hint = env.take_branch_hint(builder.srcloc().bits() as usize);
+    let branch_hint = env.take_branch_hint(builder.srcloc().bits().into());
 
     let val = env.stacks.pop1();
     let (br_destination, inputs) = translate_br_if_args(relative_depth, env);

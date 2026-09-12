@@ -389,15 +389,7 @@ impl RunCommand {
 
         let mut store = Store::new(&engine, host);
         self.populate_with_wasi(&mut linker, &mut store)?;
-
-        store.data_mut().limits = self.run.store_limits();
-        store.limiter(|t| &mut t.limits);
-
-        // If fuel has been configured, we want to add the configured
-        // fuel amount to this store.
-        if let Some(fuel) = self.run.common.wasm.fuel {
-            store.set_fuel(fuel)?;
-        }
+        self.run.configure_store(&mut store, |t| &mut t.limits)?;
 
         Ok((store, linker))
     }
@@ -502,10 +494,11 @@ impl RunCommand {
                 }
                 if e.is::<wasmtime::Trap>() {
                     eprintln!("Error: {e:?}");
-                    cfg_if::cfg_if! {
-                        if #[cfg(unix)] {
+                    cfg_select! {
+                        unix => {
                             std::process::exit(rustix::process::EXIT_SIGNALED_SIGABRT);
-                        } else if #[cfg(windows)] {
+                        }
+                        windows => {
                             // https://docs.microsoft.com/en-us/cpp/c-runtime-library/reference/abort?view=vs-2019
                             std::process::exit(3);
                         }
@@ -900,9 +893,7 @@ impl RunCommand {
     #[cfg(feature = "debug")]
     pub(crate) async fn invoke_debugger<
         T: Send + 'static,
-        F: for<'a> FnOnce(
-                &'a mut Store<T>,
-            ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>
+        F: FnOnce(&mut Store<T>) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>
             + Send
             + 'static,
     >(
@@ -1348,18 +1339,7 @@ impl RunCommand {
             builder.inherit_stderr();
         }
         self.run.configure_wasip2(&mut builder)?;
-        let mut ctx = builder.build_p1();
-        if let Some(max) = self.run.common.wasi.max_resources {
-            ctx.ctx().table.set_max_capacity(max);
-            #[cfg(feature = "component-model-async")]
-            if let Some(table) = store.concurrent_resource_table() {
-                table.set_max_capacity(max);
-            }
-        }
-        if let Some(fuel) = self.run.common.wasi.hostcall_fuel {
-            store.set_hostcall_fuel(fuel);
-        }
-        store.data_mut().wasip1_ctx = Some(ctx);
+        store.data_mut().wasip1_ctx = Some(builder.build_p1());
         Ok(())
     }
 
@@ -1426,22 +1406,10 @@ impl WasiView for Host {
 }
 
 #[cfg(feature = "wasi-http")]
-impl wasmtime_wasi_http::p2::WasiHttpView for Host {
-    fn http(&mut self) -> wasmtime_wasi_http::p2::WasiHttpCtxView<'_> {
+impl wasmtime_wasi_http::WasiHttpView for Host {
+    fn http(&mut self) -> wasmtime_wasi_http::WasiHttpCtxView<'_> {
         let ctx = self.wasi_http.as_mut().unwrap();
-        wasmtime_wasi_http::p2::WasiHttpCtxView {
-            table: WasiView::ctx(self.wasip1_ctx.as_mut().unwrap()).table,
-            ctx,
-            hooks: &mut self.wasi_http_hooks,
-        }
-    }
-}
-
-#[cfg(all(feature = "wasi-http", feature = "component-model-async"))]
-impl wasmtime_wasi_http::p3::WasiHttpView for Host {
-    fn http(&mut self) -> wasmtime_wasi_http::p3::WasiHttpCtxView<'_> {
-        let ctx = self.wasi_http.as_mut().unwrap();
-        wasmtime_wasi_http::p3::WasiHttpCtxView {
+        wasmtime_wasi_http::WasiHttpCtxView {
             table: WasiView::ctx(self.wasip1_ctx.as_mut().unwrap()).table,
             ctx,
             hooks: &mut self.wasi_http_hooks,

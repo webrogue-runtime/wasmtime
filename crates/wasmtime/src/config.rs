@@ -639,8 +639,6 @@ impl Config {
     ///
     /// By default this option is `false`.
     ///
-    /// **Note** Enabling this option is not compatible with the Winch compiler.
-    ///
     /// [`Store`]: crate::Store
     pub fn consume_fuel(&mut self, enable: bool) -> &mut Self {
         self.tunables.consume_fuel = Some(enable);
@@ -648,6 +646,14 @@ impl Config {
     }
 
     /// Configures the fuel cost of each WebAssembly operator.
+    ///
+    /// In addition to each operator's flat cost, [`OperatorCost::variable`]
+    /// configures per-byte, per-element, and per-page costs for operators whose
+    /// work depends on a runtime operand.
+    ///
+    /// These costs apply both to operators in function bodies and to operators
+    /// in constant expressions evaluated at instantiation time, such as global
+    /// initializers and element or data segment offsets.
     ///
     /// This is only relevant when [`Config::consume_fuel`] is enabled.
     pub fn operator_cost(&mut self, cost: OperatorCost) -> &mut Self {
@@ -687,10 +693,6 @@ impl Config {
     /// periodic way (say, every regular timer tick by a thread or
     /// signal handler), then we can ensure that all async code will
     /// yield to the executor within a bounded time.
-    ///
-    /// The deadline check cannot be avoided by malicious wasm code. It is safe
-    /// to use epoch deadlines to limit the execution time of untrusted
-    /// code.
     ///
     /// The [`Store`](crate::Store) tracks the deadline, and controls
     /// what happens when the deadline is reached during
@@ -736,6 +738,27 @@ impl Config {
     /// opportunity to use `tokio::time::timeout` for example on a wasm
     /// computation and have the desired effect of cancelling a blocking
     /// operation when a timeout expires.
+    ///
+    /// ## Limitations with malicious guests
+    ///
+    /// Epochs are designed to handle malicious WebAssembly guests -- the
+    /// deadline check cannot be avoided by WebAssembly code. It is safe to use
+    /// epoch deadlines to limit the execution time of untrusted code.
+    ///
+    /// Note, though, that a current limitation to this is that
+    /// bulk-data-transfer instructions, such as `memory.copy`, only check the
+    /// epoch once at the start of the operation. These operations can take a
+    /// variable amount of time to complete based on how many bytes are being
+    /// copied. This means that the maximal time slice a guest might take is
+    /// the maximum of the epoch interval and the largest
+    /// memory-copy-style-instruction executed. The size of a copy is bounded
+    /// on the size of linear memory or GC heap size. In the limit, however, a
+    /// guest using a 64-bit linear memory with a 128GiB size could issue a
+    /// 128GiB `memory.copy` which would have no preemption within the
+    /// instruction itself. Hosts which need strict time limits for guests right
+    /// now are recommended to ensure that the store's allocated heap size
+    /// (linear memory + GC heap) are bounded with a
+    /// [`ResourceLimiter`](crate::ResourceLimiter).
     ///
     /// ## When to use fuel vs. epochs
     ///
@@ -1046,7 +1069,7 @@ impl Config {
     /// Configures whether the [WebAssembly wide-arithmetic][proposal] will be
     /// enabled for compilation.
     ///
-    /// This feature is `false` by default.
+    /// This feature is `true` by default.
     ///
     /// [proposal]: https://github.com/WebAssembly/wide-arithmetic
     pub fn wasm_wide_arithmetic(&mut self, enable: bool) -> &mut Self {
@@ -1344,6 +1367,18 @@ impl Config {
         self
     }
 
+    /// Configures whether the component model memory64 support is enabled
+    ///
+    /// This corresponds to the 🐘 emoji in the component model specification.
+    ///
+    /// Please note that Wasmtime's support for this feature is _very_
+    /// incomplete.
+    #[cfg(feature = "component-model")]
+    pub fn wasm_component_model_memory64(&mut self, enable: bool) -> &mut Self {
+        self.wasm_features(WasmFeatures::CM64, enable);
+        self
+    }
+
     /// This corresponds to the 🔧 emoji in the component model specification.
     ///
     /// Please note that Wasmtime's support for this feature is _very_
@@ -1411,6 +1446,38 @@ impl Config {
     #[cfg(feature = "gc")]
     pub fn collector(&mut self, collector: Collector) -> &mut Self {
         self.collector = collector;
+        self
+    }
+
+    /// Configures the initial size, in bytes, of each store's GC heap.
+    ///
+    /// By default all GC heaps start out at 0 bytes in size and must grow
+    /// upwards from there. Growth happens incrementally as GC pressure happens
+    /// and memory runs out. The amount being grown by is additionally a
+    /// heuristic of the size of the failed allocation. By providing an initial
+    /// size of a store's GC heap embedders can more tightly control initial
+    /// parameters to optimize workloads that might have a predictable pattern.
+    /// For example if workloads frequently have less than a certain threshold
+    /// of size then that could be configured as the initial size here to avoid
+    /// growths happening over time.
+    ///
+    /// Note that like WebAssembly linear memories the GC heap does not start
+    /// with committed memory equal to this size. Instead memory is reserved,
+    /// but then lazily allocated by the OS on access. In other words it should
+    /// be relatively cheap to increase this value to help amortize initial
+    /// startup cost of wasm modules.
+    ///
+    /// The `bytes` size is rounded up to the GC heap's page size.
+    ///
+    /// This only configures the initially-allocated size of the GC heap; the
+    /// heap can still grow beyond it on demand. It is separate from
+    /// [`Config::gc_heap_reservation`], which configures the size of the
+    /// virtual-memory reservation (and therefore how far the heap can grow
+    /// in place).
+    ///
+    /// The default value for this is 0.
+    pub fn gc_heap_initial_size(&mut self, bytes: u64) -> &mut Self {
+        self.tunables.gc_heap_initial_size = Some(bytes);
         self
     }
 
@@ -2364,6 +2431,7 @@ impl Config {
             | WasmFeatures::CM_ERROR_CONTEXT
             | WasmFeatures::CM_GC
             | WasmFeatures::CM_MAP
+            | WasmFeatures::CM64
             | WasmFeatures::CM_FIXED_LENGTH_LISTS
             | WasmFeatures::CM_IMPLEMENTS;
 
@@ -2407,11 +2475,9 @@ impl Config {
                     | WasmFeatures::FUNCTION_REFERENCES
                     | WasmFeatures::RELAXED_SIMD
                     | WasmFeatures::TAIL_CALL
-                    | WasmFeatures::GC_TYPES
-                    | WasmFeatures::EXCEPTIONS
                     | WasmFeatures::LEGACY_EXCEPTIONS
-                    | WasmFeatures::STACK_SWITCHING
-                    | WasmFeatures::CM_ASYNC;
+                    | WasmFeatures::STACK_SWITCHING;
+
                 match self.compiler_target().architecture {
                     target_lexicon::Architecture::Aarch64(_) => {
                         unsupported |= WasmFeatures::THREADS;
@@ -2468,6 +2534,7 @@ impl Config {
         // features.
         features |= WasmFeatures::WASM3;
 
+        features |= WasmFeatures::WIDE_ARITHMETIC;
         // features |= WasmFeatures::YOUR_WASM_FEATURE;
         // ...
 
@@ -2713,6 +2780,15 @@ impl Config {
                 "concurrency support must be enabled to use the component \
                  model async or threading features"
             )
+        }
+
+        // Generated adapters between components will use `ref.func` in some
+        // async-related situations so `component-model-async` requires
+        // `reference-types`.
+        if features.contains(WasmFeatures::CM_ASYNC)
+            && !features.contains(WasmFeatures::REFERENCE_TYPES)
+        {
+            bail!("the component-model-async feature requires the wasm reference-types proposal");
         }
 
         // If the pooling allocator is used and GC is enabled, check that
@@ -4021,6 +4097,12 @@ impl PoolingAllocationConfig {
     /// aren't prepared to immediately flush them, and so we may go over this
     /// target size occasionally.
     ///
+    /// Note additionally that the queue of not-yet-decommitted entities is
+    /// sharded to reduce lock contention: one shard per available CPU, capped
+    /// at 16. Each shard batches up to this many decommits independently,
+    /// meaning that up to `min(available_parallelism, 16) * (batch_size - 1)`
+    /// decommits may be queued and not yet flushed at any given time.
+    ///
     /// A batch size of one effectively disables batching.
     ///
     /// Defaults to `1`.
@@ -4629,6 +4711,7 @@ fn detect_host_feature(feature: &str) -> Option<bool> {
             "paca" => Some(std::arch::is_aarch64_feature_detected!("paca")),
             "fp16" => Some(std::arch::is_aarch64_feature_detected!("fp16")),
             "dotprod" => Some(std::arch::is_aarch64_feature_detected!("dotprod")),
+            "i8mm" => Some(std::arch::is_aarch64_feature_detected!("i8mm")),
 
             _ => None,
         };
@@ -4684,6 +4767,7 @@ fn detect_host_feature(feature: &str) -> Option<bool> {
             "avx" => Some(std::is_x86_feature_detected!("avx")),
             "avx2" => Some(std::is_x86_feature_detected!("avx2")),
             "fma" => Some(std::is_x86_feature_detected!("fma")),
+            "avxvnni" => Some(std::is_x86_feature_detected!("avxvnni")),
             "bmi1" => Some(std::is_x86_feature_detected!("bmi1")),
             "bmi2" => Some(std::is_x86_feature_detected!("bmi2")),
             "avx512bitalg" => Some(std::is_x86_feature_detected!("avx512bitalg")),
@@ -4691,6 +4775,7 @@ fn detect_host_feature(feature: &str) -> Option<bool> {
             "avx512f" => Some(std::is_x86_feature_detected!("avx512f")),
             "avx512vl" => Some(std::is_x86_feature_detected!("avx512vl")),
             "avx512vbmi" => Some(std::is_x86_feature_detected!("avx512vbmi")),
+            "avx512vnni" => Some(std::is_x86_feature_detected!("avx512vnni")),
             "lzcnt" => Some(std::is_x86_feature_detected!("lzcnt")),
 
             _ => None,
@@ -4755,6 +4840,11 @@ impl Engine {
     /// Returns the configured [`Config::gc_heap_reservation`] value.
     pub fn get_gc_heap_reservation(&self) -> u64 {
         self.tunables().gc_heap_reservation
+    }
+
+    /// Returns the configured [`Config::gc_heap_initial_size`] value.
+    pub fn get_gc_heap_initial_size(&self) -> u64 {
+        self.tunables().gc_heap_initial_size
     }
 
     /// Returns the configured [`Config::gc_heap_reservation_for_growth`] value.

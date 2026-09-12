@@ -2,7 +2,7 @@
 
 use wasmtime::Result;
 use wasmtime::component::*;
-use wasmtime::{Config, Engine, Store, Trap};
+use wasmtime::{Config, Engine, Store};
 
 #[test]
 fn host_resource_types() -> Result<()> {
@@ -437,7 +437,7 @@ fn manually_destroy() -> Result<()> {
                   (func (export "pass") (param i32) (result i32) local.get 0)
                 )
                 (core instance $i (instantiate $m))
-                (type $t2' (resource (rep i32) (dtor (func $i "dtor"))))
+                (type $t2' (resource (rep i32) (dtor (core func $i "dtor"))))
                 (export $t2 "t2" (type $t2'))
                 (core func $ctor (canon resource.new $t2))
                 (func (export "[constructor]t2") (param "rep" u32) (result (own $t2))
@@ -677,7 +677,7 @@ fn dynamic_val() -> Result<()> {
 }
 
 #[test]
-fn cannot_reenter_during_import() -> Result<()> {
+fn reenter_during_import() -> Result<()> {
     let engine = super::engine();
     let c = Component::new(
         &engine,
@@ -690,7 +690,7 @@ fn cannot_reenter_during_import() -> Result<()> {
                 (core module $m
                     (import "" "f" (func $f))
                     (func (export "call") call $f)
-                    (func (export "dtor") (param i32) unreachable)
+                    (func (export "dtor") (param i32))
                 )
 
                 (core instance $i (instantiate $m
@@ -699,7 +699,7 @@ fn cannot_reenter_during_import() -> Result<()> {
                     ))
                 ))
 
-                (type $t2' (resource (rep i32) (dtor (func $i "dtor"))))
+                (type $t2' (resource (rep i32) (dtor (core func $i "dtor"))))
                 (export $t2 "t" (type $t2'))
                 (core func $ctor (canon resource.new $t2))
                 (func (export "ctor") (param "x" u32) (result (own $t2))
@@ -714,12 +714,7 @@ fn cannot_reenter_during_import() -> Result<()> {
     let mut linker = Linker::new(&engine);
     linker.root().func_wrap("f", |mut cx, ()| {
         let data: &mut Option<ResourceAny> = cx.data_mut();
-        let err = data.take().unwrap().resource_drop(cx).unwrap_err();
-        assert_eq!(
-            err.downcast_ref(),
-            Some(&Trap::CannotEnterComponent),
-            "bad error: {err:?}"
-        );
+        data.take().unwrap().resource_drop(cx)?;
         Ok(())
     })?;
     let i = linker.instantiate(&mut store, &c)?;
@@ -1737,7 +1732,7 @@ async fn drop_after_sync_lowered_async_host_function() -> Result<()> {
     (func (export "call") async
       (canon lift (core func $i "call")
         async
-        (callback (func $i "cb"))))
+        (callback (core func $i "cb"))))
   )
 
   (component $B
@@ -1779,7 +1774,7 @@ async fn drop_after_sync_lowered_async_host_function() -> Result<()> {
     (func (export "call") async (param "x" (borrow $r))
         (canon lift (core func $i "call")
             async
-            (callback (func $i "cb"))))
+            (callback (core func $i "cb"))))
   )
   (instance $a (instantiate $A (with "f" (func $f))))
   (instance $b (instantiate $B

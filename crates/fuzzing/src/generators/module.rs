@@ -23,6 +23,7 @@ pub struct ModuleConfig {
     pub component_model_error_context: bool,
     pub component_model_gc: bool,
     pub component_model_map: bool,
+    pub component_model_memory64: bool,
     pub component_model_fixed_length_lists: bool,
     pub component_model_implements: bool,
     pub legacy_exceptions: bool,
@@ -76,6 +77,9 @@ impl<'a> Arbitrary<'a> for ModuleConfig {
         // do that most of the time.
         config.disallow_traps = u.ratio(9, 10)?;
 
+        // not supported in wasmtime yet
+        config.compact_imports_enabled = false;
+
         Ok(ModuleConfig {
             component_model_async: false,
             component_model_more_async_builtins: false,
@@ -84,6 +88,7 @@ impl<'a> Arbitrary<'a> for ModuleConfig {
             component_model_error_context: false,
             component_model_gc: false,
             component_model_map: false,
+            component_model_memory64: false,
             component_model_fixed_length_lists: false,
             component_model_implements: false,
             legacy_exceptions: false,
@@ -124,17 +129,17 @@ impl ModuleConfig {
             config.limit_arrays_in_const_exprs = true;
         }
 
-        let mut module = wasm_smith::Module::new(config, input)?;
+        let mut module = wasm_smith::Module::new(config.clone(), input)?;
 
         if let Some(before) = input_before {
             static GEN_CNT: AtomicUsize = AtomicUsize::new(0);
             let used = before.len() - input.len();
             let i = GEN_CNT.fetch_add(1, Relaxed);
             let dna = format!("testcase{i}.dna");
-            let config = format!("testcase{i}.json");
-            log::debug!("writing `{dna}` and `{config}`");
+            let config_file = format!("testcase{i}.json");
+            log::debug!("writing `{dna}` and `{config_file}`");
             std::fs::write(&dna, &before[..used]).unwrap();
-            std::fs::write(&config, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+            std::fs::write(&config_file, serde_json::to_string_pretty(&config).unwrap()).unwrap();
         }
 
         if let Some(default_fuel) = default_fuel {

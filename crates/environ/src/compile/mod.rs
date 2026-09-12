@@ -321,12 +321,12 @@ pub trait Compiler: Send + Sync {
 
         let triple = self.triple();
         let (arch, flags) = match triple.architecture {
-            X86_32(_) => (Architecture::I386, 0),
-            X86_64 => (Architecture::X86_64, 0),
-            Arm(_) => (Architecture::Arm, 0),
-            Aarch64(_) => (Architecture::Aarch64, 0),
-            S390x => (Architecture::S390x, 0),
-            Riscv64(_) => (Architecture::Riscv64, 0),
+            X86_32(_) => (Architecture::I386, object::elf::FileFlags(0)),
+            X86_64 => (Architecture::X86_64, object::elf::FileFlags(0)),
+            Arm(_) => (Architecture::Arm, object::elf::FileFlags(0)),
+            Aarch64(_) => (Architecture::Aarch64, object::elf::FileFlags(0)),
+            S390x => (Architecture::S390x, object::elf::FileFlags(0)),
+            Riscv64(_) => (Architecture::Riscv64, object::elf::FileFlags(0)),
             // XXX: the `object` crate won't successfully build an object
             // with relocations and such if it doesn't know the
             // architecture, so just pretend we are riscv64. Yolo!
@@ -383,7 +383,10 @@ pub trait Compiler: Send + Sync {
                 | OperatingSystem::TvOS(_),
                 Architecture::Aarch64(..),
             ) => 0x4000,
-            (OperatingSystem::Windows, _) => 0x1000,
+            // According to
+            // https://devblogs.microsoft.com/oldnewthing/20210510-00/?p=105200
+            // it seems like windows always use a 4k page size.
+            (OperatingSystem::Windows, Architecture::Aarch64(..)) => 0x1000,
             // 64 KB is the maximal page size (i.e. memory translation granule size)
             // supported by the architecture and is used on some platforms.
             (_, Architecture::Aarch64(..)) => 0x10000,
@@ -430,6 +433,10 @@ pub trait Compiler: Send + Sync {
         // By default, an ISA cannot create a System V CIE.
         None
     }
+
+    /// Invoked at the end of a module or component compilation and signals
+    /// that any transient caches across functions can now be dropped.
+    fn release_caches(&self);
 }
 
 /// An inlining compiler.

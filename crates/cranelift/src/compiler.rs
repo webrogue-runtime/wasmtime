@@ -41,7 +41,7 @@ use wasmtime_environ::{
     Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, CompiledFunctionBody,
     DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape, FrameStateSlotBuilder,
     FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, GetPtrSize, HostCall,
-    InliningCompiler, ModulePC, ModuleStartup, ModuleTranslation, ModuleTypesBuilder,
+    InliningCompiler, ModulePC, ModuleStartup, ModuleTranslation, ModuleTypesBuilder, PtrSize,
     StackMapSection, StaticModuleIndex, TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables,
     WasmFuncType, WasmValType, prelude::*,
 };
@@ -81,7 +81,9 @@ impl Default for CompilerContext {
 /// the Wasm to Compiler IR, optimizing it and then translating to assembly.
 pub struct Compiler {
     tunables: Tunables,
-    contexts: Mutex<Vec<CompilerContext>>,
+    // Note that `CompilerContext` is quite large so the `Box` here is intended
+    // to ensure that this can be efficiently removed/added from this list.
+    contexts: Mutex<Vec<Box<CompilerContext>>>,
     isa: OwnedTargetIsa,
     emit_debug_checks: bool,
     linkopts: LinkOptions,
@@ -230,8 +232,10 @@ impl Compiler {
             caller_vmctx,
             wasmtime_environ::VMCONTEXT_MAGIC,
         );
-        let vm_store_context =
-            alias_regions.vmctx_store_context(&mut builder.cursor(), caller_vmctx);
+        let vm_store_context = alias_regions
+            .vmctx()
+            .store_context()
+            .load(&mut builder.cursor(), caller_vmctx);
         save_last_wasm_exit_fp_and_pc(
             &mut builder,
             pointer_type,
@@ -250,8 +254,15 @@ impl Compiler {
 
         // Load the actual callee out of the
         // `VMArrayCallHostFuncContext::host_func`.
+        let func_ref_offset = alias_regions
+            .offsets()
+            .get_ptr_size()
+            .vmarray_call_host_func_context_func_ref();
         let callee = alias_regions
-            .vmarray_call_host_func_context_array_call(&mut builder.cursor(), callee_vmctx);
+            .vm_func_ref()
+            .array_call()
+            .relative_to(func_ref_offset.into())
+            .load(&mut builder.cursor(), callee_vmctx);
 
         // Do an indirect call to the callee.
         let callee_signature = builder.func.import_signature(array_call_sig);
@@ -266,12 +277,16 @@ impl Compiler {
         // Increment the "execution version" on the VMStoreContext if
         // guest debugging is enabled.
         if self.tunables.debug_guest {
-            let vmstore_ctx_ptr =
-                alias_regions.vmctx_store_context(&mut builder.cursor(), caller_vmctx);
+            let vmstore_ctx_ptr = alias_regions
+                .vmctx()
+                .store_context()
+                .load(&mut builder.cursor(), caller_vmctx);
             let old_version = alias_regions
-                .vmstore_context_execution_version(&mut builder.cursor(), vmstore_ctx_ptr);
+                .vm_store_context()
+                .execution_version()
+                .load(&mut builder.cursor(), vmstore_ctx_ptr);
             let new_version = builder.ins().iadd_imm_s(old_version, 1);
-            alias_regions.store_vmstore_context_execution_version(
+            alias_regions.vm_store_context().execution_version().store(
                 &mut builder.cursor(),
                 vmstore_ctx_ptr,
                 new_version,
@@ -292,6 +307,9 @@ impl Compiler {
         );
         builder.ins().return_(&results);
         builder.finalize(self.isa().frontend_config());
+        crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(
+            &compiler.cx.codegen_context.func,
+        );
 
         Ok(CompiledFunctionBody {
             code: box_dyn_any_compiler_context(Some(compiler.cx)),
@@ -340,7 +358,10 @@ impl Compiler {
             vmctx,
             wasmtime_environ::VMCONTEXT_MAGIC,
         );
-        let vm_store_context = alias_regions.vmctx_store_context(&mut builder.cursor(), vmctx);
+        let vm_store_context = alias_regions
+            .vmctx()
+            .store_context()
+            .load(&mut builder.cursor(), vmctx);
         save_last_wasm_exit_fp_and_pc(
             &mut builder,
             pointer_type,
@@ -402,6 +423,9 @@ impl Compiler {
             builder.ins().return_(&[]);
         }
         builder.finalize(self.isa().frontend_config());
+        crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(
+            &compiler.cx.codegen_context.func,
+        );
 
         Ok(CompiledFunctionBody {
             code: box_dyn_any_compiler_context(Some(compiler.cx)),
@@ -439,9 +463,9 @@ fn box_dyn_any_compiled_function(f: CompiledFunction) -> Box<dyn Any + Send + Sy
     b
 }
 
-fn box_dyn_any_compiler_context(ctx: Option<CompilerContext>) -> Box<dyn Any + Send + Sync> {
+fn box_dyn_any_compiler_context(ctx: Option<Box<CompilerContext>>) -> Box<dyn Any + Send + Sync> {
     let b = box_dyn_any(ctx);
-    debug_assert!(b.is::<Option<CompilerContext>>());
+    debug_assert!(b.is::<Option<Box<CompilerContext>>>());
     b
 }
 
@@ -544,10 +568,14 @@ impl wasmtime_environ::Compiler for Compiler {
         if !isa.triple().is_pulley() {
             let store_ctx = func_env
                 .alias_regions
-                .vmctx_store_context_load(&mut context.func);
+                .vmctx()
+                .store_context()
+                .to_deferred_load(&mut context.func);
             let stack_limit = func_env
                 .alias_regions
-                .vmstore_context_stack_limit_load(&mut context.func);
+                .vm_store_context()
+                .stack_limit()
+                .to_deferred_load(&mut context.func);
             let stack_limit = VmctxLoadChain::new([store_ctx, stack_limit].into());
             if self.tunables.signals_based_traps {
                 let stack_limit = stack_limit.emit_global(&mut context.func);
@@ -602,7 +630,7 @@ impl wasmtime_environ::Compiler for Compiler {
                     symbol,
                     wasmtime_environ::VMCONTEXT_MAGIC,
                     |alias_regions, _pointer_type, cursor, vmctx| {
-                        alias_regions.vmctx_store_context(cursor, vmctx)
+                        alias_regions.vmctx().store_context().load(cursor, vmctx)
                     },
                 )
             }
@@ -650,7 +678,7 @@ impl wasmtime_environ::Compiler for Compiler {
                         symbol,
                         wasmtime_environ::VMCONTEXT_MAGIC,
                         |alias_regions, _pointer_type, cursor, vmctx| {
-                            alias_regions.vmctx_store_context(cursor, vmctx)
+                            alias_regions.vmctx().store_context().load(cursor, vmctx)
                         },
                     ),
                     // Delegate to a helper to finish compiling this.
@@ -686,7 +714,7 @@ impl wasmtime_environ::Compiler for Compiler {
         let funcs = funcs
             .iter()
             .map(|(sym, key, func)| {
-                debug_assert!(!func.is::<Option<CompilerContext>>());
+                debug_assert!(!func.is::<Option<Box<CompilerContext>>>());
                 debug_assert!(func.is::<CompiledFunction>());
                 let func = func.downcast_ref::<CompiledFunction>().unwrap();
                 (sym, *key, func)
@@ -859,7 +887,7 @@ impl wasmtime_environ::Compiler for Compiler {
         let get_func = move |m, f| {
             let (sym, any) = get_func(m, f);
             log::trace!("get_func({m:?}, {f:?}) -> ({sym:?}, {any:#p})");
-            debug_assert!(!any.is::<Option<CompilerContext>>());
+            debug_assert!(!any.is::<Option<Box<CompilerContext>>>());
             debug_assert!(any.is::<CompiledFunction>());
             (
                 sym,
@@ -926,20 +954,24 @@ impl wasmtime_environ::Compiler for Compiler {
         &'a self,
         func: &'a dyn Any,
     ) -> Box<dyn Iterator<Item = FuncKey> + 'a> {
-        debug_assert!(!func.is::<Option<CompilerContext>>());
+        debug_assert!(!func.is::<Option<Box<CompilerContext>>>());
         debug_assert!(func.is::<CompiledFunction>());
         let func = func.downcast_ref::<CompiledFunction>().unwrap();
         Box::new(func.relocations().map(|r| r.reloc_target))
+    }
+
+    fn release_caches(&self) {
+        *self.contexts.lock().unwrap() = Vec::new();
     }
 }
 
 impl InliningCompiler for Compiler {
     fn calls(&self, func_body: &CompiledFunctionBody, calls: &mut IndexSet<FuncKey>) -> Result<()> {
         debug_assert!(!func_body.code.is::<CompiledFunction>());
-        debug_assert!(func_body.code.is::<Option<CompilerContext>>());
+        debug_assert!(func_body.code.is::<Option<Box<CompilerContext>>>());
         let cx = func_body
             .code
-            .downcast_ref::<Option<CompilerContext>>()
+            .downcast_ref::<Option<Box<CompilerContext>>>()
             .unwrap()
             .as_ref()
             .unwrap();
@@ -960,10 +992,10 @@ impl InliningCompiler for Compiler {
 
     fn size(&self, func_body: &CompiledFunctionBody) -> u32 {
         debug_assert!(!func_body.code.is::<CompiledFunction>());
-        debug_assert!(func_body.code.is::<Option<CompilerContext>>());
+        debug_assert!(func_body.code.is::<Option<Box<CompilerContext>>>());
         let cx = func_body
             .code
-            .downcast_ref::<Option<CompilerContext>>()
+            .downcast_ref::<Option<Box<CompilerContext>>>()
             .unwrap()
             .as_ref()
             .unwrap();
@@ -978,10 +1010,10 @@ impl InliningCompiler for Compiler {
         get_callee: &'a mut dyn FnMut(FuncKey) -> Option<&'a CompiledFunctionBody>,
     ) -> Result<()> {
         debug_assert!(!func_body.code.is::<CompiledFunction>());
-        debug_assert!(func_body.code.is::<Option<CompilerContext>>());
+        debug_assert!(func_body.code.is::<Option<Box<CompilerContext>>>());
         let code = func_body
             .code
-            .downcast_mut::<Option<CompilerContext>>()
+            .downcast_mut::<Option<Box<CompilerContext>>>()
             .unwrap();
         let cx = code.as_mut().unwrap();
 
@@ -1017,10 +1049,10 @@ impl InliningCompiler for Compiler {
                     None => InlineCommand::KeepCall,
                     Some(func_body) => {
                         debug_assert!(!func_body.code.is::<CompiledFunction>());
-                        debug_assert!(func_body.code.is::<Option<CompilerContext>>());
+                        debug_assert!(func_body.code.is::<Option<Box<CompilerContext>>>());
                         let cx = func_body
                             .code
-                            .downcast_ref::<Option<CompilerContext>>()
+                            .downcast_ref::<Option<Box<CompilerContext>>>()
                             .unwrap();
                         InlineCommand::Inline {
                             callee: Cow::Borrowed(&cx.as_ref().unwrap().codegen_context.func),
@@ -1043,10 +1075,10 @@ impl InliningCompiler for Compiler {
     ) -> Result<()> {
         log::trace!("finish compiling {symbol:?}");
         debug_assert!(!func_body.code.is::<CompiledFunction>());
-        debug_assert!(func_body.code.is::<Option<CompilerContext>>());
+        debug_assert!(func_body.code.is::<Option<Box<CompilerContext>>>());
         let cx = func_body
             .code
-            .downcast_mut::<Option<CompilerContext>>()
+            .downcast_mut::<Option<Box<CompilerContext>>>()
             .unwrap()
             .take()
             .unwrap();
@@ -1275,15 +1307,17 @@ impl Compiler {
                     ctx.codegen_context.clear();
                     ctx
                 })
-                .unwrap_or_else(|| CompilerContext {
-                    incremental_cache_ctx: self.cache_store.as_ref().map(|cache_store| {
-                        IncrementalCacheContext {
-                            cache_store: cache_store.clone(),
-                            num_hits: 0,
-                            num_cached: 0,
-                        }
-                    }),
-                    ..Default::default()
+                .unwrap_or_else(|| {
+                    Box::new(CompilerContext {
+                        incremental_cache_ctx: self.cache_store.as_ref().map(|cache_store| {
+                            IncrementalCacheContext {
+                                cache_store: cache_store.clone(),
+                                num_hits: 0,
+                                num_cached: 0,
+                            }
+                        }),
+                        ..Default::default()
+                    })
                 }),
         }
     }
@@ -1352,14 +1386,16 @@ impl Compiler {
     {
         // Builtins are stored in an array in all `VMContext`s. First load the
         // base pointer of the array...
-        let array_addr = alias_regions.vmctx_builtin_functions(&mut builder.cursor(), vmctx);
+        let array_addr = alias_regions
+            .vmctx()
+            .builtin_functions()
+            .load(&mut builder.cursor(), vmctx);
         // ... and then load the entry in the array that corresponds to this
         // builtin.
-        let func_addr = alias_regions.builtin_functions_array_element(
-            &mut builder.cursor(),
-            array_addr,
-            builtin,
-        );
+        let func_addr = alias_regions
+            .vmctx()
+            .builtin_functions_array(builtin)
+            .load(&mut builder.cursor(), array_addr);
 
         let sig = builder.func.import_signature(sig);
         self.call_indirect_host(builder, builtin, sig, func_addr, args)
@@ -1402,7 +1438,14 @@ impl Compiler {
         if !self.emit_debug_checks {
             return;
         }
-        let magic = alias_regions.vmctx_magic(&mut builder.cursor(), vmctx);
+        // NB: a `VMComponentContext`'s `magic` field is deliberately read
+        // through the `VMContext` accessor: both types keep `magic` at offset
+        // zero, and this check is the one place that reads a vmctx's magic
+        // without knowing which of the two it has.
+        let magic = alias_regions
+            .vmctx()
+            .magic()
+            .load(&mut builder.cursor(), vmctx);
         let is_expected_vmctx = builder.ins().icmp_imm_s(
             ir::condcodes::IntCC::Equal,
             magic,
@@ -1563,7 +1606,7 @@ impl Compiler {
                 pointer_type,
                 i64::try_from(wasmtime_environ::VM_LAZY_THREAD_FORCED).unwrap(),
             );
-            alias_regions.store_vmstore_context_current_thread(
+            alias_regions.vm_store_context().current_thread().store(
                 &mut builder.cursor(),
                 vm_store_ctx,
                 forced,
@@ -1573,6 +1616,9 @@ impl Compiler {
         builder.ins().return_(&[false_return]);
 
         builder.finalize(self.isa().frontend_config());
+        crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(
+            &compiler.cx.codegen_context.func,
+        );
 
         Ok(CompiledFunctionBody {
             code: box_dyn_any_compiler_context(Some(compiler.cx)),
@@ -1583,7 +1629,7 @@ impl Compiler {
 
 struct FunctionCompiler<'a> {
     compiler: &'a Compiler,
-    cx: CompilerContext,
+    cx: Box<CompilerContext>,
 }
 
 impl FunctionCompiler<'_> {
@@ -1830,13 +1876,13 @@ fn save_last_wasm_entry_context<O>(
 {
     // Save the current fp/sp of the entry trampoline into the `VMStoreContext`.
     let fp = builder.ins().get_frame_pointer(pointer_type);
-    alias_regions.store_vmstore_context_last_wasm_entry_fp(
+    alias_regions.vm_store_context().last_wasm_entry_fp().store(
         &mut builder.cursor(),
         vm_store_context,
         fp,
     );
     let sp = builder.ins().get_stack_pointer(pointer_type);
-    alias_regions.store_vmstore_context_last_wasm_entry_sp(
+    alias_regions.vm_store_context().last_wasm_entry_sp().store(
         &mut builder.cursor(),
         vm_store_context,
         sp,
@@ -1847,11 +1893,10 @@ fn save_last_wasm_entry_context<O>(
     let trap_handler = builder
         .ins()
         .get_exception_handler_address(pointer_type, block, 0);
-    alias_regions.store_vmstore_context_last_wasm_entry_trap_handler(
-        &mut builder.cursor(),
-        vm_store_context,
-        trap_handler,
-    );
+    alias_regions
+        .vm_store_context()
+        .last_wasm_entry_trap_handler()
+        .store(&mut builder.cursor(), vm_store_context, trap_handler);
 }
 
 fn save_last_wasm_exit_fp_and_pc<O>(
@@ -1866,15 +1911,18 @@ fn save_last_wasm_exit_fp_and_pc<O>(
     // this so that it can know the SP (bottom of frame) for the very
     // last Wasm frame.
     let trampoline_fp = builder.ins().get_frame_pointer(pointer_type);
-    alias_regions.store_vmstore_context_last_wasm_exit_trampoline_fp(
-        &mut builder.cursor(),
-        limits,
-        trampoline_fp,
-    );
+    alias_regions
+        .vm_store_context()
+        .last_wasm_exit_trampoline_fp()
+        .store(&mut builder.cursor(), limits, trampoline_fp);
 
     // Finally save the Wasm return address to the limits.
     let wasm_pc = builder.ins().get_return_address(pointer_type);
-    alias_regions.store_vmstore_context_last_wasm_exit_pc(&mut builder.cursor(), limits, wasm_pc);
+    alias_regions.vm_store_context().last_wasm_exit_pc().store(
+        &mut builder.cursor(),
+        limits,
+        wasm_pc,
+    );
 }
 
 fn key_to_name(key: FuncKey) -> ir::UserFuncName {

@@ -47,6 +47,7 @@ pub fn apply_test_config(config: &mut Config, test_config: &wast::TestConfig) {
         component_model_error_context,
         component_model_gc,
         component_model_map,
+        component_model_memory64,
         component_model_fixed_length_lists,
         component_model_implements,
         nan_canonicalization,
@@ -81,6 +82,7 @@ pub fn apply_test_config(config: &mut Config, test_config: &wast::TestConfig) {
     let component_model_error_context = component_model_error_context.unwrap_or(false);
     let component_model_gc = component_model_gc.unwrap_or(false);
     let component_model_map = component_model_map.unwrap_or(false);
+    let component_model_memory64 = component_model_memory64.unwrap_or(false);
     let component_model_fixed_length_lists = component_model_fixed_length_lists.unwrap_or(false);
     let component_model_implements = component_model_implements.unwrap_or(false);
     let nan_canonicalization = nan_canonicalization.unwrap_or(false);
@@ -94,7 +96,8 @@ pub fn apply_test_config(config: &mut Config, test_config: &wast::TestConfig) {
     // downstream proposals once the end proposal is enabled (e.g. when enabling
     // gc that also enables function-references and reference-types).
     let function_references = gc || function_references.unwrap_or(false);
-    let reference_types = function_references || reference_types.unwrap_or(false);
+    let reference_types =
+        function_references || component_model_async || reference_types.unwrap_or(false);
     let simd = relaxed_simd || simd.unwrap_or(false);
 
     let exceptions = stack_switching || exceptions.unwrap_or(false);
@@ -125,6 +128,7 @@ pub fn apply_test_config(config: &mut Config, test_config: &wast::TestConfig) {
         .wasm_component_model_error_context(component_model_error_context)
         .wasm_component_model_gc(component_model_gc)
         .wasm_component_model_map(component_model_map)
+        .wasm_component_model_memory64(component_model_memory64)
         .wasm_component_model_fixed_length_lists(component_model_fixed_length_lists)
         .wasm_component_model_implements(component_model_implements)
         .wasm_exceptions(exceptions)

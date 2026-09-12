@@ -711,16 +711,25 @@ pub fn translate_exn_throw(
     tag_index: TagIndex,
     args: &[ir::Value],
 ) -> WasmResult<()> {
+    let exnref = translate_exn_new(func_env, builder, tag_index, args)?;
+    translate_exn_throw_ref(func_env, builder, exnref)
+}
+
+pub fn translate_exn_new(
+    func_env: &mut FuncEnvironment<'_>,
+    builder: &mut FunctionBuilder<'_>,
+    tag_index: TagIndex,
+    args: &[ir::Value],
+) -> WasmResult<ir::Value> {
     let (instance_id, defined_tag_id) = func_env.get_instance_and_tag(builder, tag_index);
-    let exnref = gc_compiler(func_env)?.alloc_exn(
+    gc_compiler(func_env)?.alloc_exn(
         func_env,
         builder,
         tag_index,
         args,
         instance_id,
         defined_tag_id,
-    )?;
-    translate_exn_throw_ref(func_env, builder, exnref)
+    )
 }
 
 pub fn translate_exn_throw_ref(
@@ -729,15 +738,36 @@ pub fn translate_exn_throw_ref(
     exnref: ir::Value,
 ) -> WasmResult<()> {
     let builtin = func_env.builtin_functions.throw_ref(builder.func);
+    let vmctx = func_env.vmctx_val(&mut builder.cursor());
+    translate_throwing_builtin(func_env, builder, builtin, &[vmctx, exnref])
+}
+
+/// Re-raise the exception currently pending in the VM context.
+///
+/// Continuation stacks catch native unwinding at their array-call boundary.
+/// When control returns to a parent continuation, this emits a new throwing
+/// callsite with that parent's Wasm exception handlers attached.
+pub fn translate_raise(
+    func_env: &mut FuncEnvironment<'_>,
+    builder: &mut FunctionBuilder<'_>,
+) -> WasmResult<()> {
+    let builtin = func_env.builtin_functions.raise(builder.func);
+    let vmctx = func_env.vmctx_val(&mut builder.cursor());
+    translate_throwing_builtin(func_env, builder, builtin, &[vmctx])
+}
+
+fn translate_throwing_builtin(
+    func_env: &mut FuncEnvironment<'_>,
+    builder: &mut FunctionBuilder<'_>,
+    builtin: ir::FuncRef,
+    args: &[ir::Value],
+) -> WasmResult<()> {
     let sig = builder.func.dfg.ext_funcs[builtin].signature;
     let vmctx = func_env.vmctx_val(&mut builder.cursor());
 
-    // Generate a `try_call` with handlers from the current
-    // stack. This libcall is unique among libcall implementations of
-    // opcodes: we know the others will not throw, but `throw_ref`'s
-    // entire purpose is to throw. So if there are any handlers in the
-    // local function body, we need to attach them to this callsite
-    // like any other.
+    // Generate a `try_call` with handlers from the current stack. Both
+    // `throw_ref` and `raise` deliberately throw, so local Wasm handlers must
+    // be attached to these callsites like they are to ordinary throwing calls.
     let continuation = builder.create_block();
     let current_block = builder.current_block().unwrap();
     builder.insert_block_after(continuation, current_block);
@@ -756,7 +786,7 @@ pub fn translate_exn_throw_ref(
     let etd = ExceptionTableData::new(sig, continuation_call, table_items);
     let et = builder.func.dfg.exception_tables.push(etd);
 
-    builder.ins().try_call(builtin, &[vmctx, exnref], et);
+    builder.ins().try_call(builtin, args, et);
 
     builder.switch_to_block(continuation);
     builder.seal_block(continuation);
@@ -773,6 +803,13 @@ pub fn translate_array_new(
     len: ir::Value,
 ) -> WasmResult<ir::Value> {
     log::trace!("translate_array_new({array_type_index:?}, {elem:?}, {len:?})");
+    let cost = func_env
+        .tunables
+        .operator_cost
+        .variable()
+        .array_new_per_element;
+    let fuel = func_env.pre_translate_bulk_op(builder, len, cost);
+
     let result =
         gc_compiler(func_env)?.alloc_uninit_array(func_env, builder, array_type_index, len)?;
     let zero = builder.ins().iconst(ir::types::I32, 0);
@@ -788,6 +825,7 @@ pub fn translate_array_new(
         elem,
         len,
     )?;
+    func_env.post_translate_bulk_op(builder, fuel)?;
     log::trace!("translate_array_new(..) -> {result:?}");
     Ok(result)
 }
@@ -799,6 +837,12 @@ pub fn translate_array_new_default(
     len: ir::Value,
 ) -> WasmResult<ir::Value> {
     log::trace!("translate_array_new_default({array_type_index:?}, {len:?})");
+    let cost = func_env
+        .tunables
+        .operator_cost
+        .variable()
+        .array_new_default_per_element;
+    let fuel = func_env.pre_translate_bulk_op(builder, len, cost);
 
     let interned_ty = func_env.module.types[array_type_index].unwrap_module_type_index();
     let array_ty = func_env.types.unwrap_array(interned_ty)?;
@@ -818,6 +862,7 @@ pub fn translate_array_new_default(
         elem,
         len,
     )?;
+    func_env.post_translate_bulk_op(builder, fuel)?;
     Ok(result)
 }
 
@@ -1229,6 +1274,32 @@ pub fn translate_ref_test(
         WasmHeapType::ConcreteArray(ty)
         | WasmHeapType::ConcreteStruct(ty)
         | WasmHeapType::ConcreteExn(ty) => {
+            // An `anyref` can be a host `externref` internalized by
+            // `any.convert_extern`, and such an object's header holds the
+            // reserved type index rather than a real one, so check the object's
+            // kind before reading it.
+            if val_ty.heap_type == WasmHeapType::Any {
+                let expected_kind = match test_ty.heap_type {
+                    WasmHeapType::ConcreteArray(_) => VMGcKind::ArrayRef,
+                    WasmHeapType::ConcreteStruct(_) => VMGcKind::StructRef,
+                    _ => unreachable!(
+                        "checked all of the `any` hierarchy (top, bottom, and i31ref further above)"
+                    ),
+                };
+                let kind_matches = check_header_kind(func_env, builder, val, expected_kind);
+                let kind_matches_block = builder.create_block();
+                let zero = builder.ins().iconst(ir::types::I32, 0);
+                builder.ins().brif(
+                    kind_matches,
+                    kind_matches_block,
+                    &[],
+                    continue_block,
+                    &[zero.into()],
+                );
+                builder.seal_block(kind_matches_block);
+                builder.switch_to_block(kind_matches_block);
+            }
+
             let expected_interned_ty = ty.unwrap_module_type_index();
             let expected_shared_ty =
                 func_env.module_interned_to_shared_ty(&mut builder.cursor(), expected_interned_ty);
@@ -1263,11 +1334,11 @@ pub fn translate_ref_test(
             let expected_shared_ty =
                 func_env.module_interned_to_shared_ty(&mut builder.cursor(), expected_interned_ty);
 
-            let actual_shared_ty = func_env.alias_regions.vmfuncref_type_index(
-                &mut builder.cursor(),
-                ir::MemFlagsData::trusted().with_readonly(),
-                val,
-            );
+            let actual_shared_ty = func_env
+                .alias_regions
+                .vm_func_ref()
+                .type_index()
+                .load(&mut builder.cursor(), val);
 
             func_env.is_subtype(
                 builder,
@@ -1481,7 +1552,11 @@ impl FuncEnvironment<'_> {
             return heap;
         }
 
-        let store_ctx = self.alias_regions.vmctx_store_context_load(func);
+        let store_ctx = self
+            .alias_regions
+            .vmctx()
+            .store_context()
+            .to_deferred_load(func);
 
         // The base pointer's load is `can_move` and `readonly` when the GC
         // heap's base can never move.
@@ -1720,7 +1795,10 @@ pub fn translate_array_new_entity(
     entity: CheckedEntity,
     entity_offset: ir::Value,
     len: ir::Value,
+    cost_per_unit: u8,
 ) -> WasmResult<ir::Value> {
+    let fuel = env.pre_translate_bulk_op(builder, len, cost_per_unit);
+
     // Before actually allocating this array first do a bounds-check on the
     // passive entity itself.
     let interned_type_index = env.module.types[array_type_index].unwrap_module_type_index();
@@ -1741,5 +1819,6 @@ pub fn translate_array_new_entity(
         len,
     )?;
 
+    env.post_translate_bulk_op(builder, fuel)?;
     Ok(array)
 }

@@ -4,7 +4,7 @@ use test_programs_artifacts::*;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Result, error::Context as _, format_err};
 use wasmtime_wasi::p3::bindings::Command;
-use wasmtime_wasi::{DirPerms, FilePerms, WasiCtxBuilder};
+use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
 
 async fn run(path: &str) -> Result<()> {
     run_allow_blocking_current_thread(path, false).await
@@ -186,6 +186,11 @@ async fn p3_file_write_blocking() -> wasmtime::Result<()> {
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_file_write_chunked() -> wasmtime::Result<()> {
+    run(P3_FILE_WRITE_CHUNKED_COMPONENT).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_file_truncation_readonly() -> wasmtime::Result<()> {
     run_with_readonly_testfile(P3_FILE_TRUNCATION_READONLY_COMPONENT).await
 }
@@ -203,12 +208,7 @@ async fn run_with_readonly_testfile(component_path: &str) -> wasmtime::Result<()
 
     run_with_builder(component_path, false, |builder| {
         builder
-            .preopened_dir(
-                tempdir.path(),
-                "readonly",
-                DirPerms::READ | DirPerms::MUTATE,
-                FilePerms::READ,
-            )
+            .preopened_dir(tempdir.path(), "readonly", FsPerms::ReadOnly)
             .unwrap();
     })
     .await?;

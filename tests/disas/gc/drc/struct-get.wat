@@ -24,11 +24,11 @@
   )
 )
 ;; function u0:0(i64 vmctx, i64, i32) -> f32 tail {
-;;     region0 = 8 "VMContext+0x8"
-;;     region1 = 134217752 "VMStoreContext+0x18"
-;;     region2 = 134217760 "VMStoreContext+0x20"
-;;     region3 = 134217768 "VMStoreContext+0x28"
-;;     region4 = 1073741824 "GcHeap"
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 196 ""
+;;     region3 = 206 ""
+;;     region4 = 108 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
 ;;     gv2 = load.i64 notrap aligned region1 gv1+24
@@ -50,11 +50,11 @@
 ;; }
 ;;
 ;; function u0:1(i64 vmctx, i64, i32) -> i32 tail {
-;;     region0 = 8 "VMContext+0x8"
-;;     region1 = 134217752 "VMStoreContext+0x18"
-;;     region2 = 134217760 "VMStoreContext+0x20"
-;;     region3 = 134217768 "VMStoreContext+0x28"
-;;     region4 = 1073741824 "GcHeap"
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 196 ""
+;;     region3 = 206 ""
+;;     region4 = 108 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
 ;;     gv2 = load.i64 notrap aligned region1 gv1+24
@@ -77,11 +77,11 @@
 ;; }
 ;;
 ;; function u0:2(i64 vmctx, i64, i32) -> i32 tail {
-;;     region0 = 8 "VMContext+0x8"
-;;     region1 = 134217752 "VMStoreContext+0x18"
-;;     region2 = 134217760 "VMStoreContext+0x20"
-;;     region3 = 134217768 "VMStoreContext+0x28"
-;;     region4 = 1073741824 "GcHeap"
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 196 ""
+;;     region3 = 206 ""
+;;     region4 = 108 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
 ;;     gv2 = load.i64 notrap aligned region1 gv1+24
@@ -105,16 +105,16 @@
 ;;
 ;; function u0:3(i64 vmctx, i64, i32) -> i32 tail {
 ;;     ss0 = explicit_slot 4, align = 4
-;;     region0 = 8 "VMContext+0x8"
-;;     region1 = 134217752 "VMStoreContext+0x18"
-;;     region2 = 134217760 "VMStoreContext+0x20"
-;;     region3 = 134217768 "VMStoreContext+0x28"
-;;     region4 = 1073741824 "GcHeap"
-;;     region5 = 32 "VMContext+0x20"
-;;     region6 = 1610612736 "VMDrcHeapData+0x0"
-;;     region7 = 1610612740 "VMDrcHeapData+0x4"
-;;     region8 = 1610612744 "VMDrcHeapData+0x8"
-;;     region9 = 3087007744 "Stack(ss0)"
+;;     region0 = 123 ""
+;;     region1 = 160 ""
+;;     region2 = 196 ""
+;;     region3 = 206 ""
+;;     region4 = 108 ""
+;;     region5 = 65 ""
+;;     region6 = 210 ""
+;;     region7 = 115 ""
+;;     region8 = 137 ""
+;;     region9 = 232 ""
 ;;     gv0 = vmctx
 ;;     gv1 = load.i64 notrap aligned readonly can_move region0 gv0+8
 ;;     gv2 = load.i64 notrap aligned region1 gv1+24

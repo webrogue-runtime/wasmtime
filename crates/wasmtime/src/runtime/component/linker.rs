@@ -13,15 +13,15 @@ use alloc::sync::Arc;
 use core::marker;
 #[cfg(feature = "component-model-async")]
 use core::pin::Pin;
-use wasmtime_environ::component::NameMap;
+use wasmtime_environ::component::{NameMap, NameMapIntern};
 use wasmtime_environ::{Atom, PrimaryMap, StringPool};
 
 /// A type used to instantiate [`Component`]s.
 ///
-/// This type is used to both link components together as well as supply host
-/// functionality to components. Values are defined in a [`Linker`] by their
-/// import name and then components are instantiated with a [`Linker`] using the
-/// names provided for name resolution of the component's imports.
+/// This type is used to supply host functionality to components. Values are
+/// defined in a [`Linker`] by their import name and then components are
+/// instantiated with a [`Linker`] using the names provided for name resolution
+/// of the component's imports.
 ///
 /// # Names and Semver
 ///
@@ -227,10 +227,17 @@ impl<T: 'static> Linker<T> {
     /// `component` imports or if a name defined doesn't match the type of the
     /// item imported by the `component` provided.
     ///
+    /// Returns an error if `component` was not compiled by the same
+    /// [`Engine`](crate::Engine) as this linker.
+    ///
     /// This function will return an [`OutOfMemory`][crate::OutOfMemory] error when
     /// memory allocation fails. See the `OutOfMemory` type's documentation for
     /// details on Wasmtime's out-of-memory handling.
     pub fn instantiate_pre(&self, component: &Component) -> Result<InstancePre<T>> {
+        ensure!(
+            Engine::same(&self.engine, component.engine()),
+            "cross-`Engine` instantiation is not currently supported"
+        );
         let cx = self.typecheck(&component)?;
 
         // A successful typecheck resolves all of the imported resources used by
@@ -365,7 +372,7 @@ impl<T: 'static> Linker<T> {
             }
 
             match item_def {
-                TypeDef::ComponentFunc(_) => {
+                TypeDef::ComponentFunc(_func_idx) => {
                     let fully_qualified_name = match parent_instance {
                         Some(parent) => {
                             let mut s = TryString::new();
@@ -380,6 +387,30 @@ impl<T: 'static> Linker<T> {
                             s
                         }
                     };
+
+                    // An `async func`-typed import can never be satisfied by
+                    // `func_new` (only a sync-typed import can) — see
+                    // `typecheck_async`'s doc comment. Stub it with
+                    // `func_new_concurrent` instead so unsatisfied async
+                    // imports can be stubbed-as-traps too, not just sync
+                    // ones; if concurrency support isn't enabled there's no
+                    // way to stub it here, so fall through to `func_new` and
+                    // let instantiation fail with that same explanatory
+                    // error.
+                    #[cfg(feature = "component-model-async")]
+                    if types[*_func_idx].async_ && linker.engine.tunables().concurrency_support {
+                        linker.func_new_concurrent(&item_name, move |_, _, _, _| {
+                            let fully_qualified_name = fully_qualified_name.try_clone();
+                            Box::pin(async move {
+                                let fully_qualified_name = fully_qualified_name?;
+                                bail!(
+                                    "unknown import: `{fully_qualified_name}` has not been defined"
+                                )
+                            })
+                        })?;
+                        return Ok(());
+                    }
+
                     linker.func_new(&item_name, move |_, _, _, _| {
                         bail!("unknown import: `{fully_qualified_name}` has not been defined")
                     })?;
@@ -884,13 +915,28 @@ impl<T: 'static> LinkerInstance<'_, T> {
     /// Same as [`LinkerInstance::instance`] except with different lifetime
     /// parameters.
     pub fn into_instance(mut self, name: &str) -> Result<Self> {
-        let name = self.insert(name, Definition::Instance(NameMap::default()))?;
-        self.map = match self.map.raw_get_mut(&name) {
+        let atom = self.strings.intern(name)?;
+
+        // If this item is already an instance then don't stomp over it with a
+        // new empty instance (or fail due to shadowing being disallowed).
+        // Instead continue through to below to explicitly allow re-opening an
+        // instance multiple times over separate API calls.
+        //
+        // If this item isn't defined, or is defined as anything other than an
+        // instance, however, the insert a fresh new instance and see what
+        // happens as a result.
+        match self.map.raw_get_mut(&atom) {
+            Some(Definition::Instance(_)) => {}
+            _ => {
+                self.insert(name, Definition::Instance(NameMap::default()))?;
+            }
+        }
+        self.map = match self.map.raw_get_mut(&atom) {
             Some(Definition::Instance(map)) => map,
             _ => unreachable!(),
         };
         self.path.truncate(self.path_len);
-        self.path.push(name);
+        self.path.push(atom);
         self.path_len += 1;
         Ok(self)
     }

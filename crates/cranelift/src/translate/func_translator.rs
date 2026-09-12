@@ -118,6 +118,7 @@ impl FuncTranslator {
         parse_function_body(validator, reader, &mut builder, environ)?;
 
         builder.finalize(environ.target_config());
+        crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(func);
         log::trace!("translated Wasm to CLIF:\n{}", func.display());
         Ok(())
     }
@@ -140,6 +141,7 @@ impl FuncTranslator {
         environ.after_translate_function(&mut builder)?;
         builder.ins().return_(&[]);
         builder.finalize(environ.target_config());
+        crate::alias_region::debug_assert_all_mem_insts_have_alias_regions(func);
         Ok(())
     }
 }
@@ -342,7 +344,7 @@ fn validate_op_and_get_operand_types<'a>(
     environ: &mut FuncEnvironment<'_>,
     operand_types: &'a mut Vec<wasmtime_environ::WasmValType>,
     op: &wasmparser::Operator<'_>,
-    pos: usize,
+    pos: u64,
 ) -> WasmResult<Option<&'a [wasmtime_environ::WasmValType]>> {
     // Get the operand types for this operator.
     //

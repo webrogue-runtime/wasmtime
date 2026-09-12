@@ -15,10 +15,6 @@ use wasmtime_environ::{
     WasmValType, drc::DrcTypeLayouts,
 };
 
-// The minimum over-approximated stack roots list size for which we will trigger
-// a GC.
-const MIN_OVER_APPROX_STACK_ROOTS_GC_THRESHOLD: i64 = 1024;
-
 #[derive(Default)]
 pub struct DrcCompiler {
     layouts: DrcTypeLayouts,
@@ -109,13 +105,17 @@ impl DrcCompiler {
         let vmctx = func_env.vmctx_val(&mut builder.cursor());
         let heap_data = func_env
             .alias_regions
-            .vmctx_gc_heap_data(&mut builder.cursor(), vmctx);
+            .vmctx()
+            .gc_heap_data()
+            .load(&mut builder.cursor(), vmctx);
 
         // Load the current first list element, which will be our new next list
         // element.
         let next = func_env
             .alias_regions
-            .vmdrc_heap_data_over_approximated_stack_roots(&mut builder.cursor(), heap_data);
+            .vm_drc_heap_data()
+            .over_approximated_stack_roots()
+            .load(&mut builder.cursor(), heap_data);
 
         // Update our object's header to point to `next` and consider itself part of the list.
         self.set_next_over_approximated_stack_root(func_env, builder, gc_ref, next);
@@ -127,11 +127,9 @@ impl DrcCompiler {
         // Commit this object as the new head of the list.
         func_env
             .alias_regions
-            .store_vmdrc_heap_data_over_approximated_stack_roots(
-                &mut builder.cursor(),
-                heap_data,
-                gc_ref,
-            );
+            .vm_drc_heap_data()
+            .over_approximated_stack_roots()
+            .store(&mut builder.cursor(), heap_data, gc_ref);
 
         // Increment the list's length.
         //
@@ -142,19 +140,16 @@ impl DrcCompiler {
         // `u32::MAX`.
         let current_len = func_env
             .alias_regions
-            .vmdrc_heap_data_current_over_approximated_stack_roots_len(
-                &mut builder.cursor(),
-                heap_data,
-            );
+            .vm_drc_heap_data()
+            .current_over_approximated_stack_roots_len()
+            .load(&mut builder.cursor(), heap_data);
         let one = builder.ins().iconst(ir::types::I32, 1);
         let new_current_len = builder.ins().iadd(current_len, one);
         func_env
             .alias_regions
-            .store_vmdrc_heap_data_current_over_approximated_stack_roots_len(
-                &mut builder.cursor(),
-                heap_data,
-                new_current_len,
-            );
+            .vm_drc_heap_data()
+            .current_over_approximated_stack_roots_len()
+            .store(&mut builder.cursor(), heap_data, new_current_len);
     }
 
     /// Trigger a GC when the over-approximated-stack-roots list has doubled
@@ -175,24 +170,25 @@ impl DrcCompiler {
         let vmctx = func_env.vmctx_val(&mut builder.cursor());
         let heap_data = func_env
             .alias_regions
-            .vmctx_gc_heap_data(&mut builder.cursor(), vmctx);
+            .vmctx()
+            .gc_heap_data()
+            .load(&mut builder.cursor(), vmctx);
         let current_len = func_env
             .alias_regions
-            .vmdrc_heap_data_current_over_approximated_stack_roots_len(
-                &mut builder.cursor(),
-                heap_data,
-            );
+            .vm_drc_heap_data()
+            .current_over_approximated_stack_roots_len()
+            .load(&mut builder.cursor(), heap_data);
         let last_len = func_env
             .alias_regions
-            .vmdrc_heap_data_over_approximated_stack_roots_len_after_last_gc(
-                &mut builder.cursor(),
-                heap_data,
-            );
+            .vm_drc_heap_data()
+            .over_approximated_stack_roots_len_after_last_gc()
+            .load(&mut builder.cursor(), heap_data);
 
         let doubled_last_len = builder.ins().iadd(last_len, last_len);
-        let min_threshold = builder
-            .ins()
-            .iconst(ir::types::I32, MIN_OVER_APPROX_STACK_ROOTS_GC_THRESHOLD);
+        let min_threshold = builder.ins().iconst(
+            ir::types::I32,
+            wasmtime_environ::drc::MIN_OVER_APPROX_STACK_ROOTS_GC_THRESHOLD,
+        );
         let threshold = builder.ins().umax(doubled_last_len, min_threshold);
 
         let should_gc =

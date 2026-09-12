@@ -449,20 +449,29 @@ where
     }
 }
 
-/// TODO
+/// An import or an export of a component or a component instance.
+///
+/// This records the type of the item that is being imported or exported along
+/// with any metadata associated with the item.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ComponentExtern {
-    /// TODO
+    /// Metadata associated with this item's name, such as
+    /// `(implements "...")`.
     pub data: ComponentExternData,
-    /// TODO
+    /// The type of this item.
     pub ty: TypeDef,
 }
 
-/// TODO
+/// Metadata associated with the name of a component import or export.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ComponentExternData {
-    /// TODO
+    /// The `(implements "...")` annotation, if present: the name of the
+    /// interface that this item implements, used when matching this item
+    /// against imports by interface name rather than by import name.
     pub implements: Option<String>,
+    /// The `(external-id "...")` annotation, if present: a free-form
+    /// host-defined identifier which is ignored by type checking.
+    pub external_id: Option<String>,
 }
 
 /// Types of imports and exports in the component model.
@@ -751,6 +760,48 @@ impl CanonicalAbiInfo {
         return ret;
     }
 
+    /// Returns the abi for a fixed length list
+    pub const fn fixed_length_list_static(
+        element: &CanonicalAbiInfo,
+        count: usize,
+    ) -> CanonicalAbiInfo {
+        if count <= u32::MAX as usize {
+            let count = count as u32;
+            CanonicalAbiInfo {
+                size32: element.size32.saturating_mul(count),
+                align32: element.align32,
+                size64: element.size64.saturating_mul(count),
+                align64: element.align64,
+
+                flat_count: match element.flat_count {
+                    None => None,
+                    Some(c) =>
+                    // .and_then(|c| u8::try_from(c).ok()) is not yet const
+                    {
+                        match count.checked_mul(c as u32) {
+                            Some(product) => {
+                                if product as usize > MAX_FLAT_TYPES || product > u8::MAX as u32 {
+                                    None
+                                } else {
+                                    Some(product as u8)
+                                }
+                            }
+                            None => None,
+                        }
+                    }
+                },
+            }
+        } else {
+            CanonicalAbiInfo {
+                size32: u32::MAX,
+                align32: element.align32,
+                size64: u32::MAX,
+                align64: element.align64,
+                flat_count: None,
+            }
+        }
+    }
+
     /// Returns the delta from the current value of `offset` to align properly
     /// and read the next record field of type `abi` for 32-bit memories.
     pub fn next_field32(&self, offset: &mut u32) -> u32 {
@@ -1002,7 +1053,7 @@ pub struct RecordField {
 /// Variants are close to Rust `enum` declarations where a value is one of many
 /// cases and each case has a unique name and an optional payload associated
 /// with it.
-#[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TypeVariant {
     /// The list of cases that this variant can take.
     pub cases: IndexMap<String, Option<InterfaceType>>,
@@ -1011,6 +1062,20 @@ pub struct TypeVariant {
     /// Byte information about this variant type.
     pub info: VariantInfo,
 }
+
+// NB: the order of `cases` matter, so this `PartialEq` disagrees with
+// `IndexMap`'s implementation.
+impl PartialEq for TypeVariant {
+    fn eq(&self, other: &TypeVariant) -> bool {
+        let TypeVariant { cases, abi, info } = self;
+        cases.len() == other.cases.len()
+            && cases.iter().eq(other.cases.iter())
+            && *abi == other.abi
+            && *info == other.info
+    }
+}
+
+impl Eq for TypeVariant {}
 
 impl Hash for TypeVariant {
     fn hash<H: Hasher>(&self, h: &mut H) {
@@ -1040,13 +1105,24 @@ pub struct TypeTuple {
 ///
 /// This can be thought of as a record-of-bools, although the representation is
 /// more efficient as bitflags.
-#[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TypeFlags {
     /// The names of all flags, all of which are unique.
     pub names: IndexSet<String>,
     /// Byte information about this type in the canonical ABI.
     pub abi: CanonicalAbiInfo,
 }
+
+// NB: the order of `names` matter, so this `PartialEq` disagrees with
+// `IndexMap`'s implementation.
+impl PartialEq for TypeFlags {
+    fn eq(&self, other: &TypeFlags) -> bool {
+        let TypeFlags { names, abi } = self;
+        names.len() == other.names.len() && names.iter().eq(other.names.iter()) && *abi == other.abi
+    }
+}
+
+impl Eq for TypeFlags {}
 
 impl Hash for TypeFlags {
     fn hash<H: Hasher>(&self, h: &mut H) {
@@ -1064,7 +1140,7 @@ impl Hash for TypeFlags {
 ///
 /// In interface types enums are simply a bag of names, and can be seen as a
 /// variant where all payloads are `Unit`.
-#[derive(Serialize, Deserialize, Clone, Eq, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TypeEnum {
     /// The names of this enum, all of which are unique.
     pub names: IndexSet<String>,
@@ -1073,6 +1149,20 @@ pub struct TypeEnum {
     /// Byte information about this variant type.
     pub info: VariantInfo,
 }
+
+// NB: the order of `names` matter, so this `PartialEq` disagrees with
+// `IndexMap`'s implementation.
+impl PartialEq for TypeEnum {
+    fn eq(&self, other: &TypeEnum) -> bool {
+        let TypeEnum { names, abi, info } = self;
+        names.len() == other.names.len()
+            && names.iter().eq(other.names.iter())
+            && *abi == other.abi
+            && *info == other.info
+    }
+}
+
+impl Eq for TypeEnum {}
 
 impl Hash for TypeEnum {
     fn hash<H: Hasher>(&self, h: &mut H) {
@@ -1298,4 +1388,69 @@ pub enum FlatType {
     I64,
     F32,
     F64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variant(cases: &[(&str, InterfaceType)]) -> TypeVariant {
+        TypeVariant {
+            cases: cases
+                .iter()
+                .map(|(name, ty)| (name.to_string(), Some(*ty)))
+                .collect(),
+            abi: CanonicalAbiInfo::default(),
+            info: VariantInfo {
+                size: DiscriminantSize::Size1,
+                payload_offset32: 4,
+                payload_offset64: 8,
+            },
+        }
+    }
+
+    fn flags(names: &[&str]) -> TypeFlags {
+        TypeFlags {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            abi: CanonicalAbiInfo::default(),
+        }
+    }
+
+    fn enum_(names: &[&str]) -> TypeEnum {
+        TypeEnum {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            abi: CanonicalAbiInfo::default(),
+            info: VariantInfo {
+                size: DiscriminantSize::Size1,
+                payload_offset32: 4,
+                payload_offset64: 8,
+            },
+        }
+    }
+
+    #[test]
+    fn variant_case_order_is_significant() {
+        let a = variant(&[("n", InterfaceType::U32), ("s", InterfaceType::String)]);
+        let b = variant(&[("s", InterfaceType::String), ("n", InterfaceType::U32)]);
+        assert_ne!(a, b);
+        assert_eq!(a, a.clone());
+    }
+
+    #[test]
+    fn flags_name_order_is_significant() {
+        let a = flags(&["a", "b", "c"]);
+        let b = flags(&["c", "b", "a"]);
+
+        assert_ne!(a, b);
+        assert_eq!(a, a.clone());
+    }
+
+    #[test]
+    fn enum_name_order_is_significant() {
+        let a = enum_(&["red", "green", "blue"]);
+        let b = enum_(&["blue", "green", "red"]);
+
+        assert_ne!(a, b);
+        assert_eq!(a, a.clone());
+    }
 }

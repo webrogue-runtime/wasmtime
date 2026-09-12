@@ -1,10 +1,15 @@
-## 47.0.0
+## 50.0.0
 
 Unreleased.
 
 ### Added
 
+- Add `--listenfd` option to `wasmtime serve`, which allows launching wasmtime
+  with sockets inherited from a service manager (e.g. systemd socket units).
+
 ### Changed
+
+- Remove non-functional `listenfd` WASI CLI option.
 
 --------------------------------------------------------------------------------
 
@@ -12,6 +17,9 @@ Release notes for previous releases of Wasmtime can be found on the respective
 release branches of the Wasmtime repository.
 
 <!-- ARCHIVE_START -->
+* [49.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-49.0.0/RELEASES.md)
+* [48.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-48.0.0/RELEASES.md)
+* [47.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-47.0.0/RELEASES.md)
 * [46.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-46.0.0/RELEASES.md)
 * [45.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-45.0.0/RELEASES.md)
 * [44.0.x](https://github.com/bytecodealliance/wasmtime/blob/release-44.0.0/RELEASES.md)
