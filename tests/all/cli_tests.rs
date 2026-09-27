@@ -971,6 +971,7 @@ mod test_programs {
     use std::net::SocketAddr;
     use std::process::{Child, Command, Stdio};
     use std::thread::{self, JoinHandle};
+    use std::time::Duration;
     use test_programs_artifacts::*;
     use tokio::net::TcpStream;
     use wasmtime::{Result, bail, error::Context as _, format_err};
@@ -1423,7 +1424,7 @@ mod test_programs {
         child: Option<Child>,
         stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
         stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
-        addr: SocketAddr,
+        addr: Vec<SocketAddr>,
         shutdown_addr: SocketAddr,
     }
 
@@ -1439,10 +1440,10 @@ mod test_programs {
             let mut cmd = super::get_wasmtime_command()?;
             cmd.arg("serve").arg("--addr=127.0.0.1:0").arg(wasm);
             configure(&mut cmd);
-            Self::spawn(&mut cmd, None)
+            Self::spawn(&mut cmd, 1)
         }
 
-        fn spawn(cmd: &mut Command, inherited_addr: Option<SocketAddr>) -> Result<WasmtimeServe> {
+        fn spawn(cmd: &mut Command, expected_addresses: usize) -> Result<WasmtimeServe> {
             cmd.arg("--shutdown-addr=127.0.0.1:0");
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::piped());
@@ -1474,16 +1475,25 @@ mod test_programs {
                     None => bail!("failed to address from: {line}"),
                 }
             };
+
             let shutdown_addr = read_addr_from_line("Listening for shutdown");
-            let addr = match inherited_addr {
-                Some(addr) => Ok(addr),
-                None => read_addr_from_line("Serving HTTP on"),
-            };
-            let (shutdown_addr, addr) = match (shutdown_addr, addr) {
-                (Ok(a), Ok(b)) => (a, b),
+            let mut addr = Vec::with_capacity(expected_addresses);
+            let mut addr_error = None;
+            for _ in 0..expected_addresses {
+                match read_addr_from_line("Serving HTTP on") {
+                    Ok(a) => addr.push(a),
+                    Err(e) => {
+                        addr_error = Some(e);
+                        break;
+                    }
+                };
+            }
+
+            let (shutdown_addr, addr) = match (shutdown_addr, addr_error) {
+                (Ok(a), None) => (a, addr),
                 // If either failed kill the child and otherwise try to shepherd
                 // along any contextual information we have.
-                (Err(a), _) | (_, Err(a)) => {
+                (Err(a), _) | (_, Some(a)) => {
                     child.kill()?;
                     child.wait()?;
                     stderr.read_to_string(&mut line)?;
@@ -1508,9 +1518,18 @@ mod test_programs {
             })
         }
 
+        fn first_addr(&self) -> &SocketAddr {
+            &self.addr[0]
+        }
+
         /// Completes this server gracefully by printing the output on failure.
         fn finish(mut self) -> Result<(String, String)> {
             self._finish()
+        }
+
+        fn wait(mut self) -> Result<(String, String)> {
+            let child = self.child.take().unwrap();
+            self._wait_with_output(child)
         }
 
         fn _finish(&mut self) -> Result<(String, String)> {
@@ -1530,6 +1549,10 @@ mod test_programs {
             // was already shut down (e.g. panicked or similar), wait for the
             // result here. The result should succeed (e.g. 0 exit status), and
             // if it did then the stdout/stderr are the caller's problem.
+            self._wait_with_output(child)
+        }
+
+        fn _wait_with_output(&mut self, child: Child) -> Result<(String, String)> {
             let mut output = child.wait_with_output()?;
             output.stdout = self.stdout.take().unwrap().join().unwrap()?;
             output.stderr = self.stderr.take().unwrap().join().unwrap()?;
@@ -1579,7 +1602,17 @@ mod test_programs {
             hyper::client::conn::http1::SendRequest<String>,
             tokio::task::JoinHandle<hyper::Result<()>>,
         )> {
-            let tcp = TcpStream::connect(&self.addr)
+            self.start_requests_at(0).await
+        }
+
+        async fn start_requests_at(
+            &self,
+            address: usize,
+        ) -> Result<(
+            hyper::client::conn::http1::SendRequest<String>,
+            tokio::task::JoinHandle<hyper::Result<()>>,
+        )> {
+            let tcp = TcpStream::connect(&self.addr[address])
                 .await
                 .context("failed to connect")?;
             let tcp = wasmtime_wasi_http::io::TokioIo::new(tcp);
@@ -1804,9 +1837,9 @@ mod test_programs {
             super::get_wasmtime_command()?
                 .arg("serve")
                 .arg("-Scli")
-                .arg(format!("--addr={}", server.addr))
+                .arg(format!("--addr={}", server.first_addr()))
                 .arg(wasm),
-            None,
+            1,
         )
         .err()
         .expect("server spawn should have failed but it succeeded");
@@ -1829,7 +1862,7 @@ mod test_programs {
         let server = WasmtimeServe::new(wasm, |cmd| {
             cmd.arg("-Scli");
         })?;
-        let addr = server.addr;
+        let addr = *server.first_addr();
 
         // Start up a `send` and `conn_task` which represents a connection to
         // this server.
@@ -1864,7 +1897,7 @@ mod test_programs {
                 .arg("-Scli")
                 .arg(format!("--addr={addr}"))
                 .arg(wasm),
-            None,
+            1,
         )?;
 
         Ok(())
@@ -2553,9 +2586,13 @@ start a print 1234
     #[cfg(unix)]
     #[tokio::test]
     async fn serve_inherit() -> Result<()> {
+        use rustix::fd::AsRawFd;
+        use std::mem::ManuallyDrop;
+        use std::net::TcpListener;
         use std::os::fd::{FromRawFd, OwnedFd};
+        use std::os::unix::net::UnixListener;
         use std::os::unix::process::CommandExt;
-        use tokio::net::TcpListener;
+        use tokio::net::UnixStream;
 
         // We can't easily inherit file descriptors to emulators like QEMU, so skip this test for
         // cross-compiled setups.
@@ -2563,14 +2600,35 @@ start a print 1234
             return Ok(());
         }
 
-        let socket = TcpListener::bind("localhost:0").await?;
-        let addr = socket.local_addr()?;
+        // This socket is required to be inherited to the child process as fd 3.
+        // This is done with a `dup2` below. If this socket is itself 3,
+        // however, then the `dup2` will be a noop. This `socket` is CLOEXEC,
+        // however, so if `dup2` is a noop then nothing will be inherited. Force
+        // this socket to NOT be fd 3 in this case by `dup`-ing it.
+        let tcp_socket = {
+            let mut socket = TcpListener::bind("localhost:0")?;
+            if socket.as_raw_fd() == 3 {
+                socket = socket.try_clone()?;
+                assert!(socket.as_raw_fd() != 3);
+            }
+            socket.set_nonblocking(true)?;
+            socket
+        };
+
+        let addr = tcp_socket.local_addr()?;
+        let (mut unix_socket, unix_path) = tempfile::Builder::new()
+            .make(|path| UnixListener::bind(path))?
+            .into_parts();
+        if unix_socket.as_raw_fd() == 4 {
+            unix_socket = unix_socket.try_clone()?;
+            assert!(unix_socket.as_raw_fd() != 4);
+        }
 
         // Using a shell script as a launcher since that uses exec, allowing us to provide the
         // LISTEN_PID variable.
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
-            .arg(r#"export LISTEN_FDS=1 LISTEN_PID=$$; exec "$@""#)
+            .arg(r#"export LISTEN_FDS=2 LISTEN_PID=$$; exec "$@""#)
             .arg("sh")
             .arg(super::get_wasmtime_path())
             .arg("serve")
@@ -2578,16 +2636,21 @@ start a print 1234
             .arg("--systemd-listenfd")
             .arg(P2_CLI_SERVE_HELLO_WORLD_COMPONENT)
             .env("WASMTIME_CODEGEN_CACHE", "n");
+
         unsafe {
             cmd.pre_exec(move || {
-                let mut target = OwnedFd::from_raw_fd(3);
-                rustix::io::dup2(&socket, &mut target)?;
-                std::mem::forget(target);
+                let mut target_3 = ManuallyDrop::new(OwnedFd::from_raw_fd(3));
+                let mut target_4 = ManuallyDrop::new(OwnedFd::from_raw_fd(4));
+                rustix::io::dup2(&tcp_socket, &mut target_3)?;
+                rustix::io::dup2(&unix_socket, &mut target_4)?;
                 Ok(())
             });
         }
 
-        let server = WasmtimeServe::spawn(&mut cmd, Some(addr))?;
+        let mut server = WasmtimeServe::spawn(&mut cmd, 0)?;
+        server.addr.push(addr);
+        drop(cmd);
+        // Should accept http requests over the TCP socket
         let resp = server
             .send_request(
                 hyper::Request::builder()
@@ -2600,9 +2663,108 @@ start a print 1234
         assert!(resp.status().is_success());
         assert_eq!(resp.body(), "Hello, WASI!");
 
+        // As well as over the unix socket
+        {
+            let unix = wasmtime_wasi_http::io::TokioIo::new(
+                UnixStream::connect(&unix_path).await.with_context(|| {
+                    format!(
+                        "failed to connect to unix socket at {}",
+                        unix_path.display()
+                    )
+                })?,
+            );
+            let (mut send, conn) = hyper::client::conn::http1::handshake(unix)
+                .await
+                .context("failed http handshake")?;
+            let conn_task = tokio::task::spawn(conn);
+
+            let resp = WasmtimeServe::send_request_with(
+                &mut send,
+                hyper::Request::builder()
+                    .uri("http://localhost/")
+                    .body(String::new())
+                    .context("failed to make request")?,
+            )
+            .await?;
+
+            assert!(resp.status().is_success());
+            assert_eq!(resp.body(), "Hello, WASI!");
+
+            drop(send);
+            conn_task.await??;
+        }
+
         let (_, stderr) = server.finish()?;
         assert!(stderr.contains("Serving HTTP on inherited socket"));
+        drop(unix_path);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serve_multiple_addresses() -> Result<()> {
+        let server = WasmtimeServe::spawn(
+            super::get_wasmtime_command()?
+                .arg("serve")
+                .arg("-Scli")
+                .arg("--addr=127.0.0.1:0")
+                .arg("--addr=127.0.0.1:0")
+                .arg(P2_CLI_SERVE_HELLO_WORLD_COMPONENT),
+            2,
+        )?;
+        assert_eq!(server.addr.len(), 2);
+        assert_ne!(server.addr[0], server.addr[1]);
+
+        // Should accept http requests on each address.
+        for i in 0..server.addr.len() {
+            let (mut send, conn_task) = server.start_requests_at(i).await?;
+            let resp = WasmtimeServe::send_request_with(
+                &mut send,
+                hyper::Request::builder()
+                    .uri("http://localhost/")
+                    .body(String::new())
+                    .context("failed to make request")?,
+            )
+            .await?;
+
+            assert!(resp.status().is_success());
+            assert_eq!(resp.body(), "Hello, WASI!");
+
+            drop(send);
+            conn_task.await??;
+        }
+
+        server.finish()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serve_idle_process_timeout() -> Result<()> {
+        let server = WasmtimeServe::new(P2_CLI_SERVE_HELLO_WORLD_COMPONENT, |cmd| {
+            cmd.arg("-Scli").arg("--idle-process-timeout=100ms");
+        })?;
+
+        let request = || {
+            hyper::Request::builder()
+                .uri("http://localhost/")
+                .body(String::new())
+                .context("failed to make request")
+        };
+
+        let (mut send, conn_task) = server.start_requests().await?;
+        let resp = WasmtimeServe::send_request_with(&mut send, request()?).await?;
+        assert_eq!(resp.body(), "Hello, WASI!");
+
+        // An open connection, even when idle, keeps the process alive.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let resp = WasmtimeServe::send_request_with(&mut send, request()?).await?;
+        assert_eq!(resp.body(), "Hello, WASI!");
+
+        // Once the connection is closed the process exits.
+        drop(send);
+        conn_task.await??;
+        server.wait()?;
         Ok(())
     }
 
@@ -2929,7 +3091,7 @@ start a print 1234
             let _ = tx.send(res);
         });
 
-        let buf = match rx.recv_timeout(std::time::Duration::from_secs(100)) {
+        let buf = match rx.recv_timeout(Duration::from_secs(100)) {
             Ok(Ok(buf)) => buf,
             Ok(Err(e)) => {
                 let _ = child.kill();
@@ -3873,6 +4035,28 @@ fn compile_time_builtins_compile_subcommand() -> Result<()> {
         "--allow-precompiled",
         cwasm.to_str().unwrap(),
     ])?;
+    Ok(())
+}
 
+#[test]
+fn hostcall_fuel() -> Result<()> {
+    for func in ["f1()", "f2()", "f3()", "f4()", "f5()", "f6()", "f7()"] {
+        run_wasmtime(&[
+            "--invoke",
+            func,
+            "tests/all/cli_tests/hostcall_fuel.wat",
+            func,
+        ])?;
+        assert!(
+            run_wasmtime(&[
+                "-Shostcall-fuel=1000",
+                "--invoke",
+                func,
+                "tests/all/cli_tests/hostcall_fuel.wat",
+                func,
+            ])
+            .is_err()
+        );
+    }
     Ok(())
 }

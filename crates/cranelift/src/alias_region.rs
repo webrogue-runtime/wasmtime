@@ -19,16 +19,16 @@
 //! We strive to avoid adding new hand-written methods as much as possible.
 
 use crate::translate::Load;
-use core::fmt;
 use cranelift_codegen::{
     cursor::FuncCursor,
     ir::{self, InstBuilder as _},
 };
+use std::collections::HashMap;
 use std::hash::{Hash as _, Hasher};
 use wasmtime_environ::{
     BuiltinFunctionIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, GetPtrSize,
-    ModuleInternedTypeIndex, NUM_COMPONENT_CONTEXT_SLOTS, PtrSize as _, RuntimeDataIndex,
-    StaticModuleIndex, VMOffsets, VmctxArrayIndex as _,
+    ModuleInternedTypeIndex, ModuleTypesBuilder, NUM_COMPONENT_CONTEXT_SLOTS, PtrSize as _,
+    RuntimeDataIndex, StaticModuleIndex, VMOffsets, VmctxArrayIndex as _, WasmCompositeInnerType,
     component::{
         ComponentBuiltinFunctionIndex, LoweredIndex, ResourceIndex, RuntimeCallbackIndex,
         RuntimeComponentInstanceIndex, RuntimeMemoryIndex, RuntimePostReturnIndex,
@@ -80,13 +80,18 @@ enum VmType {
     BuiltinFunctionsArray,
     ComponentBuiltinFunctionsArray,
     HostValRaw,
+    VMPayloads,
+    VMRawContObj,
+    VMGcHeader,
+    VMDrcHeader,
+    VMCopyingHeader,
 }
 
 /// A key that uniquely identifies an alias region across an entire compilation.
 ///
 /// This is used to assign stable `user_id`s to `AliasRegionData` entries so
 /// that alias regions can be deduplicated during inlining.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum AliasRegionKey {
     /// An access of a field within a VM data structure of type `ty`.
     Vm {
@@ -133,8 +138,30 @@ enum AliasRegionKey {
         index: DefinedGlobalIndex,
     },
 
-    /// A GC heap access.
-    GcHeap,
+    /// An access of a GC array's `length` word.
+    GcArrayLength,
+
+    /// An access of a GC struct's field.
+    GcStructField {
+        /// The first supertype that introduced this field.
+        ty: ModuleInternedTypeIndex,
+        /// The index of the field being accessed.
+        field: u32,
+    },
+
+    /// An access of a GC array's elements, which all share one region.
+    GcArrayElements {
+        /// The first supertype that introduced these elements.
+        ty: ModuleInternedTypeIndex,
+    },
+
+    /// An access of an exception object's payload field.
+    GcExnPayload {
+        /// The exception type.
+        exn_ty: ModuleInternedTypeIndex,
+        /// The payload field being accessed.
+        field: u32,
+    },
 
     /// A stack slot access.
     Stack {
@@ -156,6 +183,12 @@ enum AliasRegionKey {
 
     /// An access of the bytes inside a data segment.
     DataSegment,
+
+    /// An access of an exception object's tag-instance word.
+    GcExnTagInstance,
+
+    /// An access of an exception object's tag-defined word.
+    GcExnTagDefined,
 }
 
 impl AliasRegionKey {
@@ -265,29 +298,47 @@ impl AliasRegionKey {
     }
 }
 
-impl fmt::Debug for AliasRegionKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AliasRegionKey::Vm { ty, offset } => write!(f, "{ty:?}+{offset:#x}"),
-            AliasRegionKey::PublicMemory => write!(f, "PublicMemory"),
-            AliasRegionKey::DefinedMemory { module, index } => {
-                write!(f, "DefinedMemory({module:?}, {index:?})")
-            }
-            AliasRegionKey::PublicTable => write!(f, "PublicTable"),
-            AliasRegionKey::DefinedTable { module, index } => {
-                write!(f, "DefinedTable({module:?}, {index:?})")
-            }
-            AliasRegionKey::PublicGlobal => write!(f, "PublicGlobal"),
-            AliasRegionKey::DefinedGlobal { module, index } => {
-                write!(f, "DefinedGlobal({module:?}, {index:?})")
-            }
-            AliasRegionKey::GcHeap => write!(f, "GcHeap"),
-            AliasRegionKey::Stack { slot } => write!(f, "Stack({slot:?})"),
-            AliasRegionKey::UnsafeIntrinsicMemory => write!(f, "UnsafeIntrinsicMemory"),
-            AliasRegionKey::ElementSegment => write!(f, "ElementSegment"),
-            AliasRegionKey::DataSegment => write!(f, "DataSegment"),
-        }
-    }
+/// Which logical part of a GC object an access targets.
+#[derive(Clone, Copy, Debug)]
+pub enum GcAccess {
+    /// An access of a struct's field, by the type at the access site.
+    StructField {
+        ty: ModuleInternedTypeIndex,
+        field: u32,
+    },
+
+    /// An access of one of an array's elements, by the type at the access site.
+    ArrayElements { ty: ModuleInternedTypeIndex },
+
+    /// An access of an exception object's payload field.
+    ExnPayload {
+        exn_ty: ModuleInternedTypeIndex,
+        field: u32,
+    },
+
+    /// An access of `VMGcHeader::kind` or the reserved bits packed into it.
+    HeaderKind,
+
+    /// An access of `VMGcHeader::ty`.
+    HeaderTypeIndex,
+
+    /// An access of `VMDrcHeader::ref_count`.
+    DrcRefCount,
+
+    /// An access of `VMDrcHeader::next_over_approximated_stack_root`.
+    DrcNextOverApproximatedStackRoot,
+
+    /// An access of `VMCopyingHeader::object_size`.
+    CopyingObjectSize,
+
+    /// An access of an array's `length` word.
+    ArrayLength,
+
+    /// An access of an exception object's tag-instance word.
+    ExnTagInstance,
+
+    /// An access of an exception object's tag-defined word.
+    ExnTagDefined,
 }
 
 /// Alias region bookkeeping and load/store helper type.
@@ -298,6 +349,10 @@ impl fmt::Debug for AliasRegionKey {
 pub struct AliasRegions<Offsets> {
     pointer_type: ir::Type,
     offsets: Offsets,
+
+    /// Cache for `Self::gc_introducer`, keyed on the access site's type and the
+    /// field index, if any.
+    gc_introducer_cache: HashMap<(ModuleInternedTypeIndex, u32), ModuleInternedTypeIndex>,
 }
 
 impl<Offsets> AliasRegions<Offsets> {
@@ -1132,6 +1187,7 @@ where
             pointer_type: ir::Type::int_with_byte_size(offsets.get_ptr_size().size().into())
                 .unwrap(),
             offsets,
+            gc_introducer_cache: HashMap::new(),
         }
     }
 
@@ -1146,9 +1202,86 @@ where
         self.offsets.get_ptr_size()
     }
 
-    /// Get the alias region for accesses into the GC heap.
-    pub fn gc_heap_region(&mut self, func: &mut ir::Function) -> ir::AliasRegion {
-        self.region(func, AliasRegionKey::GcHeap)
+    /// Get the alias region for the given GC object access.
+    pub fn gc_access_region(
+        &mut self,
+        func: &mut ir::Function,
+        types: &ModuleTypesBuilder,
+        access: GcAccess,
+    ) -> ir::AliasRegion {
+        let key = match access {
+            GcAccess::HeaderKind => return self.vm_gc_header().kind().region(func),
+            GcAccess::HeaderTypeIndex => return self.vm_gc_header().ty().region(func),
+            GcAccess::DrcRefCount => return self.vm_drc_header().ref_count().region(func),
+            GcAccess::DrcNextOverApproximatedStackRoot => {
+                return self
+                    .vm_drc_header()
+                    .next_over_approximated_stack_root()
+                    .region(func);
+            }
+            GcAccess::CopyingObjectSize => {
+                return self.vm_copying_header().object_size().region(func);
+            }
+
+            GcAccess::ArrayLength => AliasRegionKey::GcArrayLength,
+            GcAccess::ExnTagInstance => AliasRegionKey::GcExnTagInstance,
+            GcAccess::ExnTagDefined => AliasRegionKey::GcExnTagDefined,
+
+            GcAccess::StructField { ty, field } => AliasRegionKey::GcStructField {
+                ty: self.gc_introducer(types, ty, field),
+                field,
+            },
+            GcAccess::ArrayElements { ty } => AliasRegionKey::GcArrayElements {
+                ty: self.gc_introducer(types, ty, 0),
+            },
+            GcAccess::ExnPayload { exn_ty, field } => {
+                AliasRegionKey::GcExnPayload { exn_ty, field }
+            }
+        };
+        self.region(func, key)
+    }
+
+    /// Find the type that introduced the given field (or, for arrays, the
+    /// elements) into `ty`'s subtyping hierarchy, memoizing the answer.
+    fn gc_introducer(
+        &mut self,
+        types: &ModuleTypesBuilder,
+        ty: ModuleInternedTypeIndex,
+        field: u32,
+    ) -> ModuleInternedTypeIndex {
+        if let Some(introducer) = self.gc_introducer_cache.get(&(ty, field)) {
+            return *introducer;
+        }
+
+        let mut introducer = ty;
+        while let Some(supertype) = types[introducer].supertype {
+            let supertype = supertype.unwrap_module_type_index();
+
+            let supertype_declares_field = match &types[supertype].composite_type.inner {
+                // Subtyping a struct can only append new fields, so we need
+                // only look at the field length.
+                WasmCompositeInnerType::Struct(s) => field < u32::try_from(s.fields.len()).unwrap(),
+
+                // Array elements are always introduced by the first type
+                // without a supertype.
+                WasmCompositeInnerType::Array(_) => true,
+
+                inner @ WasmCompositeInnerType::Func(_)
+                | inner @ WasmCompositeInnerType::Cont(_)
+                | inner @ WasmCompositeInnerType::Exn(_) => {
+                    unreachable!("not a GC type with subtyping: {inner:?}")
+                }
+            };
+
+            if supertype_declares_field {
+                introducer = supertype;
+            } else {
+                break;
+            }
+        }
+
+        self.gc_introducer_cache.insert((ty, field), introducer);
+        introducer
     }
 
     /// Get the alias region shared by all memories that cross a module boundary
@@ -1492,6 +1625,65 @@ pub(crate) fn debug_assert_all_mem_insts_have_alias_regions(func: &ir::Function)
                         func.dfg.display_inst(inst),
                     );
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collisions are sound and only cost an optimization, so this is not a
+    /// correctness test: it exists so that anything reshuffling the key hashes
+    /// says so here rather than as `tests/disas` diffs where two regions have
+    /// quietly merged. If it fires, find a new `SEED` as described on
+    /// `into_raw`, additionally covering the keys below.
+    #[test]
+    fn gc_keys_do_not_collide() {
+        let ty = ModuleInternedTypeIndex::from_u32;
+
+        let mut keys = vec![
+            AliasRegionKey::GcArrayLength,
+            AliasRegionKey::GcExnTagInstance,
+            AliasRegionKey::GcExnTagDefined,
+            AliasRegionKey::Vm {
+                ty: VmType::VMGcHeader,
+                offset: 0,
+            },
+            AliasRegionKey::Vm {
+                ty: VmType::VMGcHeader,
+                offset: 4,
+            },
+            AliasRegionKey::Vm {
+                ty: VmType::VMDrcHeader,
+                offset: 8,
+            },
+            AliasRegionKey::Vm {
+                ty: VmType::VMDrcHeader,
+                offset: 16,
+            },
+            AliasRegionKey::Vm {
+                ty: VmType::VMCopyingHeader,
+                offset: 8,
+            },
+        ];
+        for t in 0..3 {
+            for field in 0..2 {
+                keys.push(AliasRegionKey::GcStructField { ty: ty(t), field });
+            }
+            keys.push(AliasRegionKey::GcArrayElements { ty: ty(t) });
+        }
+
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(
+                    a.into_raw(),
+                    b.into_raw(),
+                    "alias region keys {a:?} and {b:?} collide on \
+                     user_id {}; a new `SEED` is needed",
+                    a.into_raw(),
+                );
             }
         }
     }

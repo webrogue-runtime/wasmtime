@@ -107,6 +107,7 @@ pin-project-lite = { workspace = true, optional = true }
 rustix = { workspace = true, features = ["mm", "process"] }
 
 [dev-dependencies]
+backtrace = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 filecheck = { workspace = true }
@@ -448,7 +449,7 @@ semver = { version = "1.0.27", default-features = false }
 ittapi = "0.4.0"
 libm = "0.2.16"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-native-tls = "0.3.1"
 native-tls = "0.2.11"
 tokio-openssl = "0.6.5"
@@ -596,7 +597,7 @@ profiling = ["wasmtime/profiling", "wasmtime/call-hook"]
 coredump = ["wasmtime-cli-flags/coredump"]
 addr2line = ["wasmtime/addr2line"]
 debug-builtins = ["wasmtime/debug-builtins"]
-threads = ["wasmtime-cli-flags/threads"]
+threads = ["wasmtime-cli-flags/threads", "wasmtime-debugger?/threads"]
 gc = ["wasmtime-cli-flags/gc", "wasmtime/gc"]
 gc-drc = ["gc", "wasmtime/gc-drc", "wasmtime-cli-flags/gc-drc"]
 gc-null = ["gc", "wasmtime/gc-null", "wasmtime-cli-flags/gc-null"]

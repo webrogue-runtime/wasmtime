@@ -938,7 +938,7 @@ impl Config {
     /// programs to implement some recursive algorithms with *O(1)* stack space
     /// usage.
     ///
-    /// This is `true` by default except when the Winch compiler is enabled.
+    /// This is `true` by default.
     ///
     /// [WebAssembly tail calls proposal]: https://github.com/WebAssembly/tail-call
     pub fn wasm_tail_call(&mut self, enable: bool) -> &mut Self {
@@ -982,6 +982,27 @@ impl Config {
     /// [WebAssembly custom-page-sizes proposal]: https://github.com/WebAssembly/custom-page-sizes
     pub fn wasm_custom_page_sizes(&mut self, enable: bool) -> &mut Self {
         self.wasm_features(WasmFeatures::CUSTOM_PAGE_SIZES, enable);
+        self
+    }
+
+    /// Configures whether the WebAssembly compact imports proposal is enabled.
+    ///
+    /// The [WebAssembly compact import section proposal]
+    /// adds two compact encodings for imports:
+    /// - A module name and a list of `(item name, type)` pairs
+    /// - A module name, a type, and a list of item names
+    ///
+    /// This reduces redundant module and type listings, and can
+    /// reduce WebAssembly file size, especially in files with many
+    /// repeated imports.
+    ///
+    /// When enabled, compact imports are accepted in binary and text-format inputs.
+    ///
+    /// This feature is `false` by default.
+    ///
+    /// [WebAssembly compact import section proposal]: https://github.com/WebAssembly/compact-import-section
+    pub fn wasm_compact_imports(&mut self, enable: bool) -> &mut Self {
+        self.wasm_features(WasmFeatures::COMPACT_IMPORTS, enable);
         self
     }
 
@@ -1396,6 +1417,16 @@ impl Config {
     #[cfg(feature = "component-model")]
     pub fn wasm_component_model_implements(&mut self, enable: bool) -> &mut Self {
         self.wasm_features(WasmFeatures::CM_IMPLEMENTS, enable);
+        self
+    }
+
+    /// This corresponds to the 🔗 emoji in the component model specification.
+    ///
+    /// Please note that Wasmtime's support for this feature is a work in
+    /// progress.
+    #[cfg(feature = "component-model")]
+    pub fn wasm_component_model_canonical_names(&mut self, enable: bool) -> &mut Self {
+        self.wasm_features(WasmFeatures::CM_CANON_NAMES, enable);
         self
     }
 
@@ -2422,6 +2453,7 @@ impl Config {
             | WasmFeatures::SHARED_EVERYTHING_THREADS
             | WasmFeatures::COMPONENT_MODEL
             | WasmFeatures::CUSTOM_PAGE_SIZES
+            | WasmFeatures::COMPACT_IMPORTS
             | WasmFeatures::STACK_SWITCHING
             | WasmFeatures::WIDE_ARITHMETIC
             | WasmFeatures::CM_ASYNC
@@ -2433,7 +2465,8 @@ impl Config {
             | WasmFeatures::CM_MAP
             | WasmFeatures::CM64
             | WasmFeatures::CM_FIXED_LENGTH_LISTS
-            | WasmFeatures::CM_IMPLEMENTS;
+            | WasmFeatures::CM_IMPLEMENTS
+            | WasmFeatures::CM_CANON_NAMES;
 
         #[allow(unused_mut, reason = "easier to avoid #[cfg]")]
         let mut unsupported = !features_known_to_wasmtime;
@@ -2474,7 +2507,6 @@ impl Config {
                 unsupported |= WasmFeatures::GC
                     | WasmFeatures::FUNCTION_REFERENCES
                     | WasmFeatures::RELAXED_SIMD
-                    | WasmFeatures::TAIL_CALL
                     | WasmFeatures::LEGACY_EXCEPTIONS
                     | WasmFeatures::STACK_SWITCHING;
 
@@ -2656,6 +2688,12 @@ impl Config {
         };
 
         let mut tunables = Tunables::default_for_target(&self.compiler_target())?;
+
+        // Stack switching is emitted inline in compiled Wasm. In
+        // ASan-enabled builds the compiler must arrange the
+        // corresponding fiber switch handshake around every such
+        // instruction.
+        tunables.asan_stack_switching = cfg!(asan);
 
         // By default this is enabled with the Cargo feature, and if the feature
         // is missing this is disabled.

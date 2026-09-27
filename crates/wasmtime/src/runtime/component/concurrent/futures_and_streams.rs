@@ -1,6 +1,6 @@
 use super::table::{TableDebug, TableId};
 use super::{Event, GlobalErrorContextRefCount, Waitable, WaitableCommon};
-use crate::component::concurrent::{ConcurrentState, QualifiedThreadId, WaitReason, WorkItem, tls};
+use crate::component::concurrent::{ConcurrentState, QualifiedThreadId, WorkItem, tls};
 use crate::component::func::{self, LiftContext, LowerContext};
 use crate::component::matching::InstanceType;
 use crate::component::types;
@@ -3509,10 +3509,6 @@ impl Instance {
             bail!(Trap::ConcurrentFutureStreamOp);
         };
 
-        if done {
-            bail!("cannot write after being notified that the readable end dropped");
-        }
-
         *state = TransmitLocalState::Busy;
         let transmit_handle = TableId::<TransmitHandle>::new(rep);
         let concurrent_state = store.0.concurrent_state_mut()?;
@@ -3523,8 +3519,11 @@ impl Instance {
             transmit.read
         );
 
-        if transmit.done {
-            bail!("cannot write to future after previous write succeeded or readable end dropped");
+        if done || transmit.done {
+            bail!(match ty {
+                TransmitIndex::Future(_) => Trap::WriteToDroppedFuture,
+                TransmitIndex::Stream(_) => Trap::WriteToDroppedStream,
+            });
         }
 
         let new_state = if let ReadState::Dropped = &transmit.read {
@@ -3592,6 +3591,7 @@ impl Instance {
                 // read).
                 // ```
 
+                let write_count = count;
                 let write_complete = count == 0 || read_count > 0;
                 let read_complete = count > 0;
                 let read_buffer_remaining = count < read_count;
@@ -3645,7 +3645,7 @@ impl Instance {
                 // zero-length rendezvous case this specifically won't execute
                 // the `read_complete` logic above, which is intentional, as the
                 // reader remains blocked.
-                if read_buffer_remaining || (count == 0 && read_count == 0) {
+                if read_buffer_remaining || (write_count == 0 && read_count == 0) {
                     let transmit = concurrent_state.get_mut(transmit_id)?;
                     transmit.read = ReadState::GuestReady {
                         ty: read_ty,
@@ -3711,6 +3711,20 @@ impl Instance {
                     transmit.done = true;
                 }
 
+                match Waitable::Transmit(transmit_handle).take_event(concurrent_state)? {
+                    Some(
+                        Event::StreamWrite {
+                            code: ReturnCode::Dropped(ItemCount::ZERO),
+                            ..
+                        }
+                        | Event::FutureWrite {
+                            code: ReturnCode::Dropped(ItemCount::ZERO),
+                            ..
+                        },
+                    ) => {}
+                    event => bail_bug!("expected pending dropped event for writer; got {event:?}"),
+                }
+
                 ReturnCode::Dropped(ItemCount::ZERO)
             }
         };
@@ -3754,10 +3768,6 @@ impl Instance {
             bail!(Trap::ConcurrentFutureStreamOp);
         };
 
-        if done {
-            bail!("cannot read after being notified that the writable end dropped");
-        }
-
         *state = TransmitLocalState::Busy;
         let transmit_handle = TableId::<TransmitHandle>::new(rep);
         let caller_thread = store.0.current_guest_thread()?;
@@ -3769,8 +3779,13 @@ impl Instance {
             transmit.write
         );
 
-        if transmit.done {
-            bail!("cannot read from future after previous read succeeded");
+        if done || transmit.done {
+            match ty {
+                TransmitIndex::Future(_) => {
+                    bail!("cannot read from future after previous read succeeded")
+                }
+                TransmitIndex::Stream(_) => bail!(Trap::ReadFromDroppedStream),
+            }
         }
 
         let new_state = if let WriteState::Dropped = &transmit.write {
@@ -3937,7 +3952,23 @@ impl Instance {
                 ReturnCode::Blocked
             }
 
-            WriteState::Dropped => ReturnCode::Dropped(ItemCount::ZERO),
+            WriteState::Dropped => {
+                if let TransmitIndex::Future(_) = ty {
+                    bail_bug!(
+                        "should not be possible to read from a future whose write end was dropped"
+                    );
+                }
+
+                match Waitable::Transmit(transmit_handle).take_event(concurrent_state)? {
+                    Some(Event::StreamRead {
+                        code: ReturnCode::Dropped(ItemCount::ZERO),
+                        ..
+                    }) => {}
+                    event => bail_bug!("expected pending dropped event for reader; got {event:?}"),
+                }
+
+                ReturnCode::Dropped(ItemCount::ZERO)
+            }
         };
 
         if result == ReturnCode::Blocked && !self.options(store.0, options).async_ {
@@ -3968,7 +3999,7 @@ impl Instance {
         handle: TableId<TransmitHandle>,
     ) -> Result<ReturnCode> {
         let waitable = Waitable::Transmit(handle);
-        store.wait_for_event(self.runtime_instance(caller), waitable, WaitReason::Other)?;
+        store.wait_for_event(self.runtime_instance(caller), waitable)?;
         let event = waitable.take_event(store.concurrent_state_mut()?)?;
         if let Some(event @ (Event::StreamWrite { code, .. } | Event::FutureWrite { code, .. })) =
             event
@@ -4061,7 +4092,7 @@ impl Instance {
         handle: TableId<TransmitHandle>,
     ) -> Result<ReturnCode> {
         let waitable = Waitable::Transmit(handle);
-        store.wait_for_event(self.runtime_instance(caller), waitable, WaitReason::Other)?;
+        store.wait_for_event(self.runtime_instance(caller), waitable)?;
         let event = waitable.take_event(store.concurrent_state_mut()?)?;
         if let Some(event @ (Event::StreamRead { code, .. } | Event::FutureRead { code, .. })) =
             event
@@ -4621,7 +4652,10 @@ fn lift_index_to_transmit(
 
     let state = future.state;
     if concurrent_state.get_mut(state)?.done {
-        bail!("cannot lift {desc} after previous read succeeded");
+        match ty {
+            TransmitIndex::Future(_) => bail!("cannot lift {desc} after previous read succeeded"),
+            TransmitIndex::Stream(_) => bail!(Trap::LiftDroppedStream),
+        };
     }
 
     Ok(id)
@@ -4837,6 +4871,31 @@ impl Waitable {
         instance: Instance,
         event: Event,
     ) -> Result<()> {
+        if let Event::FutureRead {
+            code: ReturnCode::Dropped(_),
+            ..
+        }
+        | Event::FutureWrite {
+            code: ReturnCode::Dropped(_),
+            ..
+        }
+        | Event::StreamRead {
+            code: ReturnCode::Dropped(_),
+            ..
+        }
+        | Event::StreamWrite {
+            code: ReturnCode::Dropped(_),
+            ..
+        } = event
+        {
+            let Waitable::Transmit(transmit_handle) = self else {
+                bail_bug!("unexpected `{event:?}` for `{self:?}`");
+            };
+            let state = store.concurrent_state_mut()?;
+            let transmit_id = state.get_mut(*transmit_handle)?.state;
+            state.get_mut(transmit_id)?.done = true;
+        }
+
         let instance = instance.id().get_mut(store);
         let (rep, state, code) = match event {
             Event::FutureRead {

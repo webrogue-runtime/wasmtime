@@ -41,6 +41,7 @@ pub struct OpenOptions {
     pub(crate) rsync: bool,
     #[cfg(not(windows))]
     pub(crate) nonblock: bool,
+    #[cfg(not(windows))]
     pub(crate) readdir_required: bool,
     pub(crate) follow: FollowSymlinks,
 
@@ -52,7 +53,6 @@ impl OpenOptions {
     /// Creates a blank new set of options ready for configuration.
     ///
     /// This corresponds to [`std::fs::OpenOptions::new`].
-    #[allow(clippy::new_without_default)]
     #[inline]
     pub const fn new() -> Self {
         Self {
@@ -80,6 +80,7 @@ impl OpenOptions {
             rsync: false,
             #[cfg(not(windows))]
             nonblock: false,
+            #[cfg(not(windows))]
             readdir_required: false,
             follow: FollowSymlinks::Yes,
 
@@ -150,6 +151,7 @@ impl OpenOptions {
 
     /// Sets the option to request the ability to read directory entries.
     #[inline]
+    #[cfg(not(windows))]
     pub(crate) fn readdir_required(&mut self, readdir_required: bool) -> &mut Self {
         self.readdir_required = readdir_required;
         self

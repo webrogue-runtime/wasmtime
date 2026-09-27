@@ -13,17 +13,18 @@ use bytes::BytesMut;
 use core::pin::Pin;
 use core::task::{Context, Poll, ready};
 use core::{iter, mem};
+use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, spawn_blocking};
-use wasmtime::StoreContextMut;
 use wasmtime::component::{
     Access, Accessor, Destination, FutureReader, Resource, ResourceTable, Source, StreamConsumer,
     StreamProducer, StreamReader, StreamResult,
 };
 use wasmtime::error::Context as _;
+use wasmtime::{AsContextMut, StoreContextMut};
 
 fn get_descriptor<'a>(
     table: &'a ResourceTable,
@@ -35,30 +36,112 @@ fn get_descriptor<'a>(
         .map_err(FilesystemError::trap)
 }
 
-trait AccessorExt {
-    fn get_descriptor(&self, fd: &Resource<Descriptor>) -> FilesystemResult<Descriptor>;
+fn get_file<'a>(
+    table: &'a ResourceTable,
+    fd: &'a Resource<Descriptor>,
+) -> FilesystemResult<&'a File> {
+    match get_descriptor(table, fd)? {
+        Descriptor::Host(descriptor) => Ok(descriptor.file()?),
+        Descriptor::Virtual(_) => todo!(),
+    }
 }
 
-impl<T> AccessorExt for Accessor<T, WasiFilesystem> {
-    fn get_descriptor(&self, fd: &Resource<Descriptor>) -> FilesystemResult<Descriptor> {
-        self.with(|mut store| {
-            let fd = get_descriptor(store.get().table, fd)?;
-            Ok(fd.clone())
-        })
+fn get_dir<'a>(
+    table: &'a ResourceTable,
+    fd: &'a Resource<Descriptor>,
+) -> FilesystemResult<&'a Dir> {
+    match get_descriptor(table, fd)? {
+        Descriptor::Host(descriptor) => Ok(descriptor.dir()?),
+        Descriptor::Virtual(_) => todo!(),
+    }
+}
+
+fn get_writable_file(table: &ResourceTable, fd: &Resource<Descriptor>) -> FilesystemResult<File> {
+    let file = get_file(table, fd)?;
+    if file.perms.write_not_permitted() {
+        return Err(ErrorCode::NotPermitted.into());
+    }
+    Ok(file.clone())
+}
+
+impl Descriptor {
+    async fn get_flags(&self) -> Result<filesystem::DescriptorFlags, filesystem::ErrorCode> {
+        match self {
+            Self::Host(descriptor) => descriptor.get_flags().await,
+            Self::Virtual(_) => todo!(),
+        }
+    }
+
+    async fn get_type(&self) -> Result<filesystem::DescriptorType, filesystem::ErrorCode> {
+        match self {
+            Self::Host(descriptor) => descriptor.get_type().await,
+            Self::Virtual(_) => todo!(),
+        }
+    }
+
+    async fn set_times(
+        &self,
+        atim: Option<SystemTime>,
+        mtim: Option<SystemTime>,
+    ) -> Result<(), filesystem::ErrorCode> {
+        match self {
+            Self::Host(descriptor) => descriptor.set_times(atim, mtim).await,
+            Self::Virtual(_) => todo!(),
+        }
+    }
+
+    async fn sync(&self) -> Result<(), filesystem::ErrorCode> {
+        match self {
+            Self::Host(descriptor) => descriptor.sync().await,
+            Self::Virtual(_) => todo!(),
+        }
+    }
+
+    async fn sync_data(&self) -> Result<(), filesystem::ErrorCode> {
+        match self {
+            Self::Host(descriptor) => descriptor.sync_data().await,
+            Self::Virtual(_) => todo!(),
+        }
+    }
+
+    async fn stat(&self) -> Result<filesystem::DescriptorStat, filesystem::ErrorCode> {
+        match self {
+            Self::Host(descriptor) => descriptor.stat().await,
+            Self::Virtual(_) => todo!(),
+        }
+    }
+
+    async fn metadata_hash(&self) -> Result<filesystem::MetadataHashValue, filesystem::ErrorCode> {
+        match self {
+            Self::Host(descriptor) => descriptor.metadata_hash().await,
+            Self::Virtual(_) => todo!(),
+        }
     }
 }
 
 fn systemtime_from(t: system_clock::Instant) -> Result<std::time::SystemTime, ErrorCode> {
-    if let Ok(seconds) = t.seconds.try_into() {
+    if let Ok(seconds) = <i64 as TryInto<u64>>::try_into(t.seconds) {
+        // Catch nanoseconds-into-seconds Overflow error explicitly:
+        // unfortunately, Duration::new panics when input overflows
+        let duration = core::time::Duration::new(
+            seconds
+                .checked_add(u64::from(t.nanoseconds / 1_000_000_000))
+                .ok_or(ErrorCode::Overflow)?,
+            t.nanoseconds % 1_000_000_000,
+        );
         std::time::SystemTime::UNIX_EPOCH
-            .checked_add(core::time::Duration::new(seconds, t.nanoseconds))
+            .checked_add(duration)
             .ok_or(ErrorCode::Overflow)
     } else {
+        let duration = core::time::Duration::new(
+            t.seconds
+                .unsigned_abs()
+                .checked_add(u64::from(t.nanoseconds / 1_000_000_000))
+                .ok_or(ErrorCode::Overflow)?,
+            t.nanoseconds % 1_000_000_000,
+        );
         std::time::SystemTime::UNIX_EPOCH
-            .checked_sub(core::time::Duration::new(
-                t.seconds.unsigned_abs(),
-                t.nanoseconds,
-            ))
+            .checked_sub(duration)
             .ok_or(ErrorCode::Overflow)
     }
 }
@@ -194,17 +277,83 @@ impl<D> StreamProducer<D> for ReadStreamProducer {
     }
 }
 
+struct VirtualReadStreamProducer {
+    fd: Arc<dyn VirtualDescriptor>,
+    offset: u64,
+    result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
+}
+
+impl Drop for VirtualReadStreamProducer {
+    fn drop(&mut self) {
+        self.close(Ok(()))
+    }
+}
+
+impl VirtualReadStreamProducer {
+    fn close(&mut self, res: Result<(), ErrorCode>) {
+        if let Some(tx) = self.result.take() {
+            _ = tx.send(res);
+        }
+    }
+
+    /// Update the internal `offset` field after reading `amt` bytes from the file.
+    fn complete_read(&mut self, amt: usize) -> StreamResult {
+        let Ok(amt) = amt.try_into() else {
+            self.close(Err(ErrorCode::Overflow));
+            return StreamResult::Dropped;
+        };
+        let Some(amt) = self.offset.checked_add(amt) else {
+            self.close(Err(ErrorCode::Overflow));
+            return StreamResult::Dropped;
+        };
+        self.offset = amt;
+        StreamResult::Completed
+    }
+}
+
+impl<D> StreamProducer<D> for VirtualReadStreamProducer {
+    type Item = u8;
+    type Buffer = BytesMut;
+
+    fn poll_produce<'a>(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        dst: Destination<'a, Self::Item, Self::Buffer>,
+        _finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let mut dst = dst.as_direct(store, DEFAULT_BUFFER_CAPACITY);
+        let buf = dst.remaining();
+        if buf.is_empty() {
+            return Poll::Ready(Ok(StreamResult::Completed));
+        }
+        match self.fd.read_at(buf, self.offset) {
+            Ok(0) => {
+                self.close(Ok(()));
+                Poll::Ready(Ok(StreamResult::Dropped))
+            }
+            Ok(n) => {
+                dst.mark_written(n);
+                Poll::Ready(Ok(self.complete_read(n)))
+            }
+            Err(err) => {
+                self.close(Err(err));
+                Poll::Ready(Ok(StreamResult::Dropped))
+            }
+        }
+    }
+}
+
 fn map_dir_entry(
-    entry: std::io::Result<crate::filesystem::primitives::DirEntry>,
+    entry: std::io::Result<(OsString, crate::filesystem::primitives::FileType)>,
 ) -> Result<Option<DirectoryEntry>, ErrorCode> {
     match entry {
-        Ok(entry) => {
-            let meta = entry.metadata()?;
-            let Ok(name) = entry.file_name().into_string() else {
+        Ok((filename, ty)) => {
+            let Ok(name) = filename.into_string() else {
                 return Err(ErrorCode::IllegalByteSequence);
             };
             Ok(Some(DirectoryEntry {
-                type_: meta.file_type().into(),
+                type_: ty.into(),
                 name,
             }))
         }
@@ -241,7 +390,7 @@ impl ReadDirStream {
         let (tx, rx) = mpsc::channel(1);
         ReadDirStream {
             task: spawn_blocking(move || {
-                let entries = crate::filesystem::primitives::read_base_dir(&dir)?;
+                let entries = crate::filesystem::primitives::read_dir(&dir)?;
                 for entry in entries {
                     if let Some(entry) = map_dir_entry(entry)? {
                         if let Err(_) = tx.blocking_send(entry) {
@@ -334,20 +483,14 @@ enum WriteLocation {
 }
 
 impl WriteStreamConsumer {
-    fn new_at(file: File, offset: u64, result: oneshot::Sender<Result<(), ErrorCode>>) -> Self {
+    fn new(
+        file: File,
+        location: WriteLocation,
+        result: oneshot::Sender<Result<(), ErrorCode>>,
+    ) -> Self {
         Self {
             file,
-            location: WriteLocation::Offset(offset),
-            result: Some(result),
-            buffer: BytesMut::default(),
-            task: None,
-        }
-    }
-
-    fn new_append(file: File, result: oneshot::Sender<Result<(), ErrorCode>>) -> Self {
-        Self {
-            file,
-            location: WriteLocation::End,
+            location,
             result: Some(result),
             buffer: BytesMut::default(),
             task: None,
@@ -469,76 +612,419 @@ impl types::Host for WasiFilesystemCtxView<'_> {
     }
 }
 
-struct VirtualReadStreamProducer {
-    fd: Arc<dyn VirtualDescriptor>,
-    offset: u64,
-    result: Option<
-        tokio::sync::oneshot::Sender<Result<(), crate::p3::bindings::filesystem::types::ErrorCode>>,
-    >,
+fn read_via_stream(
+    mut store: impl AsContextMut,
+    fd: Descriptor,
+    offset: Filesize,
+) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
+    let mut store = store.as_context_mut();
+    let file = match fd {
+        Descriptor::Host(HostDescriptor::File(file)) => file,
+        Descriptor::Host(HostDescriptor::Dir(_)) => {
+            return Ok((
+                StreamReader::new(&mut store, iter::empty())?,
+                FutureReader::new(&mut store, async move {
+                    wasmtime::error::Ok(Err(ErrorCode::IsDirectory))
+                })?,
+            ));
+        }
+        Descriptor::Virtual(fd) => {
+            if fd.is_dir() {
+                return Ok((
+                    StreamReader::new(&mut store, iter::empty())?,
+                    FutureReader::new(&mut store, async move {
+                        wasmtime::error::Ok(Err(ErrorCode::IsDirectory))
+                    })?,
+                ));
+            }
+            let (result_tx, result_rx) = oneshot::channel();
+            return Ok((
+                StreamReader::new(
+                    &mut store,
+                    VirtualReadStreamProducer {
+                        fd,
+                        offset,
+                        result: Some(result_tx),
+                    },
+                )?,
+                FutureReader::new(&mut store, result_rx)?,
+            ));
+        }
+    };
+    let (result_tx, result_rx) = oneshot::channel();
+    Ok((
+        StreamReader::new(
+            &mut store,
+            ReadStreamProducer {
+                file,
+                offset,
+                result: Some(result_tx),
+                task: None,
+            },
+        )?,
+        FutureReader::new(&mut store, result_rx)?,
+    ))
 }
 
-impl Drop for VirtualReadStreamProducer {
-    fn drop(&mut self) {
-        self.close(Ok(()))
+fn write_via_stream(
+    mut store: impl AsContextMut,
+    file: FilesystemResult<File>,
+    mut data: StreamReader<u8>,
+    location: WriteLocation,
+) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
+    let mut store = store.as_context_mut();
+    let (result_tx, result_rx) = oneshot::channel();
+    match file {
+        Ok(file) => {
+            data.pipe(
+                &mut store,
+                WriteStreamConsumer::new(file, location, result_tx),
+            )?;
+        }
+        Err(err) => {
+            data.close(&mut store)?;
+            let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+        }
     }
+    FutureReader::new(&mut store, result_rx)
 }
 
-impl VirtualReadStreamProducer {
-    fn close(&mut self, res: Result<(), crate::p3::bindings::filesystem::types::ErrorCode>) {
-        if let Some(tx) = self.result.take() {
-            _ = tx.send(res);
+fn read_directory(
+    mut store: impl AsContextMut,
+    dir: FilesystemResult<Dir>,
+) -> wasmtime::Result<(
+    StreamReader<DirectoryEntry>,
+    FutureReader<Result<(), ErrorCode>>,
+)> {
+    let mut store = store.as_context_mut();
+    let (result_tx, result_rx) = oneshot::channel();
+    let stream = match dir {
+        Ok(dir) => {
+            let allow_blocking_current_thread = dir.allow_blocking_current_thread;
+            let dir = Arc::clone(dir.as_dir());
+            if allow_blocking_current_thread {
+                match crate::filesystem::primitives::read_dir(&dir) {
+                    Ok(readdir) => StreamReader::new(
+                        &mut store,
+                        FallibleIteratorProducer::new(
+                            readdir.filter_map(|e| map_dir_entry(e).transpose()),
+                            result_tx,
+                        ),
+                    )?,
+                    Err(e) => {
+                        let _ = result_tx.send(Err(e.into()));
+                        StreamReader::new(&mut store, iter::empty())?
+                    }
+                }
+            } else {
+                StreamReader::new(&mut store, ReadDirStream::new(dir, result_tx))?
+            }
+        }
+        Err(err) => {
+            let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+            StreamReader::new(&mut store, iter::empty())?
+        }
+    };
+    Ok((stream, FutureReader::new(&mut store, result_rx)?))
+}
+
+impl WasiFilesystemCtxView<'_> {
+    fn advise(
+        &self,
+        fd: &Resource<Descriptor>,
+        offset: Filesize,
+        length: Filesize,
+        advice: Advice,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let file = get_file(self.table, fd).cloned();
+        async move {
+            file?.advise(offset, length, advice.into()).await?;
+            Ok(())
         }
     }
 
-    /// Update the internal `offset` field after reading `amt` bytes from the file.
-    fn complete_read(&mut self, amt: usize) -> StreamResult {
-        let Ok(amt) = amt.try_into() else {
-            self.close(Err(
-                crate::p3::bindings::filesystem::types::ErrorCode::Overflow,
-            ));
-            return StreamResult::Dropped;
-        };
-        let Some(amt) = self.offset.checked_add(amt) else {
-            self.close(Err(
-                crate::p3::bindings::filesystem::types::ErrorCode::Overflow,
-            ));
-            return StreamResult::Dropped;
-        };
-        self.offset = amt;
-        StreamResult::Completed
-    }
-}
-
-impl<D> StreamProducer<D> for VirtualReadStreamProducer {
-    type Item = u8;
-    type Buffer = BytesMut;
-
-    fn poll_produce<'a>(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        store: StoreContextMut<'a, D>,
-        dst: Destination<'a, Self::Item, Self::Buffer>,
-        _finish: bool,
-    ) -> Poll<wasmtime::Result<StreamResult>> {
-        let mut dst = dst.as_direct(store, DEFAULT_BUFFER_CAPACITY);
-        let buf = dst.remaining();
-        if buf.is_empty() {
-            return Poll::Ready(Ok(StreamResult::Completed));
+    fn get_flags(
+        &self,
+        fd: &Resource<Descriptor>,
+    ) -> impl Future<Output = FilesystemResult<DescriptorFlags>> + use<> {
+        let fd = get_descriptor(self.table, fd).cloned();
+        async move {
+            let flags = fd?.get_flags().await?;
+            Ok(flags.into())
         }
-        return match self.fd.read_at(buf, self.offset) {
-            Ok(0) => {
-                self.close(Ok(()));
-                Poll::Ready(Ok(StreamResult::Dropped))
+    }
+
+    fn get_type(
+        &self,
+        fd: &Resource<Descriptor>,
+    ) -> impl Future<Output = FilesystemResult<DescriptorType>> + use<> {
+        let fd = get_descriptor(self.table, fd).cloned();
+        async move {
+            let ty = fd?.get_type().await?;
+            Ok(ty.into())
+        }
+    }
+
+    fn set_size(
+        &self,
+        fd: &Resource<Descriptor>,
+        size: Filesize,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let file = get_file(self.table, fd).cloned();
+        async move {
+            file?.set_size(size).await?;
+            Ok(())
+        }
+    }
+
+    fn set_times(
+        &self,
+        fd: &Resource<Descriptor>,
+        data_access_timestamp: NewTimestamp,
+        data_modification_timestamp: NewTimestamp,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let fd = get_descriptor(self.table, &fd).cloned();
+        async move {
+            let atim = systemtimespec_from(data_access_timestamp)?;
+            let mtim = systemtimespec_from(data_modification_timestamp)?;
+            fd?.set_times(atim, mtim).await?;
+            Ok(())
+        }
+    }
+
+    fn sync(
+        &self,
+        fd: &Resource<Descriptor>,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let fd = get_descriptor(self.table, &fd).cloned();
+        async move {
+            fd?.sync().await?;
+            Ok(())
+        }
+    }
+
+    fn sync_data(
+        &self,
+        fd: &Resource<Descriptor>,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let fd = get_descriptor(self.table, &fd).cloned();
+        async move {
+            fd?.sync_data().await?;
+            Ok(())
+        }
+    }
+
+    fn create_directory_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path: String,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let dir = get_dir(self.table, &fd).cloned();
+        async move {
+            dir?.create_directory_at(path).await?;
+            Ok(())
+        }
+    }
+
+    fn stat(
+        &self,
+        fd: &Resource<Descriptor>,
+    ) -> impl Future<Output = FilesystemResult<DescriptorStat>> + use<> {
+        let fd = get_descriptor(self.table, &fd).cloned();
+        async move {
+            let stat = fd?.stat().await?;
+            Ok(stat.into())
+        }
+    }
+
+    fn stat_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path_flags: PathFlags,
+        path: String,
+    ) -> impl Future<Output = FilesystemResult<DescriptorStat>> + use<> {
+        let dir = get_dir(self.table, &fd).cloned();
+        async move {
+            let stat = dir?.stat_at(path_flags.into(), path).await?;
+            Ok(stat.into())
+        }
+    }
+
+    fn set_times_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path_flags: PathFlags,
+        path: String,
+        data_access_timestamp: NewTimestamp,
+        data_modification_timestamp: NewTimestamp,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let dir = get_dir(self.table, &fd).cloned();
+        async move {
+            let atim = systemtimespec_from(data_access_timestamp)?;
+            let mtim = systemtimespec_from(data_modification_timestamp)?;
+            dir?.set_times_at(path_flags.into(), path, atim, mtim)
+                .await?;
+            Ok(())
+        }
+    }
+
+    fn link_at(
+        &self,
+        old_fd: &Resource<Descriptor>,
+        old_path_flags: PathFlags,
+        old_path: String,
+        new_fd: &Resource<Descriptor>,
+        new_path: String,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let old_dir = get_dir(self.table, old_fd).cloned();
+        let new_dir = get_dir(self.table, new_fd).cloned();
+
+        async move {
+            old_dir?
+                .link_at(old_path_flags.into(), old_path, &new_dir?, new_path)
+                .await?;
+            Ok(())
+        }
+    }
+
+    fn open_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path_flags: PathFlags,
+        path: String,
+        open_flags: OpenFlags,
+        flags: DescriptorFlags,
+    ) -> impl Future<Output = FilesystemResult<Descriptor>> + use<> {
+        let fd = get_descriptor(self.table, fd).cloned();
+        let allow_blocking_current_thread = self.ctx.allow_blocking_current_thread;
+        async move {
+            match fd? {
+                Descriptor::Host(descriptor) => {
+                    let fd = descriptor
+                        .dir()?
+                        .open_at(
+                            path_flags.into(),
+                            path,
+                            open_flags.into(),
+                            flags.into(),
+                            allow_blocking_current_thread,
+                        )
+                        .await?;
+                    Ok(Descriptor::Host(fd))
+                }
+                Descriptor::Virtual(descriptor) => {
+                    if flags.contains(DescriptorFlags::WRITE)
+                        || flags.contains(DescriptorFlags::MUTATE_DIRECTORY)
+                        || flags.contains(DescriptorFlags::REQUESTED_WRITE_SYNC)
+                        || open_flags.contains(OpenFlags::CREATE)
+                    {
+                        return Err(ErrorCode::Unsupported.into());
+                    }
+                    let fd = descriptor.open(&path)?;
+                    Ok(Descriptor::Virtual(fd))
+                }
             }
-            Ok(n) => {
-                dst.mark_written(n);
-                Poll::Ready(Ok(self.complete_read(n)))
+        }
+    }
+
+    fn readlink_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path: String,
+    ) -> impl Future<Output = FilesystemResult<String>> + use<> {
+        let dir = get_dir(self.table, fd).cloned();
+        async move { Ok(dir?.readlink_at(path).await?) }
+    }
+
+    fn remove_directory_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path: String,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let dir = get_dir(self.table, fd).cloned();
+        async move {
+            dir?.remove_directory_at(path).await?;
+            Ok(())
+        }
+    }
+
+    fn rename_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        old_path: String,
+        new_fd: &Resource<Descriptor>,
+        new_path: String,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let old_dir = get_dir(self.table, fd).cloned();
+        let new_dir = get_dir(self.table, new_fd).cloned();
+        async move {
+            old_dir?.rename_at(old_path, &new_dir?, new_path).await?;
+            Ok(())
+        }
+    }
+
+    fn symlink_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        old_path: String,
+        new_path: String,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let dir = get_dir(self.table, fd).cloned();
+        async move {
+            dir?.symlink_at(old_path, new_path).await?;
+            Ok(())
+        }
+    }
+
+    fn unlink_file_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path: String,
+    ) -> impl Future<Output = FilesystemResult<()>> + use<> {
+        let dir = get_dir(self.table, fd).cloned();
+        async move {
+            dir?.unlink_file_at(path).await?;
+            Ok(())
+        }
+    }
+
+    fn is_same_object(
+        &self,
+        fd: &Resource<Descriptor>,
+        other: &Resource<Descriptor>,
+    ) -> impl Future<Output = wasmtime::Result<bool>> + use<> {
+        let fd = get_descriptor(self.table, fd).cloned();
+        let other = get_descriptor(self.table, other).cloned();
+        async move {
+            match (fd?, other?) {
+                (Descriptor::Host(fd), Descriptor::Host(other)) => fd.is_same_object(&other).await,
+                _ => Ok(false),
             }
-            Err(err) => {
-                self.close(Err(err.into()));
-                Poll::Ready(Ok(StreamResult::Dropped))
-            }
-        };
+        }
+    }
+
+    fn metadata_hash(
+        &self,
+        fd: &Resource<Descriptor>,
+    ) -> impl Future<Output = FilesystemResult<MetadataHashValue>> + use<> {
+        let fd = get_descriptor(self.table, fd).cloned();
+        async move {
+            let meta = fd?.metadata_hash().await?;
+            Ok(meta.into())
+        }
+    }
+
+    fn metadata_hash_at(
+        &self,
+        fd: &Resource<Descriptor>,
+        path_flags: PathFlags,
+        path: String,
+    ) -> impl Future<Output = FilesystemResult<MetadataHashValue>> + use<> {
+        let dir = get_dir(self.table, fd).cloned();
+        async move {
+            let meta = dir?.metadata_hash_at(path_flags.into(), path).await?;
+            Ok(meta.into())
+        }
     }
 }
 
@@ -548,116 +1034,27 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         offset: Filesize,
     ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
-        let fd = match get_descriptor(store.get().table, &fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(fd) => {
-                if fd.is_dir() {
-                    return Ok((
-                        StreamReader::new(&mut store, iter::empty())?,
-                        FutureReader::new(&mut store, async move {
-                            wasmtime::error::Ok(Err(ErrorCode::IsDirectory))
-                        })?,
-                    ));
-                }
-                let fd = fd.clone();
-                let (result_tx, result_rx) = oneshot::channel();
-                return Ok((
-                    StreamReader::new(
-                        &mut store,
-                        VirtualReadStreamProducer {
-                            fd,
-                            offset,
-                            result: Some(result_tx),
-                        },
-                    )?,
-                    FutureReader::new(&mut store, result_rx)?,
-                ));
-            }
-        };
-        let file = match fd {
-            HostDescriptor::File(file) => file.clone(),
-            HostDescriptor::Dir(_) => {
-                return Ok((
-                    StreamReader::new(&mut store, iter::empty())?,
-                    FutureReader::new(&mut store, async move {
-                        wasmtime::error::Ok(Err(ErrorCode::IsDirectory))
-                    })?,
-                ));
-            }
-        };
-        let (result_tx, result_rx) = oneshot::channel();
-        Ok((
-            StreamReader::new(
-                &mut store,
-                ReadStreamProducer {
-                    file,
-                    offset,
-                    result: Some(result_tx),
-                    task: None,
-                },
-            )?,
-            FutureReader::new(&mut store, result_rx)?,
-        ))
+        let fd = get_descriptor(store.get().table, &fd)?.clone();
+        read_via_stream(&mut store, fd, offset)
     }
 
     fn write_via_stream(
         mut store: Access<'_, U, Self>,
         fd: Resource<Descriptor>,
-        mut data: StreamReader<u8>,
+        data: StreamReader<u8>,
         offset: Filesize,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let fd = match get_descriptor(store.get().table, &fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let (result_tx, result_rx) = oneshot::channel();
-        match fd.file().and_then(|file| {
-            if file.perms.write_not_permitted() {
-                Err(filesystem::ErrorCode::NotPermitted)
-            } else {
-                Ok(file.clone())
-            }
-        }) {
-            Ok(file) => {
-                data.pipe(
-                    &mut store,
-                    WriteStreamConsumer::new_at(file, offset, result_tx),
-                )?;
-            }
-            Err(err) => {
-                data.close(&mut store)?;
-                let _ = result_tx.send(Err(err.into()));
-            }
-        }
-        FutureReader::new(&mut store, result_rx)
+        let file = get_writable_file(store.get().table, &fd);
+        write_via_stream(&mut store, file, data, WriteLocation::Offset(offset))
     }
 
     fn append_via_stream(
         mut store: Access<'_, U, Self>,
         fd: Resource<Descriptor>,
-        mut data: StreamReader<u8>,
+        data: StreamReader<u8>,
     ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
-        let fd = match get_descriptor(store.get().table, &fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let (result_tx, result_rx) = oneshot::channel();
-        match fd.file().and_then(|file| {
-            if file.perms.write_not_permitted() {
-                Err(filesystem::ErrorCode::NotPermitted)
-            } else {
-                Ok(file.clone())
-            }
-        }) {
-            Ok(file) => {
-                data.pipe(&mut store, WriteStreamConsumer::new_append(file, result_tx))?;
-            }
-            Err(err) => {
-                data.close(&mut store)?;
-                let _ = result_tx.send(Err(err.into()));
-            }
-        }
-        FutureReader::new(&mut store, result_rx)
+        let file = get_writable_file(store.get().table, &fd);
+        write_via_stream(&mut store, file, data, WriteLocation::End)
     }
 
     async fn advise(
@@ -667,49 +1064,30 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         length: Filesize,
         advice: Advice,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let file = fd.file()?;
-        file.advise(offset, length, advice.into()).await?;
-        Ok(())
+        store
+            .with(|mut s| s.get().advise(&fd, offset, length, advice))
+            .await
     }
 
     async fn sync_data(
         store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        fd.sync_data().await?;
-        Ok(())
+        store.with(|mut s| s.get().sync_data(&fd)).await
     }
 
     async fn get_flags(
         store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<DescriptorFlags> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let flags = fd.get_flags().await?;
-        Ok(flags.into())
+        store.with(|mut s| s.get().get_flags(&fd)).await
     }
 
     async fn get_type(
         store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<DescriptorType> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let ty = fd.get_type().await?;
-        Ok(ty.into())
+        store.with(|mut s| s.get().get_type(&fd)).await
     }
 
     async fn set_size(
@@ -717,12 +1095,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         size: Filesize,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        fd.file()?.set_size(size).await?;
-        Ok(())
+        store.with(|mut s| s.get().set_size(&fd, size)).await
     }
 
     async fn set_times(
@@ -731,14 +1104,12 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         data_access_timestamp: NewTimestamp,
         data_modification_timestamp: NewTimestamp,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let atim = systemtimespec_from(data_access_timestamp)?;
-        let mtim = systemtimespec_from(data_modification_timestamp)?;
-        fd.set_times(atim, mtim).await?;
-        Ok(())
+        store
+            .with(|mut s| {
+                s.get()
+                    .set_times(&fd, data_access_timestamp, data_modification_timestamp)
+            })
+            .await
     }
 
     fn read_directory(
@@ -748,48 +1119,12 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         StreamReader<DirectoryEntry>,
         FutureReader<Result<(), ErrorCode>>,
     )> {
-        let fd = match get_descriptor(store.get().table, &fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let (result_tx, result_rx) = oneshot::channel();
-        let stream = match fd.dir() {
-            Ok(dir) => {
-                let allow_blocking_current_thread = dir.allow_blocking_current_thread;
-                let dir = Arc::clone(dir.as_dir());
-                if allow_blocking_current_thread {
-                    match crate::filesystem::primitives::read_base_dir(&dir) {
-                        Ok(readdir) => StreamReader::new(
-                            &mut store,
-                            FallibleIteratorProducer::new(
-                                readdir.filter_map(|e| map_dir_entry(e).transpose()),
-                                result_tx,
-                            ),
-                        )?,
-                        Err(e) => {
-                            let _ = result_tx.send(Err(e.into()));
-                            StreamReader::new(&mut store, iter::empty())?
-                        }
-                    }
-                } else {
-                    StreamReader::new(&mut store, ReadDirStream::new(dir, result_tx))?
-                }
-            }
-            Err(err) => {
-                let _ = result_tx.send(Err(err.into()));
-                StreamReader::new(&mut store, iter::empty())?
-            }
-        };
-        Ok((stream, FutureReader::new(&mut store, result_rx)?))
+        let dir = get_dir(store.get().table, &fd).cloned();
+        read_directory(&mut store, dir)
     }
 
     async fn sync(store: &Accessor<U, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        fd.sync().await?;
-        Ok(())
+        store.with(|mut s| s.get().sync(&fd)).await
     }
 
     async fn create_directory_at(
@@ -797,24 +1132,16 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         path: String,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        fd.dir()?.create_directory_at(path).await?;
-        Ok(())
+        store
+            .with(|mut s| s.get().create_directory_at(&fd, path))
+            .await
     }
 
     async fn stat(
         store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<DescriptorStat> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let stat = fd.stat().await?;
-        Ok(stat.into())
+        store.with(|mut s| s.get().stat(&fd)).await
     }
 
     async fn stat_at(
@@ -823,12 +1150,9 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path_flags: PathFlags,
         path: String,
     ) -> FilesystemResult<DescriptorStat> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let stat = fd.dir()?.stat_at(path_flags.into(), path).await?;
-        Ok(stat.into())
+        store
+            .with(|mut s| s.get().stat_at(&fd, path_flags, path))
+            .await
     }
 
     async fn set_times_at(
@@ -839,16 +1163,17 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         data_access_timestamp: NewTimestamp,
         data_modification_timestamp: NewTimestamp,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let dir = fd.dir()?;
-        let atim = systemtimespec_from(data_access_timestamp)?;
-        let mtim = systemtimespec_from(data_modification_timestamp)?;
-        dir.set_times_at(path_flags.into(), path, atim, mtim)
-            .await?;
-        Ok(())
+        store
+            .with(|mut s| {
+                s.get().set_times_at(
+                    &fd,
+                    path_flags,
+                    path,
+                    data_access_timestamp,
+                    data_modification_timestamp,
+                )
+            })
+            .await
     }
 
     async fn link_at(
@@ -859,20 +1184,12 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         new_fd: Resource<Descriptor>,
         new_path: String,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let new_fd = match store.get_descriptor(&new_fd)? {
-            Descriptor::Host(new_fd) => new_fd,
-            Descriptor::Virtual(_new_fd) => todo!(),
-        };
-        let old_dir = fd.dir()?;
-        let new_dir = new_fd.dir()?;
-        old_dir
-            .link_at(old_path_flags.into(), old_path, &new_dir, new_path)
-            .await?;
-        Ok(())
+        store
+            .with(|mut s| {
+                s.get()
+                    .link_at(&fd, old_path_flags, old_path, &new_fd, new_path)
+            })
+            .await
     }
 
     async fn open_at(
@@ -883,37 +1200,10 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         open_flags: OpenFlags,
         flags: DescriptorFlags,
     ) -> FilesystemResult<Resource<Descriptor>> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(fd) => {
-                if flags.contains(DescriptorFlags::WRITE)
-                    || flags.contains(DescriptorFlags::MUTATE_DIRECTORY)
-                    || flags.contains(DescriptorFlags::REQUESTED_WRITE_SYNC)
-                    || open_flags.contains(OpenFlags::CREATE)
-                {
-                    return Err(ErrorCode::Unsupported.into());
-                }
-                let fd = fd.open(&path)?;
-                let fd = store.with(|mut store| store.get().table.push(Descriptor::Virtual(fd)))?;
-
-                return Ok(fd);
-            }
-        };
-        let (allow_blocking_current_thread, dir) = store.with(|mut store| {
-            let store = store.get();
-            let dir = fd.dir()?;
-            FilesystemResult::Ok((store.ctx.allow_blocking_current_thread, dir.clone()))
-        })?;
-        let fd = dir
-            .open_at(
-                path_flags.into(),
-                path,
-                open_flags.into(),
-                flags.into(),
-                allow_blocking_current_thread,
-            )
+        let fd = store
+            .with(|mut s| s.get().open_at(&fd, path_flags, path, open_flags, flags))
             .await?;
-        let fd = store.with(|mut store| store.get().table.push(Descriptor::Host(fd)))?;
+        let fd = store.with(|mut store| store.get().table.push(fd))?;
         Ok(fd)
     }
 
@@ -922,13 +1212,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         path: String,
     ) -> FilesystemResult<String> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let dir = fd.dir()?;
-        let path = dir.readlink_at(path).await?;
-        Ok(path)
+        store.with(|mut s| s.get().readlink_at(&fd, path)).await
     }
 
     async fn remove_directory_at(
@@ -936,13 +1220,9 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         path: String,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let dir = fd.dir()?;
-        dir.remove_directory_at(path).await?;
-        Ok(())
+        store
+            .with(|mut s| s.get().remove_directory_at(&fd, path))
+            .await
     }
 
     async fn rename_at(
@@ -952,18 +1232,9 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         new_fd: Resource<Descriptor>,
         new_path: String,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let new_dir = match store.get_descriptor(&new_fd)? {
-            Descriptor::Host(new_dir) => new_dir,
-            Descriptor::Virtual(_new_dir) => todo!(),
-        };
-        let old_dir = fd.dir()?;
-        let new_dir = new_dir.dir()?;
-        old_dir.rename_at(old_path, &new_dir, new_path).await?;
-        Ok(())
+        store
+            .with(|mut s| s.get().rename_at(&fd, old_path, &new_fd, new_path))
+            .await
     }
 
     async fn symlink_at(
@@ -972,13 +1243,9 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         old_path: String,
         new_path: String,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let dir = fd.dir()?;
-        dir.symlink_at(old_path, new_path).await?;
-        Ok(())
+        store
+            .with(|mut s| s.get().symlink_at(&fd, old_path, new_path))
+            .await
     }
 
     async fn unlink_file_at(
@@ -986,13 +1253,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         path: String,
     ) -> FilesystemResult<()> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let dir = fd.dir()?;
-        dir.unlink_file_at(path).await?;
-        Ok(())
+        store.with(|mut s| s.get().unlink_file_at(&fd, path)).await
     }
 
     async fn is_same_object(
@@ -1000,31 +1261,16 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         other: Resource<Descriptor>,
     ) -> wasmtime::Result<bool> {
-        let (fd, other) = store.with(|mut store| {
-            let table = store.get().table;
-            let fd = get_descriptor(table, &fd)?.clone();
-            let other = get_descriptor(table, &other)?.clone();
-            wasmtime::error::Ok((fd, other))
-        })?;
-        match (fd, other) {
-            (Descriptor::Host(fd), Descriptor::Host(other)) => fd.is_same_object(&other).await,
-            (Descriptor::Virtual(_fd), Descriptor::Virtual(_other)) => {
-                todo!()
-            }
-            _ => Ok(false),
-        }
+        store
+            .with(|mut s| s.get().is_same_object(&fd, &other))
+            .await
     }
 
     async fn metadata_hash(
         store: &Accessor<U, Self>,
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<MetadataHashValue> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let meta = fd.metadata_hash().await?;
-        Ok(meta.into())
+        store.with(|mut s| s.get().metadata_hash(&fd)).await
     }
 
     async fn metadata_hash_at(
@@ -1033,13 +1279,9 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path_flags: PathFlags,
         path: String,
     ) -> FilesystemResult<MetadataHashValue> {
-        let fd = match store.get_descriptor(&fd)? {
-            Descriptor::Host(fd) => fd,
-            Descriptor::Virtual(_fd) => todo!(),
-        };
-        let dir = fd.dir()?;
-        let meta = dir.metadata_hash_at(path_flags.into(), path).await?;
-        Ok(meta.into())
+        store
+            .with(|mut s| s.get().metadata_hash_at(&fd, path_flags, path))
+            .await
     }
 }
 
@@ -1055,5 +1297,387 @@ impl types::HostDescriptor for WasiFilesystemCtxView<'_> {
 impl preopens::Host for WasiFilesystemCtxView<'_> {
     fn get_directories(&mut self) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
         self.get_directories()
+    }
+}
+
+mod named {
+    use crate::filesystem::{Descriptor, WasiFilesystemNamed, WasiFilesystemNamedView};
+    use crate::p3::bindings::filesystem::types::{
+        Advice, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry, ErrorCode,
+        Filesize, MetadataHashValue, NewTimestamp, OpenFlags, PathFlags,
+    };
+    use crate::p3::bindings::named_imports::wasi::filesystem::{preopens, types};
+    use crate::p3::filesystem::{FilesystemError, FilesystemResult};
+    use crate::{NamedId, WasiCtxNamedView};
+    use wasmtime::component::{Access, Accessor, FutureReader, Resource, StreamReader};
+
+    impl<T> types::Host for WasiCtxNamedView<'_, T>
+    where
+        T: WasiFilesystemNamedView,
+    {
+        fn convert_error_code(&mut self, error: FilesystemError) -> wasmtime::Result<ErrorCode> {
+            error.downcast()
+        }
+    }
+
+    impl<T, U> types::HostDescriptorWithStore<U> for WasiFilesystemNamed<T>
+    where
+        T: WasiFilesystemNamedView,
+    {
+        fn read_via_stream(
+            mut store: Access<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            offset: Filesize,
+        ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
+            let fd = super::get_descriptor(store.get().0.filesystem(id).table, &fd)?.clone();
+            super::read_via_stream(&mut store, fd, offset)
+        }
+
+        fn write_via_stream(
+            mut store: Access<'_, U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            data: StreamReader<u8>,
+            offset: Filesize,
+        ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
+            let file = super::get_writable_file(store.get().0.filesystem(id).table, &fd);
+            super::write_via_stream(&mut store, file, data, super::WriteLocation::Offset(offset))
+        }
+
+        fn append_via_stream(
+            mut store: Access<'_, U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            data: StreamReader<u8>,
+        ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
+            let file = super::get_writable_file(store.get().0.filesystem(id).table, &fd);
+            super::write_via_stream(&mut store, file, data, super::WriteLocation::End)
+        }
+
+        async fn advise(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            offset: Filesize,
+            length: Filesize,
+            advice: Advice,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.advise(&fd, offset, length, advice)
+            });
+            result.await
+        }
+
+        async fn sync_data(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.sync_data(&fd)
+            });
+            result.await
+        }
+
+        async fn get_flags(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+        ) -> FilesystemResult<DescriptorFlags> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.get_flags(&fd)
+            });
+            result.await
+        }
+
+        async fn get_type(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+        ) -> FilesystemResult<DescriptorType> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.get_type(&fd)
+            });
+            result.await
+        }
+
+        async fn set_size(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            size: Filesize,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.set_size(&fd, size)
+            });
+            result.await
+        }
+
+        async fn set_times(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            data_access_timestamp: NewTimestamp,
+            data_modification_timestamp: NewTimestamp,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.set_times(&fd, data_access_timestamp, data_modification_timestamp)
+            });
+            result.await
+        }
+
+        fn read_directory(
+            mut store: Access<'_, U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+        ) -> wasmtime::Result<(
+            StreamReader<DirectoryEntry>,
+            FutureReader<Result<(), ErrorCode>>,
+        )> {
+            let dir = super::get_dir(store.get().0.filesystem(id).table, &fd).cloned();
+            super::read_directory(&mut store, dir)
+        }
+
+        async fn sync(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.sync(&fd)
+            });
+            result.await
+        }
+
+        async fn create_directory_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path: String,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.create_directory_at(&fd, path)
+            });
+            result.await
+        }
+
+        async fn stat(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+        ) -> FilesystemResult<DescriptorStat> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.stat(&fd)
+            });
+            result.await
+        }
+
+        async fn stat_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path_flags: PathFlags,
+            path: String,
+        ) -> FilesystemResult<DescriptorStat> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.stat_at(&fd, path_flags, path)
+            });
+            result.await
+        }
+
+        async fn set_times_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path_flags: PathFlags,
+            path: String,
+            data_access_timestamp: NewTimestamp,
+            data_modification_timestamp: NewTimestamp,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.set_times_at(
+                    &fd,
+                    path_flags,
+                    path,
+                    data_access_timestamp,
+                    data_modification_timestamp,
+                )
+            });
+            result.await
+        }
+
+        async fn link_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            old_path_flags: PathFlags,
+            old_path: String,
+            new_fd: Resource<Descriptor>,
+            new_path: String,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.link_at(&fd, old_path_flags, old_path, &new_fd, new_path)
+            });
+            result.await
+        }
+
+        async fn open_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path_flags: PathFlags,
+            path: String,
+            open_flags: OpenFlags,
+            flags: DescriptorFlags,
+        ) -> FilesystemResult<Resource<Descriptor>> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.open_at(&fd, path_flags, path, open_flags, flags)
+            });
+            let fd = result.await?;
+            let fd = store.with(|mut store| store.get().0.filesystem(id).table.push(fd))?;
+            Ok(fd)
+        }
+
+        async fn readlink_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path: String,
+        ) -> FilesystemResult<String> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.readlink_at(&fd, path)
+            });
+            result.await
+        }
+
+        async fn remove_directory_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path: String,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.remove_directory_at(&fd, path)
+            });
+            result.await
+        }
+
+        async fn rename_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            old_path: String,
+            new_fd: Resource<Descriptor>,
+            new_path: String,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.rename_at(&fd, old_path, &new_fd, new_path)
+            });
+            result.await
+        }
+
+        async fn symlink_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            old_path: String,
+            new_path: String,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.symlink_at(&fd, old_path, new_path)
+            });
+            result.await
+        }
+
+        async fn unlink_file_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path: String,
+        ) -> FilesystemResult<()> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.unlink_file_at(&fd, path)
+            });
+            result.await
+        }
+
+        async fn is_same_object(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            other: Resource<Descriptor>,
+        ) -> wasmtime::Result<bool> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.is_same_object(&fd, &other)
+            });
+            result.await
+        }
+
+        async fn metadata_hash(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+        ) -> FilesystemResult<MetadataHashValue> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.metadata_hash(&fd)
+            });
+            result.await
+        }
+
+        async fn metadata_hash_at(
+            store: &Accessor<U, Self>,
+            id: NamedId,
+            fd: Resource<Descriptor>,
+            path_flags: PathFlags,
+            path: String,
+        ) -> FilesystemResult<MetadataHashValue> {
+            let result = store.with(|mut s| {
+                let ctx = s.get().0.filesystem(id);
+                ctx.metadata_hash_at(&fd, path_flags, path)
+            });
+            result.await
+        }
+    }
+
+    impl<T> types::HostDescriptor for WasiCtxNamedView<'_, T>
+    where
+        T: WasiFilesystemNamedView,
+    {
+        fn drop(&mut self, id: NamedId, fd: Resource<Descriptor>) -> wasmtime::Result<()> {
+            super::types::HostDescriptor::drop(&mut self.0.filesystem(id), fd)
+        }
+    }
+
+    impl<T> preopens::Host for WasiCtxNamedView<'_, T>
+    where
+        T: WasiFilesystemNamedView,
+    {
+        fn get_directories(
+            &mut self,
+            id: NamedId,
+        ) -> wasmtime::Result<Vec<(Resource<Descriptor>, String)>> {
+            super::preopens::Host::get_directories(&mut self.0.filesystem(id))
+        }
     }
 }

@@ -1,9 +1,13 @@
 //! This module contains the runtime components of the implementation of the
 //! stack switching proposal.
 
+#[cfg(feature = "stack-switching")]
+pub(crate) mod asan;
 mod stack;
 
-use crate::vm::{VMCommonStackInformation, VMContRef, VMHostArray, VMStackLimits};
+use crate::vm::{
+    VMCommonStackInformation, VMContRef, VMHostArray, VMPayloads, VMStackLimits, VmPtr,
+};
 use core::{marker::PhantomPinned, ptr::NonNull};
 
 pub use stack::*;
@@ -51,7 +55,7 @@ pub const CONTROL_EFFECT_TRAP_ENCODING: u64 =
 /// (i.e., the one pointed to by the VMContObj) has a pointer to the
 /// other end of the chain (i.e., its last ancestor).
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VMContObj {
     pub contref: NonNull<VMContRef>,
     pub revision: usize,
@@ -86,6 +90,8 @@ impl VMCommonStackInformation {
             state: VMStackState::Running,
             handlers: VMHostArray::empty(),
             first_switch_handler_index: 0,
+            asan_stack_bottom: None,
+            asan_stack_size: 0,
         }
     }
 }
@@ -106,8 +112,29 @@ impl VMHostArray {
         Self {
             length: 0,
             capacity: 0,
-            data: core::ptr::null_mut(),
+            data: None,
         }
+    }
+
+    /// Makes this array empty.
+    pub fn clear(&mut self) {
+        *self = Self::empty();
+    }
+}
+
+impl VMPayloads {
+    /// Creates an empty payload buffer with no GC metadata.
+    pub fn empty() -> Self {
+        Self {
+            buffer: VMHostArray::empty(),
+            gc_ref_data: None,
+        }
+    }
+
+    /// Makes this payload buffer empty and invalidates its GC metadata.
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+        self.gc_ref_data = None;
     }
 }
 
@@ -131,12 +158,14 @@ impl VMContRef {
             state,
             handlers,
             first_switch_handler_index: 0,
+            asan_stack_bottom: None,
+            asan_stack_size: 0,
         };
         let parent_chain = VMStackChain::Absent;
-        let last_ancestor = core::ptr::null_mut();
+        let last_ancestor = None;
         let stack = VMContinuationStack::unallocated();
-        let args = VMHostArray::empty();
-        let values = VMHostArray::empty();
+        let args = VMPayloads::empty();
+        let values = VMPayloads::empty();
         let revision = 0;
         let _marker = PhantomPinned;
 
@@ -180,6 +209,7 @@ pub fn cont_new(
     func: *mut u8,
     param_count: u32,
     result_count: u32,
+    gc_refs: bool,
 ) -> crate::Result<*mut VMContRef> {
     let instance = store.instance_mut(instance);
     let caller_vmctx = instance.vmctx();
@@ -193,18 +223,18 @@ pub fn cont_new(
     contref.parent_chain = VMStackChain::Absent;
     // The continuation is fresh, which is a special case of being suspended.
     // Thus we need to set the correct end of the continuation chain: itself.
-    contref.last_ancestor = contref;
+    contref.last_ancestor = Some(VmPtr::from(&*contref));
 
     // The initialization function will allocate the actual args/return value buffer and
     // update this object (if needed).
-    let contref_args_ptr = &mut contref.args as *mut VMHostArray;
-
+    let contref_args_ptr = &mut contref.args as *mut VMPayloads;
     contref.stack.initialize(
         func.cast::<crate::vm::VMFuncRef>(),
         caller_vmctx.as_ptr(),
         contref_args_ptr,
         param_count,
         result_count,
+        gc_refs,
     )?;
 
     // Now that the initial stack pointer was set by the initialization
@@ -314,10 +344,10 @@ pub enum VMStackChain {
     /// does not have a parent. The `CommonStackInformation` that this
     /// variant points to is stored in the stack frame of
     /// `invoke_wasm_and_catch_traps`.
-    InitialStack(*mut VMCommonStackInformation) =
+    InitialStack(VmPtr<VMCommonStackInformation>) =
         wasmtime_environ::STACK_CHAIN_INITIAL_STACK_DISCRIMINANT,
     /// Represents a continuation's stack.
-    Continuation(*mut VMContRef) = wasmtime_environ::STACK_CHAIN_CONTINUATION_DISCRIMINANT,
+    Continuation(VmPtr<VMContRef>) = wasmtime_environ::STACK_CHAIN_CONTINUATION_DISCRIMINANT,
 }
 
 impl VMStackChain {
@@ -360,13 +390,14 @@ pub struct ContinuationIterator(VMStackChain);
 pub struct StackLimitsIterator(VMStackChain);
 
 impl Iterator for ContinuationIterator {
-    type Item = *mut VMContRef;
+    type Item = NonNull<VMContRef>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.0 {
             VMStackChain::Absent | VMStackChain::InitialStack(_) => None,
             VMStackChain::Continuation(ptr) => {
-                let continuation = unsafe { ptr.as_mut().unwrap() };
+                let ptr = ptr.as_non_null();
+                let continuation = unsafe { ptr.as_ref() };
                 self.0 = continuation.parent_chain.clone();
                 Some(ptr)
             }
@@ -375,20 +406,26 @@ impl Iterator for ContinuationIterator {
 }
 
 impl Iterator for StackLimitsIterator {
-    type Item = *mut VMStackLimits;
+    type Item = NonNull<VMStackLimits>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.0 {
             VMStackChain::Absent => None,
             VMStackChain::InitialStack(csi) => {
-                let stack_limits = unsafe { &mut (*csi).limits } as *mut VMStackLimits;
+                let csi = csi.as_ptr();
+                let stack_limits =
+                    unsafe { NonNull::new_unchecked(core::ptr::addr_of_mut!((*csi).limits)) };
                 self.0 = VMStackChain::Absent;
                 Some(stack_limits)
             }
             VMStackChain::Continuation(ptr) => {
-                let continuation = unsafe { ptr.as_mut().unwrap() };
-                let stack_limits =
-                    (&mut continuation.common_stack_information.limits) as *mut VMStackLimits;
+                let ptr = ptr.as_ptr();
+                let continuation = unsafe { &*ptr };
+                let stack_limits = unsafe {
+                    NonNull::new_unchecked(core::ptr::addr_of_mut!(
+                        (*ptr).common_stack_information.limits
+                    ))
+                };
                 self.0 = continuation.parent_chain.clone();
                 Some(stack_limits)
             }

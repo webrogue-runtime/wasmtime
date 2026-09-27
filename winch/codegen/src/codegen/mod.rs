@@ -611,8 +611,16 @@ where
             self.context.stack.len() == 0,
             CodeGenError::unexpected_value_in_value_stack()
         );
-        self.masm.free_stack(self.context.frame.locals_size)?;
-        self.masm.epilogue()?;
+        let stack_args_size = if self.sig.call_conv.is_default() {
+            crate::abi::align_to(
+                self.sig.params_stack_size(),
+                u32::from(M::ABI::call_stack_align()),
+            )
+        } else {
+            0
+        };
+        self.masm
+            .epilogue(self.context.frame.locals_size, stack_args_size)?;
         self.masm.end_source_loc()?;
         Ok(())
     }
@@ -2350,7 +2358,10 @@ where
         if !self.context.reachable {
             // `self.fuel_consumed` must be correctly flushed to memory when
             // entering an unreachable state.
-            ensure!(self.fuel_consumed == 0, CodeGenError::illegal_fuel_state())
+            ensure!(self.fuel_consumed == 0, CodeGenError::illegal_fuel_state());
+            // Control operators are still visited to track nesting and restore
+            // reachability at `else` or `end`, but those visits must not charge fuel.
+            return Ok(());
         }
 
         // Generally, most instructions require 1 fuel unit.
