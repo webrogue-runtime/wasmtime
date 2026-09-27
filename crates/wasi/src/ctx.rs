@@ -1,6 +1,6 @@
 use crate::cli::{StdinStream, StdoutStream, WasiCliCtx};
 use crate::clocks::{HostMonotonicClock, HostWallClock, WasiClocksCtx};
-use crate::filesystem::{Dir, WasiFilesystemCtx};
+use crate::filesystem::{Dir, VirtualDescriptor, WasiFilesystemCtx};
 use crate::random::WasiRandomCtx;
 use crate::sockets::{SocketAddrCheck, SocketAddrUse, WasiSocketsCtx};
 use crate::{FsPerms, OpenMode};
@@ -10,6 +10,7 @@ use std::mem;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio::io::{stderr, stdin, stdout};
 use wasmtime::Result;
 
@@ -313,6 +314,17 @@ impl WasiCtxBuilder {
             ),
             guest_path.as_ref().to_owned(),
         ));
+        Ok(self)
+    }
+
+    pub fn virt_preopened_dir(
+        &mut self,
+        descriptor: Arc<dyn VirtualDescriptor>,
+        guest_path: impl AsRef<str>,
+    ) -> Result<&mut Self> {
+        self.filesystem
+            .virt_preopens
+            .push((descriptor, guest_path.as_ref().to_owned()));
         Ok(self)
     }
 

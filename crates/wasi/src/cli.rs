@@ -1,3 +1,4 @@
+#[cfg(feature = "p2")]
 use crate::p2;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -7,12 +8,15 @@ use wasmtime_wasi_io::streams::{InputStream, OutputStream, StreamError};
 
 mod empty;
 mod file;
+#[cfg(feature = "p2")]
 mod locked_async;
+#[cfg(feature = "p2")]
 mod mem;
 mod stdout;
 mod worker_thread_stdin;
 
 pub use self::file::{InputFile, OutputFile};
+#[cfg(feature = "p2")]
 pub use self::locked_async::{AsyncStdinStream, AsyncStdoutStream};
 
 /// Convert a host `io::Error` into a `StreamError`, matching the error-code
@@ -148,6 +152,7 @@ pub trait StdinStream: IsTerminal + Send {
     /// Note that this has a default implementation which uses
     /// [`p2::pipe::AsyncReadStream`] as an adapter, but this can be overridden
     /// if there's a more specialized implementation available.
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         Box::new(p2::pipe::AsyncReadStream::new(Pin::from(
             self.async_stream(),
@@ -183,6 +188,7 @@ pub trait StdoutStream: IsTerminal + Send {
     /// Note that this has a default implementation which uses
     /// [`p2::pipe::AsyncWriteStream`] as an adapter, but this can be overridden
     /// if there's a more specialized implementation available.
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(p2::pipe::AsyncWriteStream::new(
             8192, // FIXME: extract this to a constant.
@@ -198,6 +204,7 @@ impl<T: ?Sized + IsTerminal> IsTerminal for &T {
     }
 }
 impl<T: ?Sized + StdinStream + Sync> StdinStream for &T {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         T::p2_stream(self)
     }
@@ -206,6 +213,7 @@ impl<T: ?Sized + StdinStream + Sync> StdinStream for &T {
     }
 }
 impl<T: ?Sized + StdoutStream + Sync> StdoutStream for &T {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         T::p2_stream(self)
     }
@@ -221,6 +229,7 @@ impl<T: ?Sized + IsTerminal> IsTerminal for &mut T {
     }
 }
 impl<T: ?Sized + StdinStream + Sync> StdinStream for &mut T {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         T::p2_stream(self)
     }
@@ -229,6 +238,7 @@ impl<T: ?Sized + StdinStream + Sync> StdinStream for &mut T {
     }
 }
 impl<T: ?Sized + StdoutStream + Sync> StdoutStream for &mut T {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         T::p2_stream(self)
     }
@@ -244,6 +254,7 @@ impl<T: ?Sized + IsTerminal> IsTerminal for Box<T> {
     }
 }
 impl<T: ?Sized + StdinStream + Sync> StdinStream for Box<T> {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         T::p2_stream(self)
     }
@@ -252,6 +263,7 @@ impl<T: ?Sized + StdinStream + Sync> StdinStream for Box<T> {
     }
 }
 impl<T: ?Sized + StdoutStream + Sync> StdoutStream for Box<T> {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         T::p2_stream(self)
     }
@@ -267,6 +279,7 @@ impl<T: ?Sized + IsTerminal> IsTerminal for Arc<T> {
     }
 }
 impl<T: ?Sized + StdinStream + Sync> StdinStream for Arc<T> {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         T::p2_stream(self)
     }
@@ -275,6 +288,7 @@ impl<T: ?Sized + StdinStream + Sync> StdinStream for Arc<T> {
     }
 }
 impl<T: ?Sized + StdoutStream + Sync> StdoutStream for Arc<T> {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         T::p2_stream(self)
     }

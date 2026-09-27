@@ -1,4 +1,5 @@
 use crate::cli::{IsTerminal, StdoutStream, stream_error_from};
+#[cfg(feature = "p2")]
 use crate::p2;
 use bytes::Bytes;
 use std::io::{self, Write};
@@ -14,6 +15,7 @@ impl IsTerminal for tokio::io::Stdout {
     }
 }
 impl StdoutStream for tokio::io::Stdout {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(StdioOutputStream::Stdout)
     }
@@ -29,6 +31,7 @@ impl IsTerminal for std::io::Stdout {
     }
 }
 impl StdoutStream for std::io::Stdout {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(StdioOutputStream::Stdout)
     }
@@ -44,6 +47,7 @@ impl IsTerminal for tokio::io::Stderr {
     }
 }
 impl StdoutStream for tokio::io::Stderr {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(StdioOutputStream::Stderr)
     }
@@ -59,6 +63,7 @@ impl IsTerminal for std::io::Stderr {
     }
 }
 impl StdoutStream for std::io::Stderr {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(StdioOutputStream::Stderr)
     }
@@ -72,6 +77,7 @@ enum StdioOutputStream {
     Stderr,
 }
 
+#[cfg(feature = "p2")]
 impl OutputStream for StdioOutputStream {
     fn write(&mut self, bytes: Bytes) -> p2::StreamResult<()> {
         match self {
@@ -117,6 +123,7 @@ impl AsyncWrite for StdioOutputStream {
 }
 
 #[async_trait::async_trait]
+#[cfg(feature = "p2")]
 impl p2::Pollable for StdioOutputStream {
     async fn ready(&mut self) {}
 }

@@ -1,4 +1,5 @@
 use crate::cli::{IsTerminal, StdinStream, StdoutStream};
+#[cfg(feature = "p2")]
 use crate::p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult};
 use bytes::Bytes;
 use std::io::{Read, Write};
@@ -32,6 +33,7 @@ impl IsTerminal for OutputFile {
 }
 
 impl StdoutStream for OutputFile {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(self.clone())
     }
@@ -41,11 +43,13 @@ impl StdoutStream for OutputFile {
     }
 }
 
+#[cfg(feature = "p2")]
 #[async_trait::async_trait]
 impl Pollable for OutputFile {
     async fn ready(&mut self) {}
 }
 
+#[cfg(feature = "p2")]
 impl OutputStream for OutputFile {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
         (&*self.file)
@@ -103,6 +107,7 @@ impl InputFile {
 }
 
 impl StdinStream for InputFile {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         Box::new(self.clone())
     }
@@ -117,11 +122,13 @@ impl IsTerminal for InputFile {
     }
 }
 
+#[cfg(feature = "p2")]
 #[async_trait::async_trait]
 impl Pollable for InputFile {
     async fn ready(&mut self) {}
 }
 
+#[cfg(feature = "p2")]
 impl InputStream for InputFile {
     fn read(&mut self, size: usize) -> StreamResult<Bytes> {
         let mut buf = bytes::BytesMut::zeroed(size.min(crate::MAX_READ_SIZE_ALLOC));

@@ -46,6 +46,7 @@ impl IsTerminal for tokio::io::Stdin {
     }
 }
 impl StdinStream for tokio::io::Stdin {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         Box::new(WasiStdin)
     }
@@ -61,6 +62,7 @@ impl IsTerminal for std::io::Stdin {
     }
 }
 impl StdinStream for std::io::Stdin {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         Box::new(WasiStdin)
     }

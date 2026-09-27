@@ -158,9 +158,9 @@ impl StoreOpaque {
     }
 
     fn debug_all_instances(&mut self) -> Vec<Instance> {
-        if !self.engine().tunables().debug_guest {
-            return vec![];
-        }
+        // if !self.engine().tunables().debug_guest {
+        //     return vec![];
+        // }
 
         self.all_instances().collect()
     }
@@ -337,9 +337,9 @@ impl Instance {
     }
 
     fn debug_export(&self, store: &mut StoreOpaque, index: EntityIndex) -> Option<Extern> {
-        if !store.engine().tunables().debug_guest {
-            return None;
-        }
+        // if !store.engine().tunables().debug_guest {
+        //     return None;
+        // }
 
         let env_module = self._module(store).env_module();
         if !env_module.is_valid(index) {

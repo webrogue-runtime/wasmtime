@@ -48,13 +48,20 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         len: types::Filesize,
         advice: types::Advice,
     ) -> FsResult<()> {
-        let f = self.table.get(&fd)?.file()?;
+        let descriptor = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
+        let f = descriptor.file()?;
         f.advise(offset, len, advice.into()).await?;
         Ok(())
     }
 
     async fn sync_data(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
-        let descriptor = self.table.get(&fd)?;
+        let descriptor = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         descriptor.sync_data().await?;
         Ok(())
     }
@@ -63,7 +70,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<types::DescriptorFlags> {
-        let descriptor = self.table.get(&fd)?;
+        let descriptor = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         let flags = descriptor.get_flags().await?;
         Ok(flags.into())
     }
@@ -72,7 +82,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<types::DescriptorType> {
-        let descriptor = self.table.get(&fd)?;
+        let descriptor = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         let ty = descriptor.get_type().await?;
         Ok(ty.into())
     }
@@ -82,7 +95,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
         size: types::Filesize,
     ) -> FsResult<()> {
-        let f = self.table.get(&fd)?.file()?;
+        let f = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .file()?;
         f.set_size(size).await?;
         Ok(())
     }
@@ -93,7 +110,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         atim: types::NewTimestamp,
         mtim: types::NewTimestamp,
     ) -> FsResult<()> {
-        let descriptor = self.table.get(&fd)?;
+        let descriptor = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         let atim = systemtimespec_from(atim)?;
         let mtim = systemtimespec_from(mtim)?;
         descriptor.set_times(atim, mtim).await?;
@@ -106,7 +126,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         len: types::Filesize,
         offset: types::Filesize,
     ) -> FsResult<(Vec<u8>, bool)> {
-        let f = self.table.get(&fd)?.file()?;
+        let f = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .file()?;
 
         let (mut buffer, r) = f
             .run_blocking(move |f| {
@@ -137,7 +161,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         buf: Vec<u8>,
         offset: types::Filesize,
     ) -> FsResult<types::Filesize> {
-        let f = self.table.get(&fd)?.file()?;
+        let f = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .file()?;
         if f.perms.write_not_permitted() {
             return Err(ErrorCode::NotPermitted.into());
         }
@@ -153,7 +181,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<Resource<types::DirectoryEntryStream>> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
 
         enum ReaddirError {
             Io(std::io::Error),
@@ -211,7 +243,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
     }
 
     async fn sync(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
-        let descriptor = self.table.get(&fd)?;
+        let descriptor = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         descriptor.sync().await?;
         Ok(())
     }
@@ -221,13 +256,20 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
         path: String,
     ) -> FsResult<()> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         d.create_directory_at(path).await?;
         Ok(())
     }
 
     async fn stat(&mut self, fd: Resource<types::Descriptor>) -> FsResult<types::DescriptorStat> {
-        let descriptor = self.table.get(&fd)?;
+        let descriptor = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         let stat = descriptor.stat().await?;
         Ok(stat.try_into()?)
     }
@@ -238,7 +280,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path_flags: types::PathFlags,
         path: String,
     ) -> FsResult<types::DescriptorStat> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         let stat = d.stat_at(path_flags.into(), path).await?;
         Ok(stat.try_into()?)
     }
@@ -251,7 +297,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         atim: types::NewTimestamp,
         mtim: types::NewTimestamp,
     ) -> FsResult<()> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         let atim = systemtimespec_from(atim)?;
         let mtim = systemtimespec_from(mtim)?;
         d.set_times_at(path_flags.into(), path, atim, mtim).await?;
@@ -267,8 +317,16 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         new_descriptor: Resource<types::Descriptor>,
         new_path: String,
     ) -> FsResult<()> {
-        let old_dir = self.table.get(&fd)?.dir()?;
-        let new_dir = self.table.get(&new_descriptor)?.dir()?;
+        let old_dir = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
+        let new_dir = match self.table.get(&new_descriptor)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         old_dir
             .link_at(old_path_flags.into(), old_path, new_dir, new_path)
             .await?;
@@ -283,7 +341,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         oflags: types::OpenFlags,
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         let fd = d
             .open_at(
                 path_flags.into(),
@@ -293,7 +355,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
                 self.ctx.allow_blocking_current_thread,
             )
             .await?;
-        let fd = self.table.push(fd)?;
+        let fd = self.table.push(Descriptor::Host(fd))?;
         Ok(fd)
     }
 
@@ -313,7 +375,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
         path: String,
     ) -> FsResult<String> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         let path = d.readlink_at(path).await?;
         Ok(path)
     }
@@ -323,7 +389,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
         path: String,
     ) -> FsResult<()> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         d.remove_directory_at(path).await?;
         Ok(())
     }
@@ -335,8 +405,16 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         new_fd: Resource<types::Descriptor>,
         new_path: String,
     ) -> FsResult<()> {
-        let old_dir = self.table.get(&fd)?.dir()?;
-        let new_dir = self.table.get(&new_fd)?.dir()?;
+        let old_dir = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
+        let new_dir = match self.table.get(&new_fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         old_dir.rename_at(old_path, new_dir, new_path).await?;
         Ok(())
     }
@@ -347,7 +425,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         src_path: String,
         dest_path: String,
     ) -> FsResult<()> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         d.symlink_at(src_path, dest_path).await?;
         Ok(())
     }
@@ -357,7 +439,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
         path: String,
     ) -> FsResult<()> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         d.unlink_file_at(path).await?;
         Ok(())
     }
@@ -367,11 +453,15 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
         offset: types::Filesize,
     ) -> FsResult<Resource<DynInputStream>> {
+        let fd = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         // Trap if fd lookup fails. A directory is is-directory, not
         // bad-descriptor (POSIX EISDIR on read).
-        let f = match self.table.get(&fd)? {
-            Descriptor::File(f) => f,
-            Descriptor::Dir(_) => return Err(ErrorCode::IsDirectory.into()),
+        let f = match fd {
+            crate::filesystem::HostDescriptor::File(f) => f,
+            crate::filesystem::HostDescriptor::Dir(_) => return Err(ErrorCode::IsDirectory.into()),
         };
 
         // Create a stream view for it.
@@ -389,7 +479,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         offset: types::Filesize,
     ) -> FsResult<Resource<DynOutputStream>> {
         // Trap if fd lookup fails:
-        let f = self.table.get(&fd)?.file()?;
+        let f = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .file()?;
 
         if f.perms.write_not_permitted() {
             Err(types::ErrorCode::NotPermitted)?;
@@ -410,7 +504,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
     ) -> FsResult<Resource<DynOutputStream>> {
         // Trap if fd lookup fails:
-        let f = self.table.get(&fd)?.file()?;
+        let f = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .file()?;
 
         if f.perms.write_not_permitted() {
             Err(types::ErrorCode::NotPermitted)?;
@@ -432,14 +530,25 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         b: Resource<types::Descriptor>,
     ) -> wasmtime::Result<bool> {
         let descriptor_a = self.table.get(&a)?;
+        let descriptor_a = match descriptor_a {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => return Ok(false),
+        };
         let descriptor_b = self.table.get(&b)?;
+        let descriptor_b = match descriptor_b {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => return Ok(false),
+        };
         descriptor_a.is_same_object(descriptor_b).await
     }
     async fn metadata_hash(
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<types::MetadataHashValue> {
-        let fd = self.table.get(&fd)?;
+        let fd = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        };
         let meta = fd.metadata_hash().await?;
         Ok(meta.into())
     }
@@ -449,7 +558,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path_flags: types::PathFlags,
         path: String,
     ) -> FsResult<types::MetadataHashValue> {
-        let d = self.table.get(&fd)?.dir()?;
+        let d = match self.table.get(&fd)? {
+            Descriptor::Host(descriptor) => descriptor,
+            Descriptor::Virtual(_fd) => todo!(),
+        }
+        .dir()?;
         let meta = d.metadata_hash_at(path_flags.into(), path).await?;
         Ok(meta.into())
     }

@@ -1,4 +1,5 @@
 use crate::cli::{IsTerminal, StdinStream, StdoutStream};
+#[cfg(feature = "p2")]
 use crate::p2;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,6 +13,7 @@ impl IsTerminal for tokio::io::Empty {
     }
 }
 impl StdinStream for tokio::io::Empty {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         Box::new(p2::pipe::ClosedInputStream)
     }
@@ -20,6 +22,7 @@ impl StdinStream for tokio::io::Empty {
     }
 }
 impl StdoutStream for tokio::io::Empty {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(p2::pipe::SinkOutputStream)
     }
@@ -35,6 +38,7 @@ impl IsTerminal for std::io::Empty {
     }
 }
 impl StdinStream for std::io::Empty {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn InputStream> {
         Box::new(p2::pipe::ClosedInputStream)
     }
@@ -43,6 +47,7 @@ impl StdinStream for std::io::Empty {
     }
 }
 impl StdoutStream for std::io::Empty {
+    #[cfg(feature = "p2")]
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(p2::pipe::SinkOutputStream)
     }
@@ -51,12 +56,14 @@ impl StdoutStream for std::io::Empty {
     }
 }
 
+#[cfg(feature = "p2")]
 // Implementation for p2::pipe::ClosedInputStream
 impl IsTerminal for p2::pipe::ClosedInputStream {
     fn is_terminal(&self) -> bool {
         false
     }
 }
+#[cfg(feature = "p2")]
 impl StdinStream for p2::pipe::ClosedInputStream {
     fn p2_stream(&self) -> Box<dyn InputStream> {
         Box::new(p2::pipe::ClosedInputStream)
@@ -66,12 +73,14 @@ impl StdinStream for p2::pipe::ClosedInputStream {
     }
 }
 
+#[cfg(feature = "p2")]
 // Implementation for p2::pipe::SinkOutputStream
 impl IsTerminal for p2::pipe::SinkOutputStream {
     fn is_terminal(&self) -> bool {
         false
     }
 }
+#[cfg(feature = "p2")]
 impl StdoutStream for p2::pipe::SinkOutputStream {
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(p2::pipe::SinkOutputStream)
@@ -82,11 +91,13 @@ impl StdoutStream for p2::pipe::SinkOutputStream {
 }
 
 // Implementation for p2::pipe::ClosedOutputStream
+#[cfg(feature = "p2")]
 impl IsTerminal for p2::pipe::ClosedOutputStream {
     fn is_terminal(&self) -> bool {
         false
     }
 }
+#[cfg(feature = "p2")]
 impl StdoutStream for p2::pipe::ClosedOutputStream {
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(p2::pipe::ClosedOutputStream)

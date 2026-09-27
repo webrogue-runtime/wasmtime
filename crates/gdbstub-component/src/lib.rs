@@ -10,13 +10,13 @@ use crate::{
 };
 use anyhow::Result;
 use clap::Parser;
-use futures::{FutureExt, select};
+use futures::{select, FutureExt};
 use gdbstub::{
     common::{Signal, Tid},
     conn::Connection,
     stub::{
+        state_machine::{state::Running, GdbStubStateMachine, GdbStubStateMachineInner},
         MultiThreadStopReason,
-        state_machine::{GdbStubStateMachine, GdbStubStateMachineInner, state::Running},
     },
 };
 use gdbstub_arch::wasm::addr::WasmAddr;
@@ -220,7 +220,7 @@ impl<'a> Debugger<'a> {
         match event {
             api::Event::Complete => {
                 trace!("Event::Complete");
-                let pc_bytes = self.current_pc.as_raw().to_le_bytes();
+                let pc_bytes = self.qq.as_raw().to_le_bytes();
                 let mut regs = core::iter::once((
                     gdbstub_arch::wasm::reg::id::WasmRegId::Pc,
                     pc_bytes.as_slice(),
@@ -329,7 +329,11 @@ impl Conn {
     async fn read_byte(&mut self) -> Result<Option<u8>> {
         let mut buf = [0u8];
         let len = self.conn.read(&mut buf).await?;
-        if len == 1 { Ok(Some(buf[0])) } else { Ok(None) }
+        if len == 1 {
+            Ok(Some(buf[0]))
+        } else {
+            Ok(None)
+        }
     }
 }
 

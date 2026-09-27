@@ -2,7 +2,7 @@ use crate::clocks::WasiClocksCtxView;
 use crate::p3::bindings::clocks::{monotonic_clock, system_clock, types};
 use crate::p3::clocks::WasiClocks;
 use core::time::Duration;
-use tokio::time::sleep;
+use tokio_hrtime::sleep;
 use wasmtime::component::Accessor;
 
 impl types::Host for WasiClocksCtxView<'_> {}

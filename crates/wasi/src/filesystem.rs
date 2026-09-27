@@ -1,5 +1,6 @@
 use crate::clocks::Datetime;
 use crate::filesystem::primitives::{DirOptions, FollowSymlinks, Metadata, OpenOptions};
+use crate::p3::filesystem::FilesystemResult;
 use crate::runtime::{AbortOnDropJoinHandle, spawn_blocking};
 use std::collections::hash_map;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ impl HasData for WasiFilesystem {
 pub struct WasiFilesystemCtx {
     pub(crate) allow_blocking_current_thread: bool,
     pub(crate) preopens: Vec<(Dir, String)>,
+    pub(crate) virt_preopens: Vec<(Arc<dyn VirtualDescriptor>, String)>,
 }
 
 pub struct WasiFilesystemCtxView<'a> {
@@ -480,26 +482,42 @@ impl From<std::io::Error> for ErrorCode {
 }
 
 #[derive(Clone)]
-pub enum Descriptor {
+pub enum HostDescriptor {
     File(File),
     Dir(Dir),
 }
 
-impl Descriptor {
+pub trait VirtualDescriptor: Send + Sync {
+    fn open(&self, path: &str) -> FilesystemResult<Arc<dyn VirtualDescriptor>>;
+    fn read_at(
+        &self,
+        buf: &mut [u8],
+        offset: u64,
+    ) -> Result<usize, crate::p3::bindings::filesystem::types::ErrorCode>;
+    fn is_dir(&self) -> bool;
+}
+
+#[derive(Clone)]
+pub enum Descriptor {
+    Host(HostDescriptor),
+    Virtual(Arc<dyn VirtualDescriptor>),
+}
+
+impl HostDescriptor {
     pub(crate) fn file(&self) -> Result<&File, ErrorCode> {
         match self {
-            Descriptor::File(f) => Ok(f),
+            HostDescriptor::File(f) => Ok(f),
             // File-only ops such as advise stay bad-descriptor on a dir
             // (wasi-testsuite filesystem-advise). read-via-stream maps Dir
             // to is-directory on its own.
-            Descriptor::Dir(_) => Err(ErrorCode::BadDescriptor),
+            HostDescriptor::Dir(_) => Err(ErrorCode::BadDescriptor),
         }
     }
 
     pub(crate) fn dir(&self) -> Result<&Dir, ErrorCode> {
         match self {
-            Descriptor::Dir(d) => Ok(d),
-            Descriptor::File(_) => Err(ErrorCode::NotDirectory),
+            HostDescriptor::Dir(d) => Ok(d),
+            HostDescriptor::File(_) => Err(ErrorCode::NotDirectory),
         }
     }
 
@@ -907,29 +925,30 @@ impl Dir {
         new_dir: &Self,
         new_path: String,
     ) -> Result<(), ErrorCode> {
-        if self.perms.write_not_permitted() {
-            return Err(ErrorCode::NotPermitted);
-        }
-        if new_dir.perms.write_not_permitted() {
-            return Err(ErrorCode::NotPermitted);
-        }
-        if old_path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
-            return Err(ErrorCode::Invalid);
-        }
-        if self.perms != new_dir.perms {
-            return Err(ErrorCode::NotPermitted);
-        }
-        let new_dir_handle = Arc::clone(&new_dir.dir);
-        self.run_blocking(move |d| {
-            crate::filesystem::primitives::hard_link(
-                d,
-                old_path.as_ref(),
-                &new_dir_handle,
-                new_path.as_ref(),
-            )
-        })
-        .await?;
-        Ok(())
+        Err(ErrorCode::Unsupported.into())
+        // if self.perms.write_not_permitted() {
+        //     return Err(ErrorCode::NotPermitted);
+        // }
+        // if new_dir.perms.write_not_permitted() {
+        //     return Err(ErrorCode::NotPermitted);
+        // }
+        // if old_path_flags.contains(PathFlags::SYMLINK_FOLLOW) {
+        //     return Err(ErrorCode::Invalid);
+        // }
+        // if self.perms != new_dir.perms {
+        //     return Err(ErrorCode::NotPermitted);
+        // }
+        // let new_dir_handle = Arc::clone(&new_dir.dir);
+        // self.run_blocking(move |d| {
+        //     crate::filesystem::primitives::hard_link(
+        //         d,
+        //         old_path.as_ref(),
+        //         &new_dir_handle,
+        //         new_path.as_ref(),
+        //     )
+        // })
+        // .await?;
+        // Ok(())
     }
 
     pub(crate) async fn open_at(
@@ -939,7 +958,7 @@ impl Dir {
         oflags: OpenFlags,
         flags: DescriptorFlags,
         allow_blocking_current_thread: bool,
-    ) -> Result<Descriptor, ErrorCode> {
+    ) -> Result<HostDescriptor, ErrorCode> {
         // Track whether we are creating file, for permission check:
         let mut create = false;
         // Track open mode, for permission check and recording in created descriptor:
@@ -1039,14 +1058,14 @@ impl Dir {
                 Err(ErrorCode::IsDirectory)
             }
 
-            OpenResult::Dir(dir) => Ok(Descriptor::Dir(Dir::new(
+            OpenResult::Dir(dir) => Ok(HostDescriptor::Dir(Dir::new(
                 dir,
                 self.perms,
                 open_mode,
                 allow_blocking_current_thread,
             ))),
 
-            OpenResult::File(file) => Ok(Descriptor::File(File::new(
+            OpenResult::File(file) => Ok(HostDescriptor::File(File::new(
                 file,
                 self.perms,
                 open_mode,
@@ -1108,21 +1127,23 @@ impl Dir {
         src_path: String,
         dest_path: String,
     ) -> Result<(), ErrorCode> {
-        if self.perms.write_not_permitted() {
-            return Err(ErrorCode::NotPermitted);
-        }
-        self.run_blocking(move |d| sys::symlink(src_path.as_ref(), d, dest_path.as_ref()))
-            .await?;
-        Ok(())
+        Err(ErrorCode::Unsupported.into())
+        // if self.perms.write_not_permitted() {
+        //     return Err(ErrorCode::NotPermitted);
+        // }
+        // self.run_blocking(move |d| sys::symlink(src_path.as_ref(), d, dest_path.as_ref()))
+        //     .await?;
+        // Ok(())
     }
 
     pub(crate) async fn unlink_file_at(&self, path: String) -> Result<(), ErrorCode> {
-        if self.perms.write_not_permitted() {
-            return Err(ErrorCode::NotPermitted);
-        }
-        self.run_blocking(move |d| sys::remove_file_or_symlink(d, path.as_ref()))
-            .await?;
-        Ok(())
+        Err(ErrorCode::Unsupported.into())
+        // if self.perms.write_not_permitted() {
+        //     return Err(ErrorCode::NotPermitted);
+        // }
+        // self.run_blocking(move |d| sys::remove_file_or_symlink(d, path.as_ref()))
+        //     .await?;
+        // Ok(())
     }
 
     pub(crate) async fn metadata_hash_at(
@@ -1152,8 +1173,15 @@ impl WasiFilesystemCtxView<'_> {
         for (dir, name) in preopens {
             let fd = self
                 .table
-                .push(Descriptor::Dir(dir))
+                .push(Descriptor::Host(HostDescriptor::Dir(dir)))
                 .with_context(|| format!("failed to push preopen {name}"))?;
+            results.push((fd, name));
+        }
+        for (desc, name) in self.ctx.virt_preopens.clone() {
+            let fd = self
+                .table
+                .push(Descriptor::Virtual(desc))
+                .with_context(|| format!("failed to push virt_preopen {name}"))?;
             results.push((fd, name));
         }
         Ok(results)

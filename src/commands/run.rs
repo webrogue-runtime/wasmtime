@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::thread;
 use wasmtime::{
-    Engine, Error, Func, Module, Result, Store, StoreLimits, Val, ValType, bail,
-    error::Context as _, format_err,
+    bail, error::Context as _, format_err, Engine, Error, Func, Module, Result, Store, StoreLimits,
+    Val, ValType,
 };
 use wasmtime_wasi::{WasiCtxView, WasiView};
 
@@ -650,11 +650,9 @@ impl RunCommand {
 
         store.set_epoch_deadline(1);
         let engine = store.engine().clone();
-        thread::spawn(move || {
-            loop {
-                thread::sleep(interval);
-                engine.increment_epoch();
-            }
+        thread::spawn(move || loop {
+            thread::sleep(interval);
+            engine.increment_epoch();
         });
 
         let path = path.to_string();
@@ -774,11 +772,11 @@ impl RunCommand {
         linker: &mut wasmtime::component::Linker<Host>,
     ) -> Result<wasmtime::component::Instance> {
         use wasmtime::component::{
-            Val,
             wasm_wave::{
                 untyped::UntypedFuncCall,
                 wasm::{DisplayFuncResults, WasmFunc},
             },
+            Val,
         };
 
         // Check if the invoke string is present
