@@ -491,12 +491,32 @@ pub enum HostDescriptor {
 
 pub trait VirtualDescriptor: Send + Sync {
     fn open(&self, path: &str) -> FilesystemResult<Arc<dyn VirtualDescriptor>>;
+    fn stat(&self) -> FilesystemResult<crate::p3::bindings::filesystem::types::DescriptorStat>;
+    fn stat_at(
+        &self,
+        path: &str,
+    ) -> FilesystemResult<crate::p3::bindings::filesystem::types::DescriptorStat> {
+        self.open(path)?.stat()
+    }
+    fn metadata_hash(
+        &self,
+    ) -> FilesystemResult<crate::p3::bindings::filesystem::types::MetadataHashValue> {
+        Err(crate::p3::bindings::filesystem::types::ErrorCode::Unsupported.into())
+    }
     fn read_at(
         &self,
         buf: &mut [u8],
         offset: u64,
     ) -> Result<usize, crate::p3::bindings::filesystem::types::ErrorCode>;
     fn is_dir(&self) -> bool;
+    fn dir_children(
+        &self,
+    ) -> FilesystemResult<
+        Vec<(
+            String,
+            crate::p3::bindings::filesystem::types::DescriptorType,
+        )>,
+    >;
 }
 
 #[derive(Clone)]
