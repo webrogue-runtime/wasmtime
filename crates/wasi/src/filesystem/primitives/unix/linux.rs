@@ -12,6 +12,8 @@ use std::fs;
 use std::io;
 use std::os::fd::AsFd;
 use std::path::Path;
+#[cfg(target_os = "android")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::SystemTime;
 
@@ -28,11 +30,7 @@ pub(crate) fn open_fast(
     path: &Path,
     options: &OpenOptions,
 ) -> io::Result<Option<fs::File>> {
-    // On regular Linux, attempt to use `openat2` to accelerate sandboxed
-    // lookups. On Android, the [seccomp policy] prevents us from even
-    // detecting whether `openat2` is supported, so don't even try.
-    //
-    // [seccomp policy]: https://android-developers.googleblog.com/2017/07/seccomp-filter-in-android-o.html
+    // Attempt to use `openat2` to accelerate sandboxed lookups.
     let result = open_beneath(start, path, options);
 
     // If we got anything other than a `ENOSYS` error, that's our result.
@@ -51,6 +49,20 @@ fn open_beneath(start: &fs::File, path: &Path, options: &OpenOptions) -> io::Res
     if INVALID.load(Relaxed) {
         // `openat2` is permanently unavailable.
         return Err(rustix::io::Errno::NOSYS.into());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        // On Android before API 37, the [seccomp policy] prevents us from even
+        // detecting whether `openat2` is supported, so don't even try
+        //
+        // [seccomp policy]: https://android-developers.googleblog.com/2017/07/seccomp-filter-in-android-o.html
+        static ANDROID_API_LEVEL: OnceLock<Option<u32>> = OnceLock::new();
+        let api_level = *ANDROID_API_LEVEL.get_or_init(android_device_api_level);
+        if api_level.is_none_or(|level| level < 37) {
+            INVALID.store(true, Relaxed);
+            return Err(rustix::io::Errno::NOSYS.into());
+        }
     }
 
     let oflags = compute_oflags(options)?;
@@ -115,6 +127,29 @@ fn open_beneath(start: &fs::File, path: &Path, options: &OpenOptions) -> io::Res
         rustix::io::Errno::XDEV => errors::escape_attempt(),
         err => err.into(),
     })
+}
+
+#[cfg(target_os = "android")]
+fn android_device_api_level() -> Option<u32> {
+    // `android_get_device_api_level` is defined in [`<android/api-level.h>`] and
+    // is available in Bionic libc starting from API level 29. We use `dlsym`
+    // instead of linking directly since we don't know if the function is available
+    // at runtime and [`linkage` feature] is not stable yet
+    //
+    // [`<android/api-level.h>`]: https://android.googlesource.com/platform/bionic/+/main/libc/include/android/api-level.h
+    // [`linkage` feature] https://github.com/rust-lang/rust/issues/29603
+    let symbol =
+        unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"android_get_device_api_level".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+
+    let get_api_level: unsafe extern "C" fn() -> libc::c_int =
+        unsafe { std::mem::transmute(symbol) };
+
+    // `android_get_device_api_level` may return -1 on failure, but `u32::try_from`
+    // handles this case
+    u32::try_from(unsafe { get_api_level() }).ok()
 }
 
 // In theory we could optimize `link` using `openat2` with `O_PATH` and
