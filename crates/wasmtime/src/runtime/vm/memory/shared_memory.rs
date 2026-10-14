@@ -1,8 +1,8 @@
+use crate::Engine;
 use crate::prelude::*;
-use crate::runtime::vm::memory::{validate_atomic_addr, LocalMemory, MmapMemory};
+use crate::runtime::vm::memory::{LocalMemory, MmapMemory, validate_atomic_addr};
 use crate::runtime::vm::parking_spot::{ParkingSpot, Waiter};
 use crate::runtime::vm::{self, Memory, VMMemoryDefinition, WaitResult};
-use crate::Engine;
 use std::cell::RefCell;
 use std::ops::Range;
 use std::ptr::NonNull;
@@ -22,17 +22,11 @@ use wasmtime_environ::Trap;
 #[derive(Clone)]
 pub struct SharedMemory(Arc<SharedMemoryInner>);
 
-pub(crate) struct SharedMemoryInner {
+struct SharedMemoryInner {
     memory: RwLock<LocalMemory>,
     spot: ParkingSpot,
     ty: wasmtime_environ::Memory,
     def: LongTermVMMemoryDefinition,
-}
-
-impl SharedMemoryInner {
-    pub fn interrupt_all_waits(&self) {
-        self.spot.notify_all_interrupted();
-    }
 }
 
 impl SharedMemory {
@@ -70,14 +64,12 @@ impl SharedMemory {
         if !ty.shared {
             bail!("shared memory must have a `shared` memory type");
         }
-        let inner = try_new::<Arc<_>>(SharedMemoryInner {
+        Ok(Self(try_new::<Arc<_>>(SharedMemoryInner {
             ty: *ty,
             spot: ParkingSpot::default(),
             def: LongTermVMMemoryDefinition(memory.vmmemory()),
             memory: RwLock::new(memory),
-        })?;
-        engine.register_shared_memory(&inner);
-        Ok(Self(inner))
+        })?))
     }
 
     /// Return the memory type for this [`SharedMemory`].
@@ -136,11 +128,6 @@ impl SharedMemory {
         log::trace!("memory.atomic.notify(addr={addr_index:#x}, count={count})");
         let ptr = unsafe { &*ptr };
         Ok(self.0.spot.notify(ptr, count))
-    }
-
-    /// Notify all threads that are blocked on the given address, with interrupted result.
-    pub fn interrupt_all_waits(&self) {
-        self.0.interrupt_all_waits();
     }
 
     /// Implementation of `memory.atomic.wait32` for this shared memory.

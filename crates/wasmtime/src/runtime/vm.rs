@@ -109,8 +109,6 @@ pub use crate::runtime::vm::instance::{
     PoolConcurrencyLimitError, PoolingAllocatorMetrics, PoolingInstanceAllocator,
 };
 pub use crate::runtime::vm::interpreter::*;
-#[cfg(feature = "threads")]
-pub(crate) use crate::runtime::vm::memory::SharedMemoryInner;
 pub use crate::runtime::vm::memory::{
     Memory, MemoryBase, RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory,
 };
@@ -462,8 +460,6 @@ pub enum WaitResult {
     /// Indicates that `wait` completed with a timeout, meaning that the
     /// original value matched as expected but nothing ever called `notify`.
     TimedOut = 2,
-    /// Indicates that `wait` was interrupted, e.g. by an epoch change.
-    Interrupted = 3,
 }
 
 /// Description about a fault that occurred in WebAssembly.

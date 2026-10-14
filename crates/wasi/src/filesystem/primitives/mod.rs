@@ -68,7 +68,12 @@ pub(crate) fn set_times_on_fd(
 }
 
 pub(crate) fn open(start: &fs::File, path: &Path, options: &OpenOptions) -> io::Result<fs::File> {
-    #[cfg(any(windows, target_os = "freebsd", target_os = "linux",))]
+    #[cfg(any(
+        windows,
+        target_os = "freebsd",
+        target_os = "android",
+        target_os = "linux",
+    ))]
     if let Some(file) = sys::open_fast(start, path, options)? {
         return Ok(file);
     }
@@ -311,7 +316,7 @@ pub(crate) fn stat(start: &fs::File, path: &Path, follow: FollowSymlinks) -> io:
         }
     }
 
-    #[cfg(any(target_os = "freebsd", target_os = "linux",))]
+    #[cfg(any(target_os = "freebsd", target_os = "android", target_os = "linux",))]
     if let Some(stat) = sys::stat_fast(start, path, follow)? {
         return Ok(stat);
     }

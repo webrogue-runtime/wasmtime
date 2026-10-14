@@ -67,7 +67,7 @@ use crate::vm::vmcontext::VMRawContObj;
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
-use std::time::{Duration, Instant};
+use core::time::Duration;
 use wasmtime_core::math::WasmFloat;
 use wasmtime_environ::{
     CompiledTrap, DefinedMemoryIndex, DefinedTableIndex, FuncIndex, PassiveElemIndex, TableIndex,
@@ -502,7 +502,11 @@ fn gc_alloc_raw(
     use core::alloc::Layout;
     use wasmtime_environ::{VMGcKind, VMSharedTypeIndex};
 
-    let kind = VMGcKind::from_high_bits_of_u32(kind_and_reserved);
+    // NB: unlike most `VMGcKind`s, this one is a constant baked into compiled
+    // code by our own code generator, not a value out of the GC heap.
+    let Some(kind) = VMGcKind::from_high_bits_of_u32(kind_and_reserved) else {
+        bail_bug!("compiler emitted an invalid `VMGcKind`")
+    };
     log::trace!("gc_alloc_raw(kind={kind:?}, size={size}, align={align})");
 
     let shared_type_index = VMSharedTypeIndex::from_u32(shared_type_index);
@@ -586,7 +590,10 @@ fn get_interned_func_ref(
 
     let store = AutoAssertNoGc::new(store.store_opaque_mut());
 
-    let func_ref_id = FuncRefTableId::from_raw(func_ref_id);
+    let func_ref_id = match FuncRefTableId::from_raw(func_ref_id) {
+        Some(id) => id,
+        None => bail_bug!("bad FuncRefTableId"),
+    };
     let module_interned_type_index = ModuleInternedTypeIndex::from_bits(module_interned_type_index);
 
     let func_ref = if module_interned_type_index.is_reserved_value() {
@@ -697,23 +704,13 @@ fn memory_atomic_wait32(
     addr_index: u64,
     expected: u32,
     timeout: u64,
-) -> Result<u32> {
-    let timeout_duration = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
-    let deadline = timeout_duration.map(|d| Instant::now() + d);
+) -> Result<u32, Trap> {
+    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
     let memory = DefinedMemoryIndex::from_u32(memory_index);
-    loop {
-        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        let result = store
-            .instance_mut(instance)
-            .get_defined_memory_mut(memory)
-            .atomic_wait32(addr_index, expected, timeout)?;
-        if result == vm::WaitResult::Interrupted {
-            #[cfg(target_has_atomic = "64")]
-            new_epoch(store, instance)?;
-            continue;
-        }
-        return Ok(result as u32);
-    }
+    Ok(store
+        .instance_mut(instance)
+        .get_defined_memory_mut(memory)
+        .atomic_wait32(addr_index, expected, timeout)? as u32)
 }
 
 // Implementation of `memory.atomic.wait64` for locally defined memories.
@@ -725,23 +722,13 @@ fn memory_atomic_wait64(
     addr_index: u64,
     expected: u64,
     timeout: u64,
-) -> Result<u32> {
-    let timeout_duration = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
-    let deadline = timeout_duration.map(|d| Instant::now() + d);
+) -> Result<u32, Trap> {
+    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
     let memory = DefinedMemoryIndex::from_u32(memory_index);
-    loop {
-        let timeout = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        let result = store
-            .instance_mut(instance)
-            .get_defined_memory_mut(memory)
-            .atomic_wait64(addr_index, expected, timeout)?;
-        if result == vm::WaitResult::Interrupted {
-            #[cfg(target_has_atomic = "64")]
-            new_epoch(store, instance)?;
-            continue;
-        }
-        return Ok(result as u32);
-    }
+    Ok(store
+        .instance_mut(instance)
+        .get_defined_memory_mut(memory)
+        .atomic_wait64(addr_index, expected, timeout)? as u32)
 }
 
 // Hook for when an instance runs out of fuel.
@@ -1208,9 +1195,16 @@ unsafe fn asan_start_switch_fiber(
     _store: &mut dyn VMStore,
     _instance: InstanceId,
     fake_stack_save: *mut u8,
+    source_csi: *mut u8,
     target_csi: *mut u8,
 ) {
-    unsafe { crate::vm::stack_switching::asan::start_switch_fiber(fake_stack_save, target_csi) }
+    unsafe {
+        crate::vm::stack_switching::asan::start_switch_fiber(
+            fake_stack_save,
+            source_csi,
+            target_csi,
+        )
+    }
 }
 
 #[cfg(feature = "stack-switching")]
@@ -1218,8 +1212,9 @@ unsafe fn asan_finish_switch_fiber(
     _store: &mut dyn VMStore,
     _instance: InstanceId,
     fake_stack: *mut u8,
+    current_csi: *mut u8,
 ) {
-    unsafe { crate::vm::stack_switching::asan::finish_switch_fiber(fake_stack) }
+    unsafe { crate::vm::stack_switching::asan::finish_switch_fiber(fake_stack, current_csi) }
 }
 
 #[cfg(feature = "gc")]

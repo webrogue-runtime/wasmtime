@@ -81,10 +81,6 @@ struct EngineInner {
     #[cfg(all(feature = "runtime", target_has_atomic = "64"))]
     epoch: AtomicU64,
 
-    #[cfg(all(feature = "runtime", feature = "threads"))]
-    shared_memories:
-        crate::sync::Mutex<Vec<alloc::sync::Weak<crate::runtime::vm::SharedMemoryInner>>>,
-
     /// One-time check of whether the compiler's settings, if present, are
     /// compatible with the native host.
     compatible_with_native_host: crate::sync::OnceLock<Result<(), String>>,
@@ -183,8 +179,6 @@ impl Engine {
                 signatures: TypeRegistry::new(),
                 #[cfg(all(feature = "runtime", target_has_atomic = "64"))]
                 epoch: AtomicU64::new(0),
-                #[cfg(all(feature = "runtime", feature = "threads"))]
-                shared_memories: crate::sync::Mutex::new(Vec::new()),
                 compatible_with_native_host: Default::default(),
                 config,
                 tunables,
@@ -827,6 +821,12 @@ impl Engine {
     /// slots. The tradeoff is that the next instantiation of any given module
     /// may be slower, because no cached memory mappings are present anymore.
     ///
+    /// Note that while this method is running the warm slots it is releasing
+    /// are unavailable for allocation. Instantiations running concurrently
+    /// with this method may therefore fail with a "maximum concurrent limit
+    /// reached" error, even if few instances are live, when the pool's other
+    /// free slots are exhausted.
+    ///
     /// Returns 0 if this engine is not using the pooling allocator, or if
     /// nothing was resident to release.
     ///
@@ -917,39 +917,9 @@ impl Engine {
     /// This method is signal-safe: it does not make any syscalls, and
     /// performs only an atomic increment to the epoch value in
     /// memory.
-    ///
-    /// Note that if both the `runtime` and `threads` features are enabled
-    /// then this method is no longer signal-safe because it will acquire
-    /// a lock to notify all shared memories that the epoch has changed.
     #[cfg(target_has_atomic = "64")]
     pub fn increment_epoch(&self) {
         self.inner.epoch.fetch_add(1, Ordering::Relaxed);
-        #[cfg(all(feature = "runtime", feature = "threads"))]
-        self.interrupt_all_waits();
-    }
-
-    #[cfg(all(feature = "runtime", feature = "threads"))]
-    pub(crate) fn register_shared_memory(
-        &self,
-        memory: &Arc<crate::runtime::vm::SharedMemoryInner>,
-    ) {
-        self.inner
-            .shared_memories
-            .lock()
-            .push(Arc::downgrade(memory));
-    }
-
-    #[cfg(all(feature = "runtime", feature = "threads"))]
-    pub(crate) fn interrupt_all_waits(&self) {
-        let mut memories = self.inner.shared_memories.lock();
-        memories.retain(|m| {
-            if let Some(m) = m.upgrade() {
-                m.interrupt_all_waits();
-                true
-            } else {
-                false
-            }
-        });
     }
 
     /// Returns a [`std::hash::Hash`] that can be used to check precompiled WebAssembly compatibility.

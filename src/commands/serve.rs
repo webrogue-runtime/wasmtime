@@ -21,7 +21,7 @@ use std::{
 use tokio::io::{self, AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use wasmtime::component::{Component, GuestTaskId, Linker};
+use wasmtime::component::{Component, Linker, TaskGroupId};
 use wasmtime::error::Context as _;
 use wasmtime::{
     AsContextMut as _, Engine, Result, Store, StoreContextMut, StoreLimits, UpdateDeadline, bail,
@@ -29,12 +29,12 @@ use wasmtime::{
 use wasmtime_cli_flags::opt::WasmtimeOptionValue;
 use wasmtime_wasi::p2::{StreamError, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::handler::{
     HandlerState, Instance, Prepared, Proxy, ProxyHandler, ProxyPre, ShouldAccept,
     WorkerExpiration, WorkerState, WorkerStatus,
 };
 use wasmtime_wasi_http::io::TokioIo;
+use wasmtime_wasi_http::{ErrorResponse, WasiHttpCtx};
 
 #[cfg(feature = "debug")]
 use crate::commands::run::RunCommand;
@@ -269,7 +269,7 @@ impl ServeCommand {
             };
             self.run.common.debug.debugger = Some("<built-in gdbstub>".into());
             self.run.common.debug.arg.push(addr);
-            Some(gdbstub_component_artifact::GDBSTUB_COMPONENT)
+            Some(gdbstub_component_artifact::gdbstub()?)
         } else {
             None
         };
@@ -748,40 +748,49 @@ impl ServeCommand {
             _shutdown_guard: Box::new(shutdown.clone().increment(false)),
         });
 
-        if debuggee_store.is_some() {
-            for server in servers {
-                Self::serve_on_listener(
-                    server,
-                    shutdown.clone(),
-                    sem_connections,
-                    handler.clone(),
-                    debuggee_store,
-                )
-                .await?;
-
-                // There can only be one socket with a debugger attached.
-                break;
-            }
+        // If any listener fails then a shutdown is requested to bring down all
+        // the other listeners as well, but the drain below still happens to
+        // gracefully finish in-flight requests. The first error seen is then
+        // returned at the end.
+        let result = if debuggee_store.is_some() {
+            debug_assert_eq!(servers.len(), 1);
+            let server = servers.into_iter().next().unwrap();
+            Self::serve_on_listener(
+                server,
+                shutdown.clone(),
+                sem_connections,
+                handler.clone(),
+                debuggee_store,
+            )
+            .await
         } else {
-            let mut listener_tasks = vec![];
+            let mut listener_tasks = tokio::task::JoinSet::new();
 
             for server in servers {
-                listener_tasks.push(tokio::task::spawn(Self::serve_on_listener(
+                listener_tasks.spawn(Self::serve_on_listener(
                     server,
                     shutdown.clone(),
                     sem_connections.clone(),
                     handler.clone(),
                     None,
-                )));
+                ));
             }
 
-            for task in listener_tasks {
-                task.await??;
+            let mut result = Ok(());
+            while let Some(task_result) = listener_tasks.join_next().await {
+                let task_result = task_result
+                    .map_err(wasmtime::Error::from)
+                    .and_then(|result| result);
+                if let Err(e) = task_result {
+                    eprintln!("listener error: {e:?}");
+                    shutdown.request_shutdown();
+                    if result.is_ok() {
+                        result = Err(e);
+                    }
+                }
             }
-        }
-
-        // Don't allow any further requests to get picked up.
-        handler.state().sem_requests.close();
+            result
+        };
 
         drop(handler);
 
@@ -798,7 +807,7 @@ impl ServeCommand {
             }
         }
 
-        Ok(())
+        result
     }
 
     async fn serve_on_listener(
@@ -830,11 +839,12 @@ impl ServeCommand {
             // concurrent requests can't be served. Otherwise though spawn a
             // task to handle this client.
             match &mut debuggee_store {
-                Some(store) => handle_client(stream, &handler, Some(store)).await,
+                Some(store) => handle_client(stream, &handler, &shutdown, Some(store)).await,
                 None => {
                     let handler = handler.clone();
+                    let shutdown = shutdown.clone();
                     tokio::task::spawn(async move {
-                        handle_client(stream, &handler, None).await;
+                        handle_client(stream, &handler, &shutdown, None).await;
                         drop(shutdown_guard);
                         drop(connection_permit);
                     });
@@ -907,7 +917,7 @@ impl WorkerState for HostWorkerState {
         &self,
         _store: StoreContextMut<Host>,
         request_id: u64,
-        _task_id: GuestTaskId,
+        _task_group: TaskGroupId,
     ) -> Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>> {
         log::info!(
             "Instance {} handling request {request_id}",
@@ -1251,6 +1261,7 @@ type Request = hyper::Request<hyper::body::Incoming>;
 async fn handle_client(
     client: impl AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
     handler: &ProxyHandler<HostHandlerState>,
+    shutdown: &GracefulShutdown,
     debuggee_store: Option<&mut Store<Host>>,
 ) {
     // Hyper's `service_fn` takes an `Fn` closure, so to bridge the need to
@@ -1259,49 +1270,63 @@ async fn handle_client(
     // `Send`.
     let lock = &debuggee_store.map(tokio::sync::Mutex::new);
 
-    if let Err(e) = http1::Builder::new()
-        .keep_alive(true)
-        .serve_connection(
-            TokioIo::new(client),
-            hyper::service::service_fn(move |req| async move {
-                let mut debuggee_store = match &lock {
-                    Some(store) => Some(store.lock().await),
-                    None => None,
-                };
-                let debuggee_store = debuggee_store.as_mut().map(|s| &mut ***s);
-                match handle_request(handler, debuggee_store, req).await {
-                    Ok(r) => Ok::<_, Infallible>(r),
-                    Err(e) => {
-                        eprintln!("error: {e:?}");
-                        let error_html = "\
+    let conn = http1::Builder::new().keep_alive(true).serve_connection(
+        TokioIo::new(client),
+        hyper::service::service_fn(move |req| async move {
+            let mut debuggee_store = match &lock {
+                Some(store) => Some(store.lock().await),
+                None => None,
+            };
+            let debuggee_store = debuggee_store.as_mut().map(|s| &mut ***s);
+            match handle_request(handler, debuggee_store, req).await {
+                Ok(r) => Ok::<_, Infallible>(r),
+                Err(e) => {
+                    eprintln!("error: {e:?}");
+                    let status = e
+                        .downcast_ref::<ErrorResponse>()
+                        .map(|e| e.status())
+                        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                    let error_html = format!(
+                        "\
 <!doctype html>
 <html>
 <head>
-    <title>500 Internal Server Error</title>
+    <title>{status}</title>
 </head>
 <body>
     <center>
-        <h1>500 Internal Server Error</h1>
+        <h1>{status}</h1>
         <hr>
         wasmtime
     </center>
 </body>
-</html>";
-                        Ok(Response::builder()
-                            .status(StatusCode::INTERNAL_SERVER_ERROR)
-                            .header("Content-Type", "text/html; charset=UTF-8")
-                            .body(
-                                Full::new(bytes::Bytes::from(error_html))
-                                    .map_err(|_| unreachable!())
-                                    .boxed_unsync(),
-                            )
-                            .unwrap())
-                    }
+</html>"
+                    );
+                    Ok(Response::builder()
+                        .status(status)
+                        .header("Content-Type", "text/html; charset=UTF-8")
+                        .body(
+                            Full::new(bytes::Bytes::from(error_html))
+                                .map_err(|_| unreachable!())
+                                .boxed_unsync(),
+                        )
+                        .unwrap())
                 }
-            }),
-        )
-        .await
-    {
+            }
+        }),
+    );
+    let mut conn = std::pin::pin!(conn);
+
+    // Use hyper's built-in support for graceful shutdown whenever the server
+    // here gets a shutdown request.
+    let result = tokio::select! {
+        result = conn.as_mut() => result,
+        _ = shutdown.requested() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    };
+    if let Err(e) = result {
         eprintln!("error: {e:?}");
     }
 }
@@ -1501,7 +1526,7 @@ impl wasmtime_wasi::p2::OutputStream for LogStream {
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
-        Ok(1024 * 1024)
+        Ok(64 * 1024)
     }
 }
 
@@ -1630,7 +1655,7 @@ fn use_pooling_allocator_by_default() -> Result<Option<bool>> {
     let mut store = Store::new(&engine, ());
     // NB: the maximum size is in wasm pages to take out the 16-bits of wasm
     // page size here from the maximum size.
-    let ty = MemoryType::new64(0, Some(1 << (BITS_TO_TEST - 16)));
+    let ty = MemoryType::new64(0, Some(1 << (BITS_TO_TEST - 16)))?;
     if Memory::new(&mut store, ty).is_ok() {
         Ok(Some(true))
     } else {
@@ -1645,6 +1670,7 @@ mod unix {
     use super::SocketServer;
     use rustix::fs::{FileType, fstat};
     use rustix::net::{AddressFamily, SocketType, getsockname, sockopt::socket_type};
+    use std::mem::ManuallyDrop;
     use std::net::TcpListener;
     use std::os::fd::{FromRawFd, OwnedFd, RawFd};
     use std::os::unix::net::UnixListener;
@@ -1701,25 +1727,33 @@ mod unix {
             // We want to take ownership of all file descriptors here, but only use the first socket to
             // listen on it.
             for fd in first_fd..last_fd {
-                let fd = unsafe {
-                    // Safety: We're calling this first in Self::execute(), before any other file
-                    // descriptors part from stdin, stdout and stderr are opened.
-                    OwnedFd::from_raw_fd(fd)
-                };
+                // SAFETY: CLI configuration has indicated that `fd` is probably
+                // owned by us, but we're also not entirely sure of that yet.
+                // The `OwnedFd` is wrapped in `ManuallyDrop` to avoid dropping
+                // it while it's tested below.
+                let mut fd = ManuallyDrop::new(unsafe { OwnedFd::from_raw_fd(fd) });
 
                 // Set the close-on-exec flag, matching libsystemd.
                 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
-                rustix::io::ioctl_fioclex(&fd)?;
+                rustix::io::ioctl_fioclex(&*fd)?;
 
                 // Check if this file descriptor is a TCP socket.
-                let stat = fstat(&fd)?;
+                let stat = fstat(&*fd)?;
                 if !FileType::from_raw_mode(stat.st_mode).is_socket() {
                     continue;
                 }
 
-                if socket_type(&fd)? != SocketType::STREAM {
+                if socket_type(&*fd)? != SocketType::STREAM {
                     continue;
                 }
+
+                // SAFETY: we've done all the checks we can to determine that
+                // `fd` is indeed valid. This function's own unsafe contract
+                // means that we're running very early on in the program, so at
+                // this point it by all means should be safe to take this fd. If
+                // it's not then that's a bug of the CLI configuration
+                // effectively.
+                let fd = unsafe { ManuallyDrop::take(&mut fd) };
 
                 let address_family = getsockname(&fd)?.address_family();
                 let this_listener = if address_family == AddressFamily::INET

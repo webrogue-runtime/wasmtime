@@ -123,6 +123,7 @@ impl ComponentStoreData {
         #[cfg(feature = "component-model-async")]
         if store.0.component_data().task_state.is_concurrent() {
             ComponentStoreData::drop_fibers_and_futures(store.0);
+            store.0.clean_up_task_groups();
         }
         #[cfg(not(feature = "component-model-async"))]
         let _ = store;

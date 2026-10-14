@@ -45,7 +45,6 @@ struct WaiterInner {
     // NB: these fields are only modified/read under the lock of a
     // `ParkingSpot`.
     notified: bool,
-    interrupted: bool,
     next: Option<SendSyncPtr<WaiterInner>>,
     prev: Option<SendSyncPtr<WaiterInner>>,
 }
@@ -127,7 +126,6 @@ impl ParkingSpot {
                 next: None,
                 prev: None,
                 notified: false,
-                interrupted: false,
                 thread: thread::current(),
             })
         });
@@ -137,7 +135,6 @@ impl ParkingSpot {
         // Clear the `notified` flag if it was previously notified and
         // configure the thread to wakeup as our own.
         waiter.notified = false;
-        waiter.interrupted = false;
         waiter.thread = thread::current();
 
         let ptr = SendSyncPtr::new(NonNull::from(&mut **waiter));
@@ -178,9 +175,7 @@ impl ParkingSpot {
                 }
             };
 
-            if ptr.as_ref().interrupted {
-                WaitResult::Interrupted
-            } else if timed_out {
+            if timed_out {
                 // If this thread timed out then it is still present in the
                 // waiter queue, so remove it.
                 inner.get_mut(&key).unwrap().remove(ptr);
@@ -221,24 +216,6 @@ impl ParkingSpot {
         });
 
         unparked
-    }
-
-    pub fn notify_all_interrupted(&self) {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("failed to lock inner parking table");
-        for spot in inner.values_mut() {
-            unsafe {
-                while let Some(mut head) = spot.pop() {
-                    let head = head.as_mut();
-                    assert!(head.next.is_none());
-                    head.notified = true;
-                    head.interrupted = true;
-                    head.thread.unpark();
-                }
-            }
-        }
     }
 
     fn with_lot<T, F: FnMut(&mut Spot)>(&self, addr: &T, mut f: F) {
@@ -647,25 +624,6 @@ mod tests {
             for thread in threads {
                 thread.join().unwrap();
             }
-        });
-    }
-
-    #[test]
-    fn notify_all_interrupted() {
-        let parking_spot = ParkingSpot::default();
-        let atomic = AtomicU64::new(0);
-
-        thread::scope(|s| {
-            let thread = s.spawn(|| {
-                let mut waiter = Waiter::new();
-                let result = parking_spot.wait64(&atomic, 0, None, &mut waiter);
-                assert_eq!(result, crate::runtime::vm::WaitResult::Interrupted);
-            });
-
-            // Wait a bit to ensure the thread is parked
-            thread::sleep(Duration::from_millis(100));
-            parking_spot.notify_all_interrupted();
-            thread.join().unwrap();
         });
     }
 }

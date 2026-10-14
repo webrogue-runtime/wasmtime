@@ -131,7 +131,7 @@ impl RunCommand {
             };
             self.run.common.debug.debugger = Some("<built-in gdbstub>".into());
             self.run.common.debug.arg.push(addr);
-            Some(gdbstub_component_artifact::GDBSTUB_COMPONENT)
+            Some(gdbstub_component_artifact::gdbstub()?)
         } else {
             None
         };
@@ -1146,12 +1146,8 @@ impl RunCommand {
                         }
                         // If preview2 was explicitly requested, always use it.
                         // Otherwise use it so long as threads are disabled.
-                        //
-                        // Note that for now `p0` is currently
-                        // default-enabled but this may turn into
-                        // default-disabled in the future.
                         (Some(true), _) | (None, Some(false) | None) => {
-                            if self.run.common.wasi.preview0 != Some(false) {
+                            if self.run.common.wasi.preview0 == Some(true) {
                                 wasmtime_wasi::p0::add_to_linker_async(linker, |t| t.wasip1_ctx())?;
                             }
                             wasmtime_wasi::p1::add_to_linker_async(linker, |t| t.wasip1_ctx())?;
@@ -1289,6 +1285,11 @@ impl RunCommand {
                 }
                 let http = self.run.wasi_http_ctx()?;
                 store.data_mut().wasi_http = Some(http);
+                // The hooks carry the `--http-outgoing-body-*` limits, so they
+                // have to be taken from the CLI options as well: `Host` is
+                // built with `Host::default()`, which leaves the default hooks
+                // in place.
+                store.data_mut().wasi_http_hooks = self.run.wasi_http_hooks();
             }
         }
 

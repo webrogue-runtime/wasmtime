@@ -629,7 +629,9 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             return;
         }
 
-        self.fuel_consumed += self.tunables.operator_cost.cost(op);
+        if !matches!(op, Operator::Else | Operator::End) {
+            self.fuel_consumed += self.tunables.operator_cost.cost(op);
+        }
 
         match op {
             // Exiting a function (via a return or unreachable) or otherwise
@@ -713,6 +715,13 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         match op {
             Operator::Call { .. } | Operator::CallIndirect { .. } | Operator::CallRef { .. } => {
                 self.fuel_load_into_var(builder);
+            }
+            Operator::Else => {
+                self.fuel_consumed += self.tunables.operator_cost.cost(op);
+            }
+            Operator::End => {
+                self.fuel_consumed += self.tunables.operator_cost.cost(op);
+                self.fuel_increment_var(builder);
             }
             _ => {}
         }
@@ -4784,20 +4793,22 @@ impl FuncEnvironment<'_> {
             (2, ir::types::I16),
             (1, ir::types::I8),
         ];
-        // 12 covers the worst case under the 128-byte cap: n=127 decomposes into
-        // 7×i8x16 + i64 + i32 + i16 + i8 = 11 chunks. Sized so both `SmallVec`s
-        // stay inline.
-        let mut chunks: SmallVec<[(i32, ir::Type); 12]> = smallvec![];
+        // Without vectors, n=127 decomposes into 15×i64 + i32 + i16 + i8 = 18
+        // chunks, the worst case under the 128-byte cap. Keep both `SmallVec`s inline.
+        let mut chunks: SmallVec<[(i32, ir::Type); 18]> = smallvec![];
         let mut offset = 0u64;
         let mut remaining = bytes;
         for &(width, ty) in WIDTHS {
+            if ty.is_vector() && !self.isa.supports_vector_load_store(ty) {
+                continue;
+            }
             while remaining >= width {
                 chunks.push((i32::try_from(offset).unwrap(), ty));
                 offset += width;
                 remaining -= width;
             }
         }
-        let vals: SmallVec<[ir::Value; 12]> = chunks
+        let vals: SmallVec<[ir::Value; 18]> = chunks
             .iter()
             .map(|&(off, ty)| builder.ins().load(ty, load_flags, src_addr, off))
             .collect();

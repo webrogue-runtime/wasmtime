@@ -151,6 +151,7 @@ impl Config {
             component_model_fixed_length_lists,
             component_model_implements,
             component_model_canonical_names,
+            component_model_accessors,
             simd,
             exceptions,
             legacy_exceptions: _,
@@ -183,6 +184,7 @@ impl Config {
         self.module_config.component_model_implements = component_model_implements.unwrap_or(false);
         self.module_config.component_model_canonical_names =
             component_model_canonical_names.unwrap_or(false);
+        self.module_config.component_model_accessors = component_model_accessors.unwrap_or(false);
         self.module_config.stack_switching = stack_switching.unwrap_or(false);
         self.wasmtime.branch_hinting = branch_hinting.unwrap_or(false);
 
@@ -344,6 +346,7 @@ impl Config {
         cfg.wasm.component_model_implements = Some(self.module_config.component_model_implements);
         cfg.wasm.component_model_canonical_names =
             Some(self.module_config.component_model_canonical_names);
+        cfg.wasm.component_model_accessors = Some(self.module_config.component_model_accessors);
         cfg.wasm.custom_page_sizes = Some(self.module_config.config.custom_page_sizes_enabled);
         cfg.wasm.compact_imports = Some(self.module_config.config.compact_imports_enabled);
         cfg.wasm.epoch_interruption = Some(self.wasmtime.epoch_interruption);
@@ -364,6 +367,10 @@ impl Config {
         cfg.wasm.wide_arithmetic = Some(self.module_config.config.wide_arithmetic_enabled);
         cfg.wasm.branch_hinting = Some(self.wasmtime.branch_hinting);
         cfg.wasm.exceptions = Some(self.module_config.config.exceptions_enabled);
+        // Winch disables GC types by default, but we want to fuzz it
+        if self.wasmtime.compiler_strategy == CompilerStrategy::Winch {
+            cfg.wasm.gc_support = Some(true);
+        }
         cfg.wasm.stack_switching = Some(self.module_config.stack_switching);
         cfg.wasm.shared_memory = Some(self.module_config.shared_memory);
         if !self.module_config.config.simd_enabled {
