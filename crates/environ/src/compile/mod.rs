@@ -375,6 +375,14 @@ pub trait Compiler: Send + Sync {
         }
 
         use target_lexicon::*;
+
+        if matches!(
+            self.triple().environment,
+            Environment::Android | Environment::Androideabi
+        ) {
+            return 0x4000;
+        }
+
         match (self.triple().operating_system, self.triple().architecture) {
             (
                 OperatingSystem::MacOSX { .. }
